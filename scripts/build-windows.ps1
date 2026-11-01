@@ -5,6 +5,16 @@ $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 if (-not (Test-Path "src-tauri\binaries\ffmpeg-*.exe")) { & "$PSScriptRoot\fetch-ffmpeg.ps1" }
 npm ci
+# Auto-update files are signed with the updater key (kept out of git in .secrets\).
+if (-not $env:TAURI_SIGNING_PRIVATE_KEY) {
+    $key = Join-Path $root ".secrets\updater.key"
+    if (Test-Path $key) {
+        $env:TAURI_SIGNING_PRIVATE_KEY = Get-Content -Raw $key
+    } else {
+        Write-Host "업데이트 서명 키가 없어 자동 업데이트 파일 없이 빌드합니다."
+        $env:TAURI_CONFIG = '{"bundle":{"createUpdaterArtifacts":false}}'
+    }
+}
 npx tauri build
 Write-Host ""
 Write-Host "Installers:"

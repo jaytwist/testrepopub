@@ -1,0 +1,62 @@
+# Builds the signed Windows installers and the auto-update feed (latest.json) and publishes them
+# as a GitHub Release. Triggered by pushing a version tag (scripts/release.mjs does this).
+#
+# One-time setup: repository secret TAURI_SIGNING_PRIVATE_KEY = contents of the updater private key.
+# (Add TAURI_SIGNING_PRIVATE_KEY_PASSWORD only if the key has a password.)
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Release notes from the tag message
+        id: notes
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          notes="$(git tag -l --format='%(contents)' "$tag" 2>/dev/null)"
+          [ -z "$notes" ] && notes="Media Organizer $tag"
+          { echo "body<<__NOTES__"; echo "$notes"; echo "__NOTES__"; } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - run: npm ci
+
+      - name: Fetch ffmpeg/ffprobe sidecars
+        shell: pwsh
+        run: ./scripts/fetch-ffmpeg.ps1
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: v__VERSION__
+          releaseName: Media Organizer v__VERSION__
+          releaseBody: ${{ steps.notes.outputs.body }}
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true
+          updaterJsonPreferNsis: true

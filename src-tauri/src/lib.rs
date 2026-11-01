@@ -22,6 +22,7 @@ use serde::Serialize;
 use tauri::http::{Response, StatusCode};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
+use tauri_plugin_updater::UpdaterExt;
 
 type CmdResult<T> = Result<T, String>;
 
@@ -332,6 +333,135 @@ fn open_file(app: AppHandle, state: State<AppState>, id: i64) -> CmdResult<()> {
 }
 
 // ---------------------------------------------------------------------------------------------
+// VLC (external player for formats the webview can't play)
+// ---------------------------------------------------------------------------------------------
+
+fn find_vlc() -> Option<PathBuf> {
+    let mut cands: Vec<PathBuf> = Vec::new();
+    #[cfg(windows)]
+    {
+        for var in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"] {
+            if let Some(p) = std::env::var_os(var) {
+                cands.push(PathBuf::from(p).join("VideoLAN").join("VLC").join("vlc.exe"));
+            }
+        }
+        if let Some(p) = std::env::var_os("LOCALAPPDATA") {
+            cands.push(PathBuf::from(p).join("Programs").join("VideoLAN").join("VLC").join("vlc.exe"));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    cands.push(PathBuf::from("/Applications/VLC.app/Contents/MacOS/VLC"));
+    let exe = if cfg!(windows) { "vlc.exe" } else { "vlc" };
+    if let Some(path) = std::env::var_os("PATH") {
+        cands.extend(std::env::split_paths(&path).map(|d| d.join(exe)));
+    }
+    cands.into_iter().find(|p| p.is_file())
+}
+
+#[tauri::command]
+fn vlc_path() -> Option<String> {
+    find_vlc().map(|p| p.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn open_in_vlc(state: State<AppState>, id: i64) -> CmdResult<()> {
+    let vlc = find_vlc().ok_or("VLC를 찾을 수 없습니다. VLC가 설치되어 있는지 확인하세요")?;
+    let conn = state.db.conn().map_err(err)?;
+    let f = db::get_file(&conn, id).map_err(err)?.ok_or("not found")?;
+    if !f.online {
+        return Err("드라이브가 연결되어 있지 않습니다".into());
+    }
+    std::process::Command::new(vlc).arg(f.abs_path()).spawn().map_err(err)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Auto-update (GitHub Releases + signed installers)
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct UpdateInfo {
+    current: String,
+    available: bool,
+    version: Option<String>,
+    notes: Option<String>,
+    date: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+struct UpdateProgress {
+    downloaded: u64,
+    total: Option<u64>,
+}
+
+/// `MO_UPDATE_ENDPOINT` overrides the configured feed (for testing a release before publishing).
+fn updater(app: &AppHandle) -> Result<tauri_plugin_updater::Updater, String> {
+    let mut b = app.updater_builder();
+    if let Ok(url) = std::env::var("MO_UPDATE_ENDPOINT") {
+        b = b.endpoints(vec![url.parse::<tauri::Url>().map_err(err)?]).map_err(err)?;
+    }
+    b.build().map_err(err)
+}
+
+#[tauri::command]
+async fn check_update(app: AppHandle) -> CmdResult<UpdateInfo> {
+    let current = app.package_info().version.to_string();
+    let u = updater(&app)?.check().await.map_err(err)?;
+    Ok(match u {
+        Some(u) => UpdateInfo { current, available: true, version: Some(u.version.clone()), notes: u.body.clone(), date: u.date.map(|d| d.to_string()) },
+        None => UpdateInfo { current, available: false, version: None, notes: None, date: None },
+    })
+}
+
+/// Download, verify (signature), install and restart. Refused while a job is moving files.
+#[tauri::command]
+async fn install_update(app: AppHandle) -> CmdResult<()> {
+    {
+        let st = app.state::<AppState>();
+        let mut j = st.job.lock().unwrap();
+        if let Some(cur) = j.as_ref() {
+            return Err(format!("작업이 끝난 뒤 업데이트할 수 있습니다 (진행 중: {cur})"));
+        }
+        *j = Some("update".into());
+    }
+    let release = |app: &AppHandle| *app.state::<AppState>().job.lock().unwrap() = None;
+    let update = match updater(&app)?.check().await {
+        Ok(Some(u)) => u,
+        Ok(None) => {
+            release(&app);
+            return Err("이미 최신 버전입니다".into());
+        }
+        Err(e) => {
+            release(&app);
+            return Err(err(e));
+        }
+    };
+    let emit_app = app.clone();
+    let mut downloaded: u64 = 0;
+    let res = update
+        .download_and_install(
+            move |chunk, total| {
+                downloaded += chunk as u64;
+                let _ = emit_app.emit("update-progress", UpdateProgress { downloaded, total });
+            },
+            || {},
+        )
+        .await;
+    if let Err(e) = res {
+        release(&app);
+        let msg = e.to_string();
+        return Err(if msg.contains("signature") {
+            "업데이트 파일의 서명이 맞지 않아 설치하지 않았습니다 (손상되었거나 위조된 파일)".into()
+        } else if msg.contains("https") {
+            "업데이트 주소가 안전하지 않습니다 (https 필요)".into()
+        } else {
+            format!("업데이트 설치 실패: {msg}")
+        });
+    }
+    app.restart();
+}
+
+// ---------------------------------------------------------------------------------------------
 // Labels & dates
 // ---------------------------------------------------------------------------------------------
 
@@ -522,6 +652,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .register_asynchronous_uri_scheme_protocol("thumb", |ctx, request, responder| {
             let app = ctx.app_handle().clone();
             let path = request.uri().path().to_string();
@@ -574,6 +706,10 @@ pub fn run() {
             video_preview_path,
             reveal_file,
             open_file,
+            vlc_path,
+            open_in_vlc,
+            check_update,
+            install_update,
             label_counts,
             add_label,
             remove_label,

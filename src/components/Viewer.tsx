@@ -22,6 +22,8 @@ export default function Viewer({ items, index, onIndex, onClose, onChanged }: Pr
   const [newLabel, setNewLabel] = useState("");
   const [allLabels, setAllLabels] = useState<LabelCount[]>([]);
   const [editDate, setEditDate] = useState<string | null>(null);
+  const [vlc, setVlc] = useState<string | null>(null);
+  const [vlcMsg, setVlcMsg] = useState<string | null>(null);
 
   const load = () => {
     api.fileDetail(item.id).then(setDetail);
@@ -34,6 +36,7 @@ export default function Viewer({ items, index, onIndex, onClose, onChanged }: Pr
     setVideoState("original");
     setPreviewErr(null);
     setEditDate(null);
+    setVlcMsg(null);
     load();
     if (item.kind === "video") {
       if (item.online) {
@@ -47,7 +50,13 @@ export default function Viewer({ items, index, onIndex, onClose, onChanged }: Pr
 
   useEffect(() => {
     api.labelCounts().then(setAllLabels).catch(() => {});
+    api.vlcPath().then(setVlc).catch(() => {});
   }, []);
+
+  const playInVlc = () => {
+    setVlcMsg(null);
+    api.openInVlc(item.id).then(() => setVlcMsg("VLC에서 재생합니다")).catch((e) => setVlcMsg(String(e)));
+  };
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -92,6 +101,7 @@ export default function Viewer({ items, index, onIndex, onClose, onChanged }: Pr
     if (!editDate) return;
     await api.setDate([item.id], editDate);
     setEditDate(null);
+    setVlcMsg(null);
     load();
     onChanged?.();
   };
@@ -110,7 +120,7 @@ export default function Viewer({ items, index, onIndex, onClose, onChanged }: Pr
 
         {item.kind === "video" ? (
           videoSrc ? (
-            <video key={videoSrc} src={videoSrc} controls autoPlay className="viewer-media" onError={() => (videoState === "original" ? convertVideo() : setVideoState("failed"))} />
+            <video key={videoSrc} src={videoSrc} controls autoPlay className="viewer-media" onError={() => (videoState === "original" ? (vlc ? setVideoState("failed") : convertVideo()) : setVideoState("failed"))} />
           ) : (
             <div className="viewer-placeholder">
               <img src={thumbUrl(item.id)} alt="" className="viewer-media dim" />
@@ -126,7 +136,15 @@ export default function Viewer({ items, index, onIndex, onClose, onChanged }: Pr
           </div>
         )}
         {videoState === "converting" && <div className="viewer-msg floating"><span className="spinner" /> 이 형식은 바로 재생이 안 되어 변환 중입니다…</div>}
-        {videoState === "failed" && <div className="viewer-msg floating bad">재생할 수 없습니다. {previewErr}</div>}
+        {videoState === "failed" && (
+          <div className="viewer-msg floating choice">
+            <span>이 동영상 형식은 앱 안에서 바로 재생되지 않습니다.{previewErr ? ` (${previewErr})` : ""}</span>
+            <span className="btn-row">
+              {vlc && <button className="btn small primary" onClick={playInVlc}>VLC로 재생</button>}
+              {!previewErr && <button className="btn small" onClick={() => { setVideoState("original"); convertVideo(); }}>변환해서 여기서 보기</button>}
+            </span>
+          </div>
+        )}
       </div>
 
       <aside className="viewer-info" onClick={(e) => e.stopPropagation()}>
@@ -186,7 +204,9 @@ export default function Viewer({ items, index, onIndex, onClose, onChanged }: Pr
             <div className="btn-row">
               <button className="btn small" disabled={!f.online} onClick={() => api.revealFile(f.id)}>탐색기에서 보기</button>
               <button className="btn small" disabled={!f.online} onClick={() => api.openFile(f.id)}>기본 앱으로 열기</button>
+              {f.kind === "video" && vlc && <button className="btn small" disabled={!f.online} onClick={playInVlc}>VLC로 재생</button>}
             </div>
+            {vlcMsg && <div className="small muted">{vlcMsg}</div>}
             <div className="muted small">← → 이동 · Esc 닫기 · {index + 1} / {items.length}</div>
           </>
         ) : (

@@ -99,6 +99,8 @@ export interface BatchRow {
 }
 export interface Progress { job: string; stage: string; done: number; total: number; message: string }
 export interface JobDone { job: string; ok: boolean; error: string | null; result: any }
+export interface UpdateInfo { current: string; available: boolean; version: string | null; notes: string | null; date: string | null }
+export interface UpdateProgress { downloaded: number; total: number | null }
 export interface AppInfo { version: string; data_dir: string; cache_dir: string; ffmpeg: boolean; job: string | null }
 
 export const api = {
@@ -125,6 +127,10 @@ export const api = {
   previewPath: (id: number) => invoke<string>("preview_path", { id }),
   videoPreviewPath: (id: number) => invoke<string>("video_preview_path", { id }),
   revealFile: (id: number) => invoke<void>("reveal_file", { id }),
+  vlcPath: () => invoke<string | null>("vlc_path"),
+  openInVlc: (id: number) => invoke<void>("open_in_vlc", { id }),
+  checkUpdate: () => invoke<UpdateInfo>("check_update"),
+  installUpdate: () => invoke<void>("install_update"),
   openFile: (id: number) => invoke<void>("open_file", { id }),
 
   labelCounts: () => invoke<LabelCount[]>("label_counts"),
@@ -161,6 +167,9 @@ export const fileUrl = (path: string) => convertFileSrc(path);
 
 export function onProgress(cb: (p: Progress) => void): Promise<UnlistenFn> {
   return listen<Progress>("job-progress", (e) => cb(e.payload));
+}
+export function onUpdateProgress(cb: (p: UpdateProgress) => void): Promise<UnlistenFn> {
+  return listen<UpdateProgress>("update-progress", (e) => cb(e.payload));
 }
 export function onJobDone(cb: (d: JobDone) => void): Promise<UnlistenFn> {
   return listen<JobDone>("job-done", (e) => cb(e.payload));

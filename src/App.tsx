@@ -1,5 +1,8 @@
 import { createContext, useContext, useEffect, useState } from "react";
-import { api, onJobDone, onProgress, type AppInfo, type JobDone, type LibraryStats, type Progress, fmtBytes, fmtCount } from "./api";
+import {
+  api, onJobDone, onProgress, onUpdateProgress, type AppInfo, type JobDone, type LibraryStats, type Progress,
+  type UpdateInfo, type UpdateProgress, fmtBytes, fmtCount,
+} from "./api";
 import Library from "./pages/Library";
 import Sources from "./pages/Sources";
 import Duplicates from "./pages/Duplicates";
@@ -55,6 +58,42 @@ export default function App() {
   const [stats, setStats] = useState<LibraryStats | null>(null);
   const [info, setInfo] = useState<AppInfo | null>(null);
   const [toast, setToast] = useState<{ ok: boolean; text: string } | null>(null);
+  const [update, setUpdate] = useState<UpdateInfo | null>(null);
+  const [updating, setUpdating] = useState<UpdateProgress | null>(null);
+  const [checking, setChecking] = useState(false);
+
+  // Quietly look for a new version shortly after start; never interrupts the user.
+  useEffect(() => {
+    const t = setTimeout(() => api.checkUpdate().then((u) => u.available && setUpdate(u)).catch(() => {}), 4000);
+    const un = onUpdateProgress(setUpdating);
+    return () => {
+      clearTimeout(t);
+      un.then((u) => u());
+    };
+  }, []);
+
+  const checkNow = async () => {
+    setChecking(true);
+    try {
+      const u = await api.checkUpdate();
+      if (u.available) setUpdate(u);
+      else setToast({ ok: true, text: `최신 버전입니다 (v${u.current})` });
+    } catch (e) {
+      setToast({ ok: false, text: `업데이트 확인 실패: ${e}` });
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  const installNow = async () => {
+    setUpdating({ downloaded: 0, total: null });
+    try {
+      await api.installUpdate(); // the app restarts itself when done
+    } catch (e) {
+      setUpdating(null);
+      setToast({ ok: false, text: String(e) });
+    }
+  };
 
   useEffect(() => {
     api.appInfo().then((i) => {
@@ -110,6 +149,31 @@ export default function App() {
               </button>
             ))}
           </nav>
+          {update?.available && (
+            <div className="update-card">
+              <b>새 버전 v{update.version}</b>
+              <span className="muted small">지금 v{update.current}</span>
+              {update.notes && (
+                <details>
+                  <summary className="small">바뀐 점</summary>
+                  <div className="small notes">{update.notes}</div>
+                </details>
+              )}
+              {updating ? (
+                <>
+                  <div className="bar"><div className={`bar-fill ${updating.total ? "" : "indeterminate"}`} style={{ width: updating.total ? `${(updating.downloaded / updating.total) * 100}%` : "30%" }} /></div>
+                  <span className="small muted">
+                    {updating.total && updating.downloaded >= updating.total ? "설치 후 다시 시작합니다…" : `내려받는 중 ${fmtBytes(updating.downloaded)}${updating.total ? ` / ${fmtBytes(updating.total)}` : ""}`}
+                  </span>
+                </>
+              ) : (
+                <button className="btn small primary" disabled={!!running} title={running ? "진행 중인 작업이 끝나면 업데이트할 수 있습니다" : ""} onClick={installNow}>
+                  업데이트 후 재시작
+                </button>
+              )}
+              {running && !updating && <span className="small muted">작업이 끝나면 업데이트할 수 있습니다</span>}
+            </div>
+          )}
           {stats && (
             <div className="side-stats">
               <div><b>{fmtCount(stats.files)}</b> 개 · {fmtBytes(stats.bytes)}</div>
@@ -120,6 +184,10 @@ export default function App() {
             </div>
           )}
           {info && !info.ffmpeg && <div className="side-warning">ffmpeg가 없어 동영상 썸네일·유사 영상 찾기가 제한됩니다.</div>}
+          <div className="side-version">
+            <span>v{info?.version ?? ""}</span>
+            <button className="btn small ghost" disabled={checking} onClick={checkNow}>{checking ? "확인 중…" : "업데이트 확인"}</button>
+          </div>
         </aside>
 
         <main className="content">
