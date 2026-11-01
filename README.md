@@ -62,7 +62,7 @@ scripts/                Windows 빌드·ffmpeg 다운로드 스크립트
 데이터 위치:
 
 - 색인 DB: `%APPDATA%\com.mediaorganizer.app\library.db`
-- 썸네일 캐시: `%LOCALAPPDATA%\com.mediaorganizer.app\cache`. 50만 장이면 약 15GB입니다.
+- 썸네일 캐시: `%LOCALAPPDATA%\com.mediaorganizer.app\cache`. 썸네일 한 장은 약 8~25KB라서, 50만 장이면 4~12GB 정도입니다.
 
 ## Windows에서 빌드하기
 
