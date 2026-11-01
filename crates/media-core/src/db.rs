@@ -76,6 +76,11 @@ CREATE TABLE IF NOT EXISTS dup_members (
     PRIMARY KEY(group_id, file_id)
 );
 
+CREATE TABLE IF NOT EXISTS settings (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS batches (
     id          TEXT PRIMARY KEY,
     kind        TEXT NOT NULL,          -- 'dedupe' | 'organize'
@@ -238,6 +243,9 @@ pub struct GridItem {
     pub height: Option<i64>,
     pub duration_ms: Option<i64>,
     pub online: bool,
+    pub size: i64,
+    pub mtime: i64,
+    pub name: String,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -258,9 +266,42 @@ pub struct FileFilter {
     pub date_confidence: Option<String>,
     pub online_only: bool,
     pub ids: Option<Vec<i64>>,
+    /// Capture date range, inclusive, as wall-clock timestamps (see `meta::to_ts`).
+    pub date_from: Option<i64>,
+    pub date_to: Option<i64>,
+    /// File size range in bytes.
+    pub size_min: Option<i64>,
+    pub size_max: Option<i64>,
+    /// Resolution range in megapixels.
+    pub mp_min: Option<f64>,
+    pub mp_max: Option<f64>,
+    /// Video length range in seconds.
+    pub dur_min: Option<i64>,
+    pub dur_max: Option<i64>,
+    pub camera: Option<String>,
+    pub ext: Option<String>,
+    pub has_gps: Option<bool>,
+    /// 'taken' (default) | 'mtime' | 'size' | 'name' | 'resolution' | 'duration'
+    pub sort: Option<String>,
+    /// Default: true (newest / largest first).
+    pub desc: Option<bool>,
 }
 
 impl FileFilter {
+    /// ORDER BY clause for the chosen sort (always with a stable tie-breaker).
+    pub fn order_sql(&self) -> String {
+        let dir = if self.desc.unwrap_or(true) { "DESC" } else { "ASC" };
+        let key = match self.sort.as_deref().unwrap_or("taken") {
+            "mtime" => "f.mtime",
+            "size" => "f.size",
+            "name" => "f.name COLLATE NOCASE",
+            "resolution" => "(COALESCE(f.width, 0) * COALESCE(f.height, 0))",
+            "duration" => "COALESCE(f.duration_ms, 0)",
+            _ => "f.taken_at",
+        };
+        format!("{key} {dir}, f.id {dir}")
+    }
+
     /// Returns a WHERE clause (without the keyword) and its parameters.
     pub fn to_sql(&self, conn: &Connection) -> Result<(String, Vec<rusqlite::types::Value>)> {
         use rusqlite::types::Value;
@@ -315,6 +356,62 @@ impl FileFilter {
                 _ => "('folder','mtime')",
             };
             w.push(format!("f.date_source IN {set}"));
+        }
+        if let Some(v) = self.date_from {
+            w.push("f.taken_at >= ?".into());
+            p.push(Value::Integer(v));
+        }
+        if let Some(v) = self.date_to {
+            w.push("f.taken_at <= ?".into());
+            p.push(Value::Integer(v));
+        }
+        if let Some(v) = self.size_min {
+            w.push("f.size >= ?".into());
+            p.push(Value::Integer(v));
+        }
+        if let Some(v) = self.size_max {
+            w.push("f.size <= ?".into());
+            p.push(Value::Integer(v));
+        }
+        if let Some(v) = self.mp_min {
+            w.push("COALESCE(f.width, 0) * COALESCE(f.height, 0) >= ?".into());
+            p.push(Value::Integer((v * 1_000_000.0) as i64));
+        }
+        if let Some(v) = self.mp_max {
+            w.push("COALESCE(f.width, 0) * COALESCE(f.height, 0) <= ?".into());
+            p.push(Value::Integer((v * 1_000_000.0) as i64));
+        }
+        if let Some(v) = self.dur_min {
+            w.push("f.duration_ms >= ?".into());
+            p.push(Value::Integer(v * 1000));
+        }
+        if let Some(v) = self.dur_max {
+            w.push("f.duration_ms <= ?".into());
+            p.push(Value::Integer(v * 1000));
+        }
+        if let Some(c) = self.camera.as_ref().filter(|c| !c.is_empty()) {
+            w.push("f.camera = ?".into());
+            p.push(Value::Text(c.clone()));
+        }
+        if let Some(e) = self.ext.as_ref().filter(|e| !e.is_empty()) {
+            // "jpg" also matches "jpeg"/"jpe"/"jfif"; "tif" matches "tiff"; "heic" matches "heif".
+            let group: &[&str] = match e.to_lowercase().as_str() {
+                "jpg" | "jpeg" => &["jpg", "jpeg", "jpe", "jfif"],
+                "tif" | "tiff" => &["tif", "tiff"],
+                "heic" | "heif" => &["heic", "heif"],
+                _ => &[],
+            };
+            if group.is_empty() {
+                w.push("f.ext = ?".into());
+                p.push(Value::Text(e.to_lowercase()));
+            } else {
+                w.push(format!("f.ext IN ({})", group.iter().map(|g| format!("'{g}'")).collect::<Vec<_>>().join(",")));
+            }
+        }
+        match self.has_gps {
+            Some(true) => w.push("f.lat IS NOT NULL AND f.lon IS NOT NULL".into()),
+            Some(false) => w.push("(f.lat IS NULL OR f.lon IS NULL)".into()),
+            None => {}
         }
         if self.online_only {
             w.push("v.online = 1".into());
@@ -392,7 +489,8 @@ pub fn query_files(conn: &Connection, filter: &FileFilter, offset: i64, limit: i
     let (w, p) = filter.to_sql(conn)?;
     let sql = format!(
         "SELECT {FILE_COLS} FROM files f JOIN volumes v ON v.id = f.volume_id WHERE {w}
-         ORDER BY f.taken_at DESC, f.id DESC LIMIT {limit} OFFSET {offset}"
+         ORDER BY {} LIMIT {limit} OFFSET {offset}",
+        filter.order_sql()
     );
     let mut st = conn.prepare(&sql)?;
     let rows = st.query_map(params_from_iter(p), FileRow::from_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -402,9 +500,10 @@ pub fn query_files(conn: &Connection, filter: &FileFilter, offset: i64, limit: i
 pub fn query_grid(conn: &Connection, filter: &FileFilter, offset: i64, limit: i64) -> Result<Vec<GridItem>> {
     let (w, p) = filter.to_sql(conn)?;
     let sql = format!(
-        "SELECT f.id, f.kind, f.taken_at, f.width, f.height, f.duration_ms, v.online
+        "SELECT f.id, f.kind, f.taken_at, f.width, f.height, f.duration_ms, v.online, f.size, f.mtime, f.name
          FROM files f JOIN volumes v ON v.id = f.volume_id WHERE {w}
-         ORDER BY f.taken_at DESC, f.id DESC LIMIT {limit} OFFSET {offset}"
+         ORDER BY {} LIMIT {limit} OFFSET {offset}",
+        filter.order_sql()
     );
     let mut st = conn.prepare(&sql)?;
     let rows = st
@@ -417,6 +516,9 @@ pub fn query_grid(conn: &Connection, filter: &FileFilter, offset: i64, limit: i6
                 height: r.get(4)?,
                 duration_ms: r.get(5)?,
                 online: r.get::<_, i64>(6)? != 0,
+                size: r.get(7)?,
+                mtime: r.get(8)?,
+                name: r.get(9)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -425,7 +527,7 @@ pub fn query_grid(conn: &Connection, filter: &FileFilter, offset: i64, limit: i6
 
 pub fn query_ids(conn: &Connection, filter: &FileFilter) -> Result<Vec<i64>> {
     let (w, p) = filter.to_sql(conn)?;
-    let sql = format!("SELECT f.id FROM files f JOIN volumes v ON v.id = f.volume_id WHERE {w} ORDER BY f.taken_at DESC, f.id DESC");
+    let sql = format!("SELECT f.id FROM files f JOIN volumes v ON v.id = f.volume_id WHERE {w} ORDER BY {}", filter.order_sql());
     let mut st = conn.prepare(&sql)?;
     let rows = st.query_map(params_from_iter(p), |r| r.get(0))?.collect::<rusqlite::Result<Vec<i64>>>()?;
     Ok(rows)
@@ -501,4 +603,85 @@ pub fn library_stats(conn: &Connection) -> Result<LibraryStats> {
 pub fn set_file_hash(conn: &Connection, id: i64, hash: &str) -> Result<()> {
     conn.execute("UPDATE files SET hash = ? WHERE id = ?", params![hash, id])?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Filter helpers for the UI
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ValueCount {
+    pub value: String,
+    pub count: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Default)]
+pub struct FilterOptions {
+    pub cameras: Vec<ValueCount>,
+    pub exts: Vec<ValueCount>,
+    pub years: Vec<i32>,
+    pub max_size: i64,
+    pub with_gps: i64,
+}
+
+/// Values that actually exist in the library, so dropdowns never offer empty choices.
+pub fn filter_options(conn: &Connection) -> Result<FilterOptions> {
+    let live = "f.missing = 0 AND f.quarantined = 0";
+    let vc = |sql: &str| -> Result<Vec<ValueCount>> {
+        let mut st = conn.prepare(sql)?;
+        let rows = st.query_map([], |r| Ok(ValueCount { value: r.get(0)?, count: r.get(1)? }))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    };
+    let cameras = vc(&format!(
+        "SELECT f.camera, COUNT(*) FROM files f WHERE {live} AND f.camera IS NOT NULL AND f.camera != '' GROUP BY f.camera ORDER BY COUNT(*) DESC"
+    ))?;
+    let exts = vc(&format!(
+        "SELECT CASE WHEN f.ext IN ('jpeg','jpe','jfif') THEN 'jpg' WHEN f.ext = 'tiff' THEN 'tif' WHEN f.ext = 'heif' THEN 'heic' ELSE f.ext END e,
+                COUNT(*) FROM files f WHERE {live} GROUP BY e ORDER BY COUNT(*) DESC"
+    ))?;
+    let years: Vec<i32> = {
+        let mut st = conn.prepare(&format!(
+            "SELECT DISTINCT CAST(strftime('%Y', f.taken_at, 'unixepoch') AS INTEGER) y FROM files f WHERE {live} AND f.taken_at IS NOT NULL ORDER BY y DESC"
+        ))?;
+        let rows = st.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<i32>>>()?;
+        rows
+    };
+    let (max_size, with_gps): (i64, i64) = conn.query_row(
+        &format!("SELECT COALESCE(MAX(f.size), 0), COALESCE(SUM(f.lat IS NOT NULL), 0) FROM files f WHERE {live}"),
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok(FilterOptions { cameras, exts, years, max_size, with_gps })
+}
+
+#[derive(Clone, Debug, Serialize, Default)]
+pub struct FilteredStats {
+    pub count: i64,
+    pub bytes: i64,
+    pub photos: i64,
+    pub videos: i64,
+    pub raws: i64,
+    pub first_taken: Option<i64>,
+    pub last_taken: Option<i64>,
+}
+
+/// Count and total size of whatever the current filter matches.
+pub fn filtered_stats(conn: &Connection, filter: &FileFilter) -> Result<FilteredStats> {
+    let (w, p) = filter.to_sql(conn)?;
+    let sql = format!(
+        "SELECT COUNT(*), COALESCE(SUM(f.size), 0), COALESCE(SUM(f.kind = 'photo'), 0), COALESCE(SUM(f.kind = 'video'), 0),
+                COALESCE(SUM(f.kind = 'raw'), 0), MIN(f.taken_at), MAX(f.taken_at)
+         FROM files f JOIN volumes v ON v.id = f.volume_id WHERE {w}"
+    );
+    Ok(conn.query_row(&sql, params_from_iter(p), |r| {
+        Ok(FilteredStats {
+            count: r.get(0)?,
+            bytes: r.get(1)?,
+            photos: r.get(2)?,
+            videos: r.get(3)?,
+            raws: r.get(4)?,
+            first_taken: r.get(5)?,
+            last_taken: r.get(6)?,
+        })
+    })?)
 }

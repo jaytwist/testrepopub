@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Virtuoso } from "react-virtuoso";
-import { api, fmtCount, fmtDuration, thumbUrl, type FileFilter, type GridItem, type MonthCount } from "../api";
+import { api, fmtBytes, fmtCount, fmtDate, fmtDuration, thumbUrl, type FileFilter, type FilteredStats, type GridItem, type MonthCount, type SortKey } from "../api";
 import { useJob } from "../App";
 import FilterBar from "../components/FilterBar";
 import Viewer from "../components/Viewer";
@@ -16,16 +16,75 @@ function monthKey(ts: number | null) {
   const d = new Date(ts * 1000);
   return `${d.getUTCFullYear()}-${d.getUTCMonth() + 1}`;
 }
-function monthTitle(key: string) {
+function monthTitle(key: string, prefix = "") {
   if (key === "none") return "날짜 없음";
   const [y, m] = key.split("-");
-  return `${y}년 ${m}월`;
+  return `${prefix}${y}년 ${m}월`;
+}
+/** mtime is a real UTC timestamp: group by the PC's local month. */
+function localMonthKey(ts: number) {
+  const d = new Date(ts * 1000);
+  return `${d.getFullYear()}-${d.getMonth() + 1}`;
+}
+
+const MB = 1024 * 1024;
+const SIZE_BUCKETS: [number, string][] = [[1024 * MB, "1GB 이상"], [100 * MB, "100MB – 1GB"], [10 * MB, "10 – 100MB"], [MB, "1 – 10MB"], [0, "1MB 미만"]];
+const MP_BUCKETS: [number, string][] = [[40, "40MP 이상"], [12, "12 – 40MP"], [2, "2 – 12MP"], [0.000001, "2MP 미만"], [0, "해상도 정보 없음"]];
+const DUR_BUCKETS: [number, string][] = [[600, "10분 이상"], [60, "1 – 10분"], [1, "1분 미만"], [0, "길이 없음 (사진)"]];
+
+function bucket(table: [number, string][], v: number) {
+  return (table.find(([min]) => v >= min) ?? table[table.length - 1])[1];
+}
+
+/** Group key + header title for an item under the current sort. */
+function groupOf(item: GridItem, sort: SortKey): [string, string] {
+  switch (sort) {
+    case "mtime": {
+      const k = localMonthKey(item.mtime);
+      return [k, monthTitle(k, "수정: ")];
+    }
+    case "size": {
+      const t = bucket(SIZE_BUCKETS, item.size);
+      return [t, t];
+    }
+    case "resolution": {
+      const t = bucket(MP_BUCKETS, ((item.width ?? 0) * (item.height ?? 0)) / 1e6);
+      return [t, t];
+    }
+    case "duration": {
+      const t = bucket(DUR_BUCKETS, (item.duration_ms ?? 0) / 1000);
+      return [t, t];
+    }
+    case "name": {
+      const c = (item.name[0] ?? "#").toUpperCase();
+      const k = /[0-9]/.test(c) ? "0-9" : /[A-Z]/.test(c) ? c : /[가-힣]/.test(c) ? "한글" : "기타";
+      return [k, k];
+    }
+    default: {
+      const k = monthKey(item.taken_at);
+      return [k, monthTitle(k)];
+    }
+  }
+}
+
+/** Small caption under each tile that shows the value being sorted by. */
+function caption(item: GridItem, sort: SortKey): string | null {
+  switch (sort) {
+    case "size": return fmtBytes(item.size);
+    case "resolution": return item.width ? `${item.width}×${item.height}` : null;
+    case "duration": return item.duration_ms ? fmtDuration(item.duration_ms) : null;
+    case "name": return item.name;
+    case "mtime": return fmtDate(item.mtime);
+    default: return null;
+  }
 }
 
 export default function Library() {
   const { version } = useJob();
   const [filter, setFilter] = useState<FileFilter>({});
   const [timeline, setTimeline] = useState<MonthCount[]>([]);
+  const [stats, setStats] = useState<FilteredStats | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [items, setItems] = useState<GridItem[]>([]);
   const [done, setDone] = useState(false);
   const [cols, setCols] = useState(6);
@@ -38,18 +97,29 @@ export default function Library() {
   const wrapRef = useRef<HTMLDivElement>(null);
   const gen = useRef(0);
 
-  const total = useMemo(() => timeline.reduce((a, m) => a + m.count, 0), [timeline]);
+  // Group by the sort the *loaded* items were fetched with (not the one just selected), so a
+  // transitional render never mixes orders.
+  const [loadedSort, setLoadedSort] = useState<SortKey>("taken");
+  const sort: SortKey = loadedSort;
+  const total = stats?.count ?? 0;
   const monthCounts = useMemo(() => new Map(timeline.map((m) => [`${m.year}-${m.month}`, m.count])), [timeline]);
 
   const reload = useCallback(() => {
     const g = ++gen.current;
     loading.current = true;
     setDone(false);
-    Promise.all([api.timeline(filter), api.grid(filter, 0, PAGE)]).then(([tl, first]) => {
+    Promise.all([api.timeline(filter), api.grid(filter, 0, PAGE), api.filteredStats(filter)]).then(([tl, first, st]) => {
       if (g !== gen.current) return;
       setTimeline(tl);
+      setStats(st);
+      setLoadedSort(filter.sort ?? "taken");
       setItems(first);
       setDone(first.length < PAGE);
+      setLoadError(null);
+      loading.current = false;
+    }).catch((e) => {
+      if (g !== gen.current) return;
+      setLoadError(String(e));
       loading.current = false;
     });
   }, [filter]);
@@ -83,25 +153,29 @@ export default function Library() {
   const rows: Row[] = useMemo(() => {
     const out: Row[] = [];
     let cur: string | null = null;
-    let bucket: { item: GridItem; index: number }[] = [];
+    let bucketItems: { item: GridItem; index: number }[] = [];
+    // Bucket sizes are exact for capture-date sort (from the timeline); otherwise count what is loaded.
+    const counts = new Map<string, number>();
+    if (sort !== "taken") items.forEach((it) => { const k = groupOf(it, sort)[0]; counts.set(k, (counts.get(k) ?? 0) + 1); });
     const flush = () => {
-      for (let i = 0; i < bucket.length; i += cols) {
-        out.push({ type: "tiles", key: `${cur}-${i}`, items: bucket.slice(i, i + cols) });
+      for (let i = 0; i < bucketItems.length; i += cols) {
+        // Key by the first item's position: unique even if a group label repeats.
+        out.push({ type: "tiles", key: `t-${bucketItems[i].index}`, items: bucketItems.slice(i, i + cols) });
       }
-      bucket = [];
+      bucketItems = [];
     };
     items.forEach((item, index) => {
-      const k = monthKey(item.taken_at);
+      const [k, title] = groupOf(item, sort);
       if (k !== cur) {
         flush();
         cur = k;
-        out.push({ type: "header", key: `h-${k}`, title: monthTitle(k), count: monthCounts.get(k) ?? 0 });
+        out.push({ type: "header", key: `h-${index}`, title, count: sort === "taken" ? monthCounts.get(k) ?? 0 : counts.get(k) ?? 0 });
       }
-      bucket.push({ item, index });
+      bucketItems.push({ item, index });
     });
     flush();
     return out;
-  }, [items, cols, monthCounts]);
+  }, [items, cols, monthCounts, sort]);
 
   const onTileClick = (e: React.MouseEvent, index: number, id: number) => {
     if (e.shiftKey && anchor != null) {
@@ -143,10 +217,20 @@ export default function Library() {
       <header className="page-head">
         <div>
           <h1>라이브러리</h1>
-          <div className="muted">{fmtCount(total)}개 항목 · 클릭하면 크게 보기, Ctrl/Shift+클릭으로 여러 개 선택</div>
+          <div className="muted">
+            {stats ? (
+              <>
+                <b className="text">{fmtCount(stats.count)}개</b> · {fmtBytes(stats.bytes)}
+                {stats.count > 0 && <> · 사진 {fmtCount(stats.photos)} · 동영상 {fmtCount(stats.videos)}{stats.raws ? ` · RAW ${fmtCount(stats.raws)}` : ""}</>}
+                {stats.first_taken != null && stats.count > 1 && <> · {fmtDate(stats.first_taken)} ~ {fmtDate(stats.last_taken)}</>}
+              </>
+            ) : "불러오는 중…"}
+          </div>
+          <div className="muted small">클릭하면 크게 보기 · Ctrl/Shift+클릭으로 여러 개 선택</div>
         </div>
       </header>
-      <FilterBar filter={filter} onChange={setFilter} timeline={timeline} />
+      <FilterBar filter={filter} onChange={setFilter} />
+      {loadError && <div className="alert bad">불러오기 실패: {loadError}</div>}
 
       {selected.size > 0 && (
         <div className="selbar">
@@ -168,11 +252,21 @@ export default function Library() {
         </div>
       )}
 
-      {total === 0 && !loading.current ? (
+      {stats && total === 0 ? (
         <div className="empty">
           <div className="empty-icon">⛁</div>
-          <h2>아직 사진이 없습니다</h2>
-          <p>왼쪽 <b>드라이브 · 폴더</b>에서 C 드라이브나 외장 드라이브의 폴더를 추가하고 스캔하세요.</p>
+          {Object.keys(filter).some((k) => k !== "sort" && k !== "desc" && (filter as any)[k] != null && (filter as any)[k] !== false) ? (
+            <>
+              <h2>조건에 맞는 항목이 없습니다</h2>
+              <p>필터를 줄이거나 「모두 지우기」를 눌러 보세요.</p>
+              <button className="btn" onClick={() => setFilter({ sort: filter.sort, desc: filter.desc })}>필터 모두 지우기</button>
+            </>
+          ) : (
+            <>
+              <h2>아직 사진이 없습니다</h2>
+              <p>왼쪽 <b>드라이브 · 폴더</b>에서 「내 사진 폴더 빠르게 추가」를 누르거나 외장 드라이브를 추가하고 스캔하세요.</p>
+            </>
+          )}
         </div>
       ) : (
         <Virtuoso
@@ -184,7 +278,7 @@ export default function Library() {
           itemContent={(_, r) =>
             r.type === "header" ? (
               <div className="month-head">
-                {r.title} <span className="muted">{fmtCount(r.count)}</span>
+                {r.title} {r.count > 0 && <span className="muted">{fmtCount(r.count)}{sort !== "taken" && !done ? "+" : ""}</span>}
               </div>
             ) : (
               <div className="tile-row" style={{ gridTemplateColumns: `repeat(${cols}, ${TILE}px)`, gap: GAP }}>
@@ -200,6 +294,7 @@ export default function Library() {
                     {item.kind === "video" && <span className="badge-video">▶ {fmtDuration(item.duration_ms)}</span>}
                     {item.kind === "raw" && <span className="badge-raw">RAW</span>}
                     {!item.online && <span className="badge-offline" title="드라이브 연결 안 됨">⏏</span>}
+                    {caption(item, sort) && <span className="tile-caption">{caption(item, sort)}</span>}
                   </div>
                 ))}
               </div>
@@ -217,7 +312,7 @@ export default function Library() {
             if (i > items.length - 50) loadMore();
           }}
           onClose={() => setViewIndex(null)}
-          onChanged={() => api.timeline(filter).then(setTimeline)}
+          onChanged={() => { api.timeline(filter).then(setTimeline); api.filteredStats(filter).then(setStats); }}
         />
       )}
     </div>

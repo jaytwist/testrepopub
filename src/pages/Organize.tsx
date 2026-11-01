@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { open, confirm } from "@tauri-apps/plugin-dialog";
-import { api, fmtBytes, fmtCount, type FileFilter, type OrganizeOptions, type PlanItem, type PlanView } from "../api";
+import { api, fmtBytes, fmtCount, type FileFilter, type FilteredStats, type OrganizeOptions, type PlanItem, type PlanView } from "../api";
 import { useJob } from "../App";
 import FilterBar from "../components/FilterBar";
 
@@ -32,6 +32,11 @@ export default function Organize() {
   const [tab, setTab] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<any>(null);
+  const [target, setTarget] = useState<FilteredStats | null>(null);
+
+  useEffect(() => {
+    api.filteredStats(opts.filter).then(setTarget).catch(() => setTarget(null));
+  }, [opts.filter]);
 
   // Pick up results of our jobs.
   useEffect(() => {
@@ -167,8 +172,11 @@ export default function Organize() {
 
         <label>대상 파일</label>
         <div>
-          <FilterBar filter={opts.filter} onChange={(f: FileFilter) => set({ filter: f })} />
-          <div className="muted small">필터를 비워두면 연결된 모든 드라이브의 모든 사진·동영상이 대상입니다.</div>
+          <FilterBar filter={opts.filter} onChange={(f: FileFilter) => set({ filter: f })} showSort={false} />
+          <div className="muted small">
+            {target && <><b className="text">대상 {fmtCount(target.count)}개 · {fmtBytes(target.bytes)}</b> · </>}
+            필터를 비워두면 연결된 모든 드라이브의 모든 사진·동영상이 대상입니다.
+          </div>
         </div>
       </div>
 

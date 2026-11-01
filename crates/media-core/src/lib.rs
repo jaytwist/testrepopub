@@ -12,6 +12,7 @@ pub mod meta;
 pub mod organizer;
 pub mod scanner;
 pub mod thumbs;
+pub mod userfiles;
 pub mod volumes;
 
 pub use db::Db;

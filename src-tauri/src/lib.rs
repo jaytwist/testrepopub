@@ -9,12 +9,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use media_core::db::{self, FileFilter, FileRow, GridItem, LibraryStats, MonthCount, SourceRow, VolumeRow};
+use media_core::db::{self, FileFilter, FileRow, FilterOptions, FilteredStats, GridItem, LibraryStats, MonthCount, SourceRow, VolumeRow};
 use media_core::dedupe::{self, DupGroup, DupKind, DupSummary, Similarity};
 use media_core::journal::{self, BatchRow};
 use media_core::labels::{self, LabelCount, LabelRow};
 use media_core::organizer::{self, OrganizeOptions, Plan, PlanItem, PlanSummary};
-use media_core::scanner::{self, ScanOptions};
+use media_core::scanner;
+use media_core::userfiles::{self, ScanOptions};
 use media_core::thumbs::{self, ThumbCache};
 use media_core::{meta, volumes, Db, Progress, StopFlag};
 use serde::Serialize;
@@ -140,7 +141,7 @@ fn remove_source(state: State<AppState>, id: i64) -> CmdResult<()> {
 #[tauri::command]
 fn start_scan(app: AppHandle, state: State<AppState>, source_id: Option<i64>) -> CmdResult<()> {
     spawn_job(&app, &state, "scan", move |st, progress| {
-        let opts = ScanOptions::default();
+        let opts = userfiles::load_options(&st.db.conn()?)?;
         let stats = match source_id {
             Some(id) => vec![scanner::scan_source(&st.db, id, &opts, &st.stop, progress)?],
             None => scanner::scan_all(&st.db, &opts, &st.stop, progress)?,
@@ -149,6 +150,73 @@ fn start_scan(app: AppHandle, state: State<AppState>, source_id: Option<i64>) ->
         let warm = thumbs::warm(&st.db, &st.thumbs, &st.stop, progress)?;
         Ok(serde_json::json!({ "scan": stats, "thumbs": warm }))
     })
+}
+
+#[tauri::command]
+fn get_scan_options(state: State<AppState>) -> CmdResult<ScanOptions> {
+    let conn = state.db.conn().map_err(err)?;
+    userfiles::load_options(&conn).map_err(err)
+}
+
+#[tauri::command]
+fn set_scan_options(state: State<AppState>, options: ScanOptions) -> CmdResult<()> {
+    let conn = state.db.conn().map_err(err)?;
+    userfiles::save_options(&conn, &options).map_err(err)
+}
+
+#[tauri::command]
+fn default_scan_options() -> ScanOptions {
+    ScanOptions::default()
+}
+
+#[derive(Serialize)]
+struct SuggestedFolder {
+    label: String,
+    path: String,
+    kind: String,
+    already_added: bool,
+}
+
+/// The user's own media folders (Pictures, Videos, Desktop, Downloads, Documents, OneDrive) and
+/// connected external drives: one click to add, instead of scanning all of C:.
+#[tauri::command]
+fn suggested_folders(app: AppHandle, state: State<AppState>) -> CmdResult<Vec<SuggestedFolder>> {
+    let conn = state.db.conn().map_err(err)?;
+    let sources: Vec<PathBuf> = db::list_sources(&conn).map_err(err)?.into_iter().map(|s| PathBuf::from(s.abs_path)).collect();
+    let covered = |p: &Path| sources.iter().any(|s| p.starts_with(s));
+    let paths = app.path();
+    let mut cands: Vec<(String, Option<PathBuf>, &str)> = vec![
+        ("사진".into(), paths.picture_dir().ok(), "user"),
+        ("동영상".into(), paths.video_dir().ok(), "user"),
+        ("바탕 화면".into(), paths.desktop_dir().ok(), "user"),
+        ("다운로드".into(), paths.download_dir().ok(), "user"),
+        ("문서".into(), paths.document_dir().ok(), "user"),
+    ];
+    for var in ["OneDrive", "OneDriveConsumer", "OneDriveCommercial"] {
+        if let Some(p) = std::env::var_os(var) {
+            cands.push(("OneDrive".into(), Some(PathBuf::from(p)), "user"));
+        }
+    }
+    let mut out: Vec<SuggestedFolder> = Vec::new();
+    for (label, p, kind) in cands {
+        let Some(p) = p.filter(|p| p.is_dir()) else { continue };
+        if out.iter().any(|o| Path::new(&o.path) == p) {
+            continue;
+        }
+        out.push(SuggestedFolder { label, already_added: covered(&p), path: p.to_string_lossy().into(), kind: kind.into() });
+    }
+    // External drives: the whole drive is a sensible source (system folders are skipped anyway).
+    let mut drives: Vec<_> = volumes::mounted().into_values().filter(|v| v.removable).collect();
+    drives.sort_by(|a, b| a.root.cmp(&b.root));
+    for v in drives {
+        out.push(SuggestedFolder {
+            label: format!("외장 드라이브 {} ({})", v.root.display(), v.label),
+            already_added: covered(&v.root),
+            path: v.root.to_string_lossy().into(),
+            kind: "drive".into(),
+        });
+    }
+    Ok(out)
 }
 
 #[tauri::command]
@@ -175,6 +243,18 @@ fn library_stats(state: State<AppState>) -> CmdResult<LibraryStats> {
 fn timeline(state: State<AppState>, filter: FileFilter) -> CmdResult<Vec<MonthCount>> {
     let conn = state.db.conn().map_err(err)?;
     db::timeline_summary(&conn, &filter).map_err(err)
+}
+
+#[tauri::command]
+fn filter_options(state: State<AppState>) -> CmdResult<FilterOptions> {
+    let conn = state.db.conn().map_err(err)?;
+    db::filter_options(&conn).map_err(err)
+}
+
+#[tauri::command]
+fn filtered_stats(state: State<AppState>, filter: FileFilter) -> CmdResult<FilteredStats> {
+    let conn = state.db.conn().map_err(err)?;
+    db::filtered_stats(&conn, &filter).map_err(err)
 }
 
 #[tauri::command]
@@ -477,6 +557,12 @@ pub fn run() {
             add_source,
             remove_source,
             start_scan,
+            get_scan_options,
+            set_scan_options,
+            default_scan_options,
+            suggested_folders,
+            filter_options,
+            filtered_stats,
             start_thumbs,
             cancel_job,
             library_stats,

@@ -13,7 +13,22 @@ export interface FileFilter {
   date_confidence?: string | null;
   online_only?: boolean;
   ids?: number[] | null;
+  date_from?: number | null;
+  date_to?: number | null;
+  size_min?: number | null;
+  size_max?: number | null;
+  mp_min?: number | null;
+  mp_max?: number | null;
+  dur_min?: number | null;
+  dur_max?: number | null;
+  camera?: string | null;
+  ext?: string | null;
+  has_gps?: boolean | null;
+  sort?: SortKey | null;
+  desc?: boolean | null;
 }
+
+export type SortKey = "taken" | "mtime" | "size" | "name" | "resolution" | "duration";
 
 export interface VolumeRow {
   id: number; uid: string; label: string; mount: string; removable: boolean; online: boolean;
@@ -31,8 +46,27 @@ export interface FileRow {
 }
 export interface GridItem {
   id: number; kind: string; taken_at: number | null; width: number | null; height: number | null;
-  duration_ms: number | null; online: boolean;
+  duration_ms: number | null; online: boolean; size: number; mtime: number; name: string;
 }
+export interface ValueCount { value: string; count: number }
+export interface FilterOptions { cameras: ValueCount[]; exts: ValueCount[]; years: number[]; max_size: number; with_gps: number }
+export interface FilteredStats {
+  count: number; bytes: number; photos: number; videos: number; raws: number;
+  first_taken: number | null; last_taken: number | null;
+}
+export interface ScanOptions {
+  min_image_bytes: number; min_image_side: number; skip_hidden: boolean; skip_app_folders: boolean;
+  skip_cloud_only: boolean; exclude_dirs: string[];
+}
+export interface SkipCounts {
+  system_folders: number; hidden_folders: number; app_files: number; hidden_files: number;
+  system_files: number; cloud_only: number; too_small: number;
+}
+export interface ScanStats {
+  source_id: number; seen: number; added: number; updated: number; unchanged: number; missing: number;
+  errors: number; skipped: SkipCounts;
+}
+export interface SuggestedFolder { label: string; path: string; kind: "user" | "drive"; already_added: boolean }
 export interface MonthCount { year: number; month: number; count: number }
 export interface LibraryStats {
   files: number; bytes: number; photos: number; videos: number; raws: number; offline_files: number;
@@ -74,6 +108,12 @@ export const api = {
   addSource: (path: string) => invoke<number>("add_source", { path }),
   removeSource: (id: number) => invoke<void>("remove_source", { id }),
   startScan: (sourceId?: number) => invoke<void>("start_scan", { sourceId: sourceId ?? null }),
+  getScanOptions: () => invoke<ScanOptions>("get_scan_options"),
+  setScanOptions: (options: ScanOptions) => invoke<void>("set_scan_options", { options }),
+  defaultScanOptions: () => invoke<ScanOptions>("default_scan_options"),
+  suggestedFolders: () => invoke<SuggestedFolder[]>("suggested_folders"),
+  filterOptions: () => invoke<FilterOptions>("filter_options"),
+  filteredStats: (filter: FileFilter) => invoke<FilteredStats>("filtered_stats", { filter }),
   startThumbs: () => invoke<void>("start_thumbs"),
   cancelJob: () => invoke<void>("cancel_job"),
 
@@ -152,6 +192,19 @@ export function fmtBytes(n: number): string {
 
 export function fmtCount(n: number): string {
   return n.toLocaleString("ko-KR");
+}
+
+/** "YYYY-MM-DD" (from <input type="date">) to a wall-clock timestamp; endOfDay for range ends. */
+export function dateInputToTs(v: string, endOfDay = false): number | null {
+  if (!v) return null;
+  const [y, m, d] = v.split("-").map(Number);
+  return Date.UTC(y, m - 1, d, endOfDay ? 23 : 0, endOfDay ? 59 : 0, endOfDay ? 59 : 0) / 1000;
+}
+export function tsToDateInput(ts: number | null | undefined): string {
+  if (ts == null) return "";
+  const d = new Date(ts * 1000);
+  const p = (x: number) => String(x).padStart(2, "0");
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())}`;
 }
 
 /** taken_at is camera wall-clock time stored as UTC seconds. */

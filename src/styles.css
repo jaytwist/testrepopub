@@ -209,3 +209,32 @@ input:focus, select:focus { outline: 2px solid var(--accent-soft); border-color:
 .path-tail { direction: rtl; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; word-break: normal; }
 .card .row-between { min-width: 0; }
 .card .pill { max-width: 60%; overflow: hidden; text-overflow: ellipsis; }
+
+/* --- Search / sort --- */
+.text { color: var(--text); }
+.ok-text { color: var(--ok); font-size: 12px; }
+.filterbar-wrap { margin-bottom: 8px; }
+.filterbar-wrap .filterbar { margin-bottom: 6px; }
+.sort { display: inline-flex; gap: 4px; align-items: center; }
+.filter-panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; margin-bottom: 8px; }
+.fp-row { display: grid; grid-template-columns: 96px 1fr; gap: 12px; align-items: start; }
+.fp-row > label { font-weight: 600; font-size: 13px; padding-top: 5px; }
+.fp-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 10px 14px; }
+.fp-grid label, .scan-settings label { display: block; font-weight: 600; font-size: 12px; margin-bottom: 4px; }
+.fp-grid select { width: 100%; max-width: none; }
+.chip.ghost.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+input.num { width: 96px; }
+.active-filters { align-items: center; }
+.tile-caption { position: absolute; left: 0; right: 0; bottom: 0; padding: 14px 6px 4px; font-size: 11px; color: #fff; background: linear-gradient(transparent, rgba(0, 0, 0, 0.65)); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
+.tile .badge-video { bottom: 22px; }
+
+/* --- Sources: quick add + settings --- */
+.quick-add { margin: 12px 0; border-color: var(--accent); }
+.quick-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 6px; margin-top: 8px; }
+.quick-item { display: flex; flex-direction: column; gap: 2px; padding: 8px 10px 8px 34px; border: 1px solid var(--line); border-radius: 8px; position: relative; cursor: pointer; }
+.quick-item input { position: absolute; left: 10px; top: 10px; }
+.quick-item.on { background: var(--accent-soft); border-color: var(--accent); }
+.settings-head { display: flex; align-items: baseline; gap: 12px; cursor: pointer; margin-top: 10px; }
+.scan-settings { gap: 12px; }
+.chips.excl { margin: 4px 0; }
+.chips.excl .chip button { border: 0; background: none; cursor: pointer; margin-left: 4px; padding: 0; color: var(--muted); }

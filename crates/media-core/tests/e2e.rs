@@ -131,6 +131,23 @@ fn full_workflow() {
     // Junk that must be ignored.
     fs::write(disk_a.join("DCIM/notes.txt"), b"not media").unwrap();
     fs::write(disk_a.join("DCIM/tiny.jpg"), b"\xFF\xD8tiny").unwrap();
+    // System / app / hidden folders: real-looking photos that are NOT the user's.
+    write_jpeg(&disk_a.join("Program Files/Vendor/splash.jpg"), &picture(31, 800, 600), None);
+    write_jpeg(&disk_a.join("Users/me/AppData/Local/Cache/img.jpg"), &picture(32, 800, 600), None);
+    fs::create_dir_all(disk_a.join("Games/MyGame/textures")).unwrap();
+    for dll in ["engine.dll", "physics.dll", "audio.dll"] {
+        fs::write(disk_a.join("Games/MyGame").join(dll), b"MZ").unwrap();
+    }
+    write_jpeg(&disk_a.join("Games/MyGame/textures/sky.jpg"), &picture(33, 1024, 1024), None);
+    write_jpeg(&disk_b.join(".hidden/secret.jpg"), &picture(34, 800, 600), None);
+    write_jpeg(&disk_b.join("DCIM/.thumbnails/thumb.jpg"), &picture(35, 800, 600), None);
+    // A noisy 300px sticker: passes the byte check, fails the pixel check.
+    let noisy = DynamicImage::ImageRgb8(ImageBuffer::from_fn(300, 300, |x, y| {
+        let v = (x.wrapping_mul(2654435761) ^ y.wrapping_mul(40503)).wrapping_mul(2246822519) >> 24;
+        Rgb([v as u8, v.wrapping_mul(3) as u8, v.wrapping_mul(7) as u8])
+    }));
+    write_jpeg(&disk_b.join("KakaoTalk/sticker.jpg"), &noisy, None);
+    assert!(fs::metadata(disk_b.join("KakaoTalk/sticker.jpg")).unwrap().len() > 10 * 1024, "fixture: sticker must pass the byte check");
 
     let originals: Vec<(PathBuf, String)> = walk_media(root);
 
@@ -147,6 +164,11 @@ fn full_workflow() {
     let stats = scanner::scan_all(&db, &ScanOptions::default(), &stop, &quiet).unwrap();
     let added: u64 = stats.iter().map(|s| s.added).sum();
     assert_eq!(added, 8, "{stats:?}");
+    let sk = |f: fn(&media_core::userfiles::SkipCounts) -> u64| stats.iter().map(|s| f(&s.skipped)).sum::<u64>();
+    assert_eq!(sk(|c| c.system_folders), 3, "Program Files, AppData, .thumbnails: {stats:?}");
+    assert_eq!(sk(|c| c.hidden_folders), 1, ".hidden");
+    assert_eq!(sk(|c| c.app_files), 1, "game texture");
+    assert_eq!(sk(|c| c.too_small), 2, "tiny.jpg by bytes + sticker by pixels");
 
     let all = db::query_files(&conn, &FileFilter::default(), 0, 100).unwrap();
     let by_name = |n: &str| all.iter().find(|f| f.rel_path.ends_with(n)).unwrap_or_else(|| panic!("{n} missing")).clone();
@@ -172,6 +194,33 @@ fn full_workflow() {
     assert_eq!(y2019.len(), 4, "IMG_0001 x2 + two DSC0001");
     let tl = db::timeline_summary(&conn, &FileFilter::default()).unwrap();
     assert!(tl.iter().any(|m| m.year == 2019 && m.month == 5 && m.count == 4), "{tl:?}");
+
+    // Metadata sort + range filters.
+    let q = |f: FileFilter| db::query_files(&conn, &f, 0, 100).unwrap();
+    let by_size = q(FileFilter { sort: Some("size".into()), ..Default::default() });
+    assert!(by_size.windows(2).all(|w| w[0].size >= w[1].size), "size desc");
+    let by_name = q(FileFilter { sort: Some("name".into()), desc: Some(false), ..Default::default() });
+    let names: Vec<String> = by_name.iter().map(|f| f.name.to_lowercase()).collect();
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert_eq!(names, sorted, "name asc");
+    assert_eq!(q(FileFilter { mp_min: Some(1.0), ..Default::default() }).len(), 2, "only the two 1200x900 originals are >= 1 MP");
+    assert_eq!(q(FileFilter { camera: Some("Apple iPhone 13".into()), ..Default::default() }).len(), 2);
+    assert_eq!(q(FileFilter { ext: Some("png".into()), ..Default::default() }).len(), 1);
+    assert_eq!(q(FileFilter { ext: Some("jpeg".into()), ..Default::default() }).len(), 7, "jpeg == jpg group");
+    let may = |d: u32| media_core::meta::to_ts(chrono::NaiveDate::from_ymd_opt(2019, 5, d).unwrap().and_hms_opt(0, 0, 0).unwrap());
+    assert_eq!(q(FileFilter { date_from: Some(may(1)), date_to: Some(may(31)), ..Default::default() }).len(), 4);
+    assert_eq!(q(FileFilter { date_from: Some(may(13)), date_to: Some(may(31)), ..Default::default() }).len(), 2, "only the two DSC0001");
+    let big = img1.size;
+    assert!(q(FileFilter { size_min: Some(big), ..Default::default() }).iter().all(|f| f.size >= big));
+    let opts = db::filter_options(&conn).unwrap();
+    assert!(opts.cameras.iter().any(|c| c.value == "Apple iPhone 13" && c.count == 2), "{:?}", opts.cameras);
+    assert!(opts.exts.iter().any(|e| e.value == "jpg" && e.count == 7));
+    assert!(opts.years.windows(2).all(|w| w[0] > w[1]), "years newest first: {:?}", opts.years);
+    assert!([2021, 2020, 2019, 2015].iter().all(|y| opts.years.contains(y)), "{:?}", opts.years);
+    let st = db::filtered_stats(&conn, &FileFilter { kind: Some("photo".into()), ..Default::default() }).unwrap();
+    assert_eq!(st.count, 8);
+    assert_eq!(st.photos, 8);
 
     // Rescan is incremental: nothing changes.
     let stats = scanner::scan_all(&db, &ScanOptions::default(), &stop, &quiet).unwrap();

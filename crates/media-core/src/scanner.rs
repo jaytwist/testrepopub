@@ -10,37 +10,14 @@ use std::time::UNIX_EPOCH;
 use anyhow::{anyhow, Result};
 use rayon::prelude::*;
 use rusqlite::{params, Connection};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use walkdir::WalkDir;
 
 use crate::media::{ext_of, kind_for_ext, Kind};
+use crate::userfiles::{AppDirDetector, Rules, Skip, SkipCounts};
 use crate::{labels, meta, volumes, Db, Progress, ProgressFn, StopFlag};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ScanOptions {
-    /// Images smaller than this are skipped (icons, web thumbnails). Videos are never skipped.
-    pub min_image_bytes: u64,
-    /// Directory names skipped anywhere in the tree (case-insensitive).
-    pub exclude_dirs: Vec<String>,
-}
-
-impl Default for ScanOptions {
-    fn default() -> Self {
-        Self {
-            min_image_bytes: 10 * 1024,
-            exclude_dirs: [
-                "Windows", "Program Files", "Program Files (x86)", "ProgramData", "$Recycle.Bin", "$RECYCLE.BIN",
-                "System Volume Information", "AppData", "node_modules", ".git", ".svn", ".cache", ".thumbnails",
-                "Recovery", "PerfLogs", "MSOCache", "$WinREAgent", "Config.Msi", "OneDriveTemp",
-                volumes::QUARANTINE_DIR, ".media-organizer",
-            ]
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
-        }
-    }
-}
+pub use crate::userfiles::ScanOptions;
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct ScanStats {
@@ -51,6 +28,8 @@ pub struct ScanStats {
     pub unchanged: u64,
     pub missing: u64,
     pub errors: u64,
+    /// What was deliberately not indexed, and why.
+    pub skipped: SkipCounts,
 }
 
 struct Candidate {
@@ -88,16 +67,24 @@ pub fn scan_source(db: &Db, source_id: i64, opts: &ScanOptions, stop: &StopFlag,
     let job = format!("scan:{source_id}");
     let mut stats = ScanStats { source_id, ..Default::default() };
 
-    // 1. Walk.
-    let excl: Vec<String> = opts.exclude_dirs.iter().map(|s| s.to_lowercase()).collect();
+    // 1. Walk, skipping anything that is not the user's own media.
+    let rules = Rules::new(opts);
+    let skipped = std::cell::RefCell::new(SkipCounts::default());
+    let mut apps = AppDirDetector::default();
     let mut cands: Vec<Candidate> = Vec::new();
     let mut walked: u64 = 0;
     let walker = WalkDir::new(&abs_root).follow_links(false).into_iter().filter_entry(|e| {
         if e.depth() == 0 || !e.file_type().is_dir() {
             return true;
         }
-        let n = e.file_name().to_string_lossy().to_lowercase();
-        !excl.contains(&n)
+        let md = e.metadata().ok();
+        match rules.dir_skip(e.path(), md.as_ref()) {
+            Some(reason) => {
+                skipped.borrow_mut().add(reason);
+                false
+            }
+            None => true,
+        }
     });
     for entry in walker {
         if stop.is_stopped() {
@@ -114,6 +101,9 @@ pub fn scan_source(db: &Db, source_id: i64, opts: &ScanOptions, stop: &StopFlag,
         if !entry.file_type().is_file() {
             continue;
         }
+        if opts.skip_app_folders {
+            apps.observe(entry.path());
+        }
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with("._") {
             continue; // macOS resource forks on exFAT drives
@@ -125,12 +115,23 @@ pub fn scan_source(db: &Db, source_id: i64, opts: &ScanOptions, stop: &StopFlag,
             continue;
         };
         let size = md.len();
-        if kind != Kind::Video && size < opts.min_image_bytes {
+        if let Some(reason) = rules.file_skip(&name, kind == Kind::Video, size, &md) {
+            skipped.borrow_mut().add(reason);
             continue;
         }
         let Ok(rel) = volumes::rel_of(&vol_root, entry.path()) else { continue };
         cands.push(Candidate { rel, abs: entry.path().to_path_buf(), name, ext, kind, size, mtime: mtime_of(&md) });
     }
+    // Media shipped inside installed programs and games (icons, textures, sample clips).
+    if opts.skip_app_folders {
+        let dirs = apps.app_dirs();
+        if !dirs.is_empty() {
+            let before = cands.len();
+            cands.retain(|c| !AppDirDetector::contains(&dirs, &abs_root, &c.abs));
+            skipped.borrow_mut().app_files += (before - cands.len()) as u64;
+        }
+    }
+    stats.skipped = skipped.into_inner();
     stats.seen = cands.len() as u64;
 
     // 2. Diff against the index.
@@ -174,6 +175,16 @@ pub fn scan_source(db: &Db, source_id: i64, opts: &ScanOptions, stop: &StopFlag,
                 (*c, m)
             })
             .collect();
+        // Icon-sized pictures (stickers, emoji, web thumbnails) are not the user's photos.
+        let (metas, small): (Vec<_>, Vec<_>) =
+            metas.into_iter().partition(|(c, m)| c.kind != Kind::Photo || !rules.pixels_too_small(m.width, m.height));
+        for (c, _) in &small {
+            stats.skipped.add(Skip::TooSmall);
+            if let Some((id, _, _)) = existing.get(&c.rel) {
+                conn.execute("UPDATE files SET missing = 1 WHERE id = ?", [id])?;
+            }
+        }
+        stats.seen -= small.len() as u64;
         let tx = conn.transaction()?;
         {
             let mut up = tx.prepare_cached(
@@ -234,6 +245,13 @@ pub fn scan_source(db: &Db, source_id: i64, opts: &ScanOptions, stop: &StopFlag,
         }
         tx.commit()?;
     }
+    // Settings may have changed since these were indexed: hide photos now below the size threshold.
+    stats.skipped.too_small += conn.execute(
+        "UPDATE files SET missing = 1 WHERE volume_id = ?1 AND missing = 0 AND quarantined = 0 AND kind = 'photo'
+           AND width > 0 AND height > 0 AND MAX(width, height) < ?3
+           AND (?2 = '' OR substr(rel_path, 1, length(?2) + 1) = ?2 || '/')",
+        params![volume_id, rel_root, opts.min_image_side],
+    )? as u64;
     conn.execute("UPDATE sources SET last_scan = ? WHERE id = ?", params![now, source_id])?;
     progress(Progress::new(&job, "done", total, total, format!("{} files", stats.seen)));
     Ok(stats)
