@@ -1,0 +1,210 @@
+// Typed wrappers around the Tauri commands in src-tauri/src/lib.rs.
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+
+export interface FileFilter {
+  kind?: string | null;
+  label?: string | null;
+  volume_id?: number | null;
+  source_id?: number | null;
+  year?: number | null;
+  month?: number | null;
+  text?: string | null;
+  date_confidence?: string | null;
+  online_only?: boolean;
+  ids?: number[] | null;
+}
+
+export interface VolumeRow {
+  id: number; uid: string; label: string; mount: string; removable: boolean; online: boolean;
+  last_seen: number; file_count: number; total_bytes: number;
+}
+export interface SourceRow {
+  id: number; volume_id: number; rel_root: string; last_scan: number; volume_label: string;
+  mount: string; online: boolean; abs_path: string;
+}
+export interface FileRow {
+  id: number; volume_id: number; rel_path: string; name: string; ext: string; kind: string; size: number;
+  mtime: number; taken_at: number | null; date_source: string; width: number | null; height: number | null;
+  duration_ms: number | null; camera: string | null; lat: number | null; lon: number | null;
+  orientation: number | null; hash: string | null; missing: boolean; quarantined: boolean; mount: string; online: boolean;
+}
+export interface GridItem {
+  id: number; kind: string; taken_at: number | null; width: number | null; height: number | null;
+  duration_ms: number | null; online: boolean;
+}
+export interface MonthCount { year: number; month: number; count: number }
+export interface LibraryStats {
+  files: number; bytes: number; photos: number; videos: number; raws: number; offline_files: number;
+  low_confidence_dates: number; quarantined_files: number; quarantined_bytes: number;
+}
+export interface LabelRow { label: string; source: string }
+export interface LabelCount { label: string; count: number; user: boolean }
+export interface FileDetail {
+  file: FileRow; labels: LabelRow[]; abs_path: string; taken: string; confidence: string; thumb_cached: boolean;
+}
+export interface DupMember { file: FileRow; keep: boolean }
+export interface DupGroup { id: number; kind: string; members: DupMember[]; reclaimable_bytes: number }
+export interface DupSummary { kind: string; groups: number; files: number; reclaimable_bytes: number }
+export interface OrganizeOptions {
+  target_dir: string; template: string; rename: "keep" | "date_prefix"; mode: "move" | "copy";
+  filter: FileFilter; uncertain_folder: string | null; remove_empty_dirs: boolean;
+}
+export interface PlanSummary {
+  total: number; moves: number; copies: number; in_place: number; skip_duplicate: number; skip_offline: number;
+  renamed: number; cross_volume: number; bytes: number; uncertain_dates: number; folders: number;
+}
+export interface PlanView { id: string; summary: PlanSummary; options: OrganizeOptions }
+export interface PlanItem {
+  file_id: number; src: string; dst: string;
+  action: "move" | "copy" | "in_place" | "skip_duplicate" | "skip_offline";
+  renamed: boolean; cross_volume: boolean; size: number;
+}
+export interface BatchRow {
+  id: string; kind: string; description: string; created_at: number; op_count: number; state: string; bytes: number;
+}
+export interface Progress { job: string; stage: string; done: number; total: number; message: string }
+export interface JobDone { job: string; ok: boolean; error: string | null; result: any }
+export interface AppInfo { version: string; data_dir: string; cache_dir: string; ffmpeg: boolean; job: string | null }
+
+export const api = {
+  appInfo: () => invoke<AppInfo>("app_info"),
+  listVolumes: (refresh = false) => invoke<VolumeRow[]>("list_volumes", { refresh }),
+  listSources: () => invoke<SourceRow[]>("list_sources"),
+  addSource: (path: string) => invoke<number>("add_source", { path }),
+  removeSource: (id: number) => invoke<void>("remove_source", { id }),
+  startScan: (sourceId?: number) => invoke<void>("start_scan", { sourceId: sourceId ?? null }),
+  startThumbs: () => invoke<void>("start_thumbs"),
+  cancelJob: () => invoke<void>("cancel_job"),
+
+  libraryStats: () => invoke<LibraryStats>("library_stats"),
+  timeline: (filter: FileFilter) => invoke<MonthCount[]>("timeline", { filter }),
+  grid: (filter: FileFilter, offset: number, limit: number) => invoke<GridItem[]>("grid", { filter, offset, limit }),
+  queryIds: (filter: FileFilter) => invoke<number[]>("query_ids", { filter }),
+  fileDetail: (id: number) => invoke<FileDetail>("file_detail", { id }),
+  previewPath: (id: number) => invoke<string>("preview_path", { id }),
+  videoPreviewPath: (id: number) => invoke<string>("video_preview_path", { id }),
+  revealFile: (id: number) => invoke<void>("reveal_file", { id }),
+  openFile: (id: number) => invoke<void>("open_file", { id }),
+
+  labelCounts: () => invoke<LabelCount[]>("label_counts"),
+  addLabel: (ids: number[], label: string) => invoke<number>("add_label", { ids, label }),
+  removeLabel: (ids: number[], label: string) => invoke<number>("remove_label", { ids, label }),
+  setDate: (ids: number[], datetime: string) => invoke<number>("set_date", { ids, datetime }),
+  shiftDate: (ids: number[], deltaSecs: number) => invoke<number>("shift_date", { ids, deltaSecs }),
+
+  startDedupe: (kind: string, similarity?: string) => invoke<void>("start_dedupe", { kind, similarity: similarity ?? null }),
+  dupSummary: () => invoke<DupSummary[]>("dup_summary"),
+  dupGroups: (kind: string, offset: number, limit: number) => invoke<DupGroup[]>("dup_groups", { kind, offset, limit }),
+  setKeep: (groupId: number, fileId: number, keep: boolean) => invoke<void>("set_keep", { groupId, fileId, keep }),
+  startDedupeApply: (kind: string, groupIds?: number[]) => invoke<void>("start_dedupe_apply", { kind, groupIds: groupIds ?? null }),
+
+  startPlan: (options: OrganizeOptions) => invoke<void>("start_plan", { options }),
+  planItems: (planId: string, action: string | null, offset: number, limit: number) =>
+    invoke<PlanItem[]>("plan_items", { planId, action, offset, limit }),
+  startExecute: (planId: string) => invoke<void>("start_execute", { planId }),
+
+  batches: () => invoke<BatchRow[]>("batches"),
+  startUndo: (batchId: string) => invoke<void>("start_undo", { batchId }),
+  startPurge: (batchId: string) => invoke<void>("start_purge", { batchId }),
+};
+
+/** Absolute path of an indexed file using the drive's native separator. */
+export function absPath(f: { mount: string; rel_path: string }): string {
+  const sep = f.mount.includes("\\") ? "\\" : "/";
+  const m = f.mount.endsWith(sep) ? f.mount : f.mount + sep;
+  return m + f.rel_path.split("/").join(sep);
+}
+
+export const thumbUrl = (id: number) => convertFileSrc(String(id), "thumb");
+export const fileUrl = (path: string) => convertFileSrc(path);
+
+export function onProgress(cb: (p: Progress) => void): Promise<UnlistenFn> {
+  return listen<Progress>("job-progress", (e) => cb(e.payload));
+}
+export function onJobDone(cb: (d: JobDone) => void): Promise<UnlistenFn> {
+  return listen<JobDone>("job-done", (e) => cb(e.payload));
+}
+
+/** Resolve when the named job (prefix match) finishes. */
+export function waitJob(prefix: string): Promise<JobDone> {
+  return new Promise((resolve) => {
+    let un: UnlistenFn | undefined;
+    onJobDone((d) => {
+      if (d.job.startsWith(prefix)) {
+        un?.();
+        resolve(d);
+      }
+    }).then((u) => (un = u));
+  });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Formatting
+// ---------------------------------------------------------------------------------------------
+
+export function fmtBytes(n: number): string {
+  if (!n) return "0 B";
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  const i = Math.min(u.length - 1, Math.floor(Math.log(n) / Math.log(1024)));
+  return `${(n / 1024 ** i).toFixed(i >= 3 ? 2 : i ? 1 : 0)} ${u[i]}`;
+}
+
+export function fmtCount(n: number): string {
+  return n.toLocaleString("ko-KR");
+}
+
+/** taken_at is camera wall-clock time stored as UTC seconds. */
+export function fmtDate(ts: number | null, withTime = false): string {
+  if (ts == null) return "날짜 없음";
+  const d = new Date(ts * 1000);
+  const p = (x: number) => String(x).padStart(2, "0");
+  const s = `${d.getUTCFullYear()}.${p(d.getUTCMonth() + 1)}.${p(d.getUTCDate())}`;
+  return withTime ? `${s} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}` : s;
+}
+
+export function toDatetimeLocal(ts: number | null): string {
+  if (ts == null) return "";
+  const d = new Date(ts * 1000);
+  const p = (x: number) => String(x).padStart(2, "0");
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())}T${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
+}
+
+export function fmtDuration(ms: number | null): string {
+  if (!ms) return "";
+  const s = Math.round(ms / 1000);
+  const m = Math.floor(s / 60);
+  const h = Math.floor(m / 60);
+  const p = (x: number) => String(x).padStart(2, "0");
+  return h ? `${h}:${p(m % 60)}:${p(s % 60)}` : `${m}:${p(s % 60)}`;
+}
+
+const LABEL_NAMES: Record<string, string> = {
+  screenshot: "스크린샷",
+  "src:kakaotalk": "카카오톡",
+  "src:whatsapp": "WhatsApp",
+  "src:telegram": "텔레그램",
+  "src:line": "LINE",
+  "src:instagram": "인스타그램",
+  "src:download": "다운로드",
+  edited: "편집본",
+  gps: "위치정보",
+  "date:uncertain": "날짜 불확실",
+};
+
+export function labelName(l: string): string {
+  if (LABEL_NAMES[l]) return LABEL_NAMES[l];
+  if (l.startsWith("camera:")) return `📷 ${l.slice(7)}`;
+  return l;
+}
+
+export const DATE_SOURCE_NAMES: Record<string, string> = {
+  exif: "사진 정보(EXIF)",
+  video: "동영상 정보",
+  user: "직접 지정",
+  filename: "파일 이름",
+  folder: "폴더 이름",
+  mtime: "파일 수정일(추정)",
+};
+
+export const KIND_NAMES: Record<string, string> = { photo: "사진", video: "동영상", raw: "RAW", screenshot: "스크린샷" };

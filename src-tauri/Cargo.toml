@@ -1,0 +1,24 @@
+[package]
+name = "media-organizer"
+description = "Find, preview, label, de-duplicate and organize photos and videos across all your drives"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "media_organizer_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.7", features = [] }
+
+[dependencies]
+media-core = { path = "../crates/media-core" }
+tauri = { version = "2.12", features = ["protocol-asset"] }
+tauri-plugin-dialog = "2.8"
+tauri-plugin-opener = "2.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+log = "0.4"
+chrono = "0.4"
