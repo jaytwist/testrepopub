@@ -4,3 +4,4 @@ target/
 src-tauri/gen/
 src-tauri/binaries/
 *.log
+dist-windows/
