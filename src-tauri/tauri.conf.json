@@ -58,7 +58,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDg4OTE5RkQwNjQ5MDY0QkMKUldTOFpKQmswSitSaUEvM21LYzIvSkdIZ2J3T2cveFZJaFhmcG1oaHkzSjVCOGIwRGpmTkRHaFUK",
       "endpoints": [
-        "https://github.com/jaytwist/testrepo/releases/latest/download/latest.json"
+        "https://github.com/jaytwist/testrepopub/releases/latest/download/latest.json"
       ],
       "windows": {
         "installMode": "passive"

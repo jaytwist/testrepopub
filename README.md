@@ -112,7 +112,7 @@ npx tauri dev
 
 설치된 앱은 켤 때 새 버전을 조용히 확인합니다. 새 버전이 있으면 왼쪽에 「새 버전 vX.Y.Z · 업데이트 후 재시작」 카드가 뜹니다. 누르면 내려받기, 서명 확인, 설치, 재시작이 자동으로 진행됩니다. 스캔이나 정리 작업 중에는 업데이트하지 않고, 서명이 맞지 않는 파일은 설치하지 않습니다. 색인, 썸네일, 라벨은 AppData에 있어서 그대로 남습니다.
 
-- 업데이트 주소: `https://github.com/jaytwist/testrepo/releases/latest/download/latest.json` (`src-tauri/tauri.conf.json`의 `plugins.updater.endpoints`)
+- 업데이트 주소: `https://github.com/jaytwist/testrepopub/releases/latest/download/latest.json` (`src-tauri/tauri.conf.json`의 `plugins.updater.endpoints`)
 - 업데이트는 **설치 파일(NSIS/MSI)로 설치한 앱**에서만 동작합니다. 휴대용 zip 버전은 직접 덮어써야 합니다.
 - 저장소가 **공개(public)** 여야 앱이 로그인 없이 업데이트를 받을 수 있습니다. 비공개 저장소를 원하면 릴리스 파일만 올리는 공개 저장소를 따로 두면 됩니다.
 
