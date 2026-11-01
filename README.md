@@ -108,6 +108,34 @@ npm ci
 npx tauri dev
 ```
 
+## 자동 업데이트
+
+설치된 앱은 켤 때 새 버전을 조용히 확인합니다. 새 버전이 있으면 왼쪽에 「새 버전 vX.Y.Z · 업데이트 후 재시작」 카드가 뜹니다. 누르면 내려받기, 서명 확인, 설치, 재시작이 자동으로 진행됩니다. 스캔이나 정리 작업 중에는 업데이트하지 않고, 서명이 맞지 않는 파일은 설치하지 않습니다. 색인, 썸네일, 라벨은 AppData에 있어서 그대로 남습니다.
+
+- 업데이트 주소: `https://github.com/jaytwist/testrepo/releases/latest/download/latest.json` (`src-tauri/tauri.conf.json`의 `plugins.updater.endpoints`)
+- 업데이트는 **설치 파일(NSIS/MSI)로 설치한 앱**에서만 동작합니다. 휴대용 zip 버전은 직접 덮어써야 합니다.
+- 저장소가 **공개(public)** 여야 앱이 로그인 없이 업데이트를 받을 수 있습니다. 비공개 저장소를 원하면 릴리스 파일만 올리는 공개 저장소를 따로 두면 됩니다.
+
+### 처음 한 번 설정
+
+1. Claude GitHub 앱이 이 저장소에 접근할 수 있게 합니다 (https://claude.ai/connect-github).
+2. 저장소 Settings → Secrets and variables → Actions → New repository secret
+   - 이름: `TAURI_SIGNING_PRIVATE_KEY`
+   - 값: 업데이트 서명 개인 키 파일(`updater.key`)의 내용 전체
+3. 개인 키는 안전한 곳에 백업합니다. 잃어버리면 이미 설치된 앱에 더 이상 업데이트를 보낼 수 없습니다. git에는 절대 올리지 않습니다(`.secrets/`는 git에서 제외됨).
+
+### 새 버전 배포하기
+
+```bash
+npm run release -- 0.2.0 "바뀐 점을 여기에 적습니다"
+```
+
+버전 번호를 package.json, tauri.conf.json, Cargo.toml에서 한꺼번에 올리고, 커밋과 태그를 만들어 push합니다. GitHub Actions가 서명된 Windows 설치 파일과 `latest.json`을 만들어 Releases에 올리는 데 약 10~15분 걸립니다. 그 뒤로 설치된 앱들이 업데이트를 알립니다. 적은 "바뀐 점"이 앱의 업데이트 카드에 그대로 표시됩니다.
+
+## VLC 연결
+
+VLC가 설치되어 있으면 앱이 자동으로 찾습니다. 찾는 위치는 Program Files, 사용자별 설치 경로, PATH입니다. 뷰어에 「VLC로 재생」 버튼이 생기고, 앱 안에서 바로 재생되지 않는 형식(HEVC, MTS, AVI 등)은 변환 대신 VLC로 여는 것을 먼저 제안합니다.
+
 ## 테스트
 
 ```bash
@@ -137,4 +165,4 @@ cargo run -p media-core --example demo_index -- <data_dir> <cache_dir> ./demo/di
 - **CLIP 내용 라벨·자연어 검색**: `ort`(ONNX Runtime)와 CLIP ViT-B/32를 사용합니다. 음식, 풍경, 문서, 반려동물 같은 라벨이 `labels` 테이블에 `source='ml'`로 추가됩니다.
 - **얼굴 인식·인물 묶기**: InsightFace ONNX를 사용합니다.
 - **썸네일 캐시 위치 설정**: 지금은 `%LOCALAPPDATA%` 고정입니다.
-- **코드 서명**: 서명하지 않은 설치 파일은 SmartScreen 경고가 뜹니다.
+- **코드 서명**: 서명하지 않은 설치 파일은 SmartScreen 경고가 뜹니다. 업데이트 서명과는 별개입니다.
