@@ -159,6 +159,7 @@ export const api = {
 
   batches: () => invoke<BatchRow[]>("batches"),
   startUndo: (batchId: string) => invoke<void>("start_undo", { batchId }),
+  startDelete: (ids: number[]) => invoke<void>("start_delete", { ids }),
   startPurge: (batchId: string) => invoke<void>("start_purge", { batchId }),
 };
 

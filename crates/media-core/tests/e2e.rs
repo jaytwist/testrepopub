@@ -282,6 +282,19 @@ fn full_workflow() {
     assert_eq!(db::query_files(&conn, &FileFilter::default(), 0, 100).unwrap().len(), 8);
     assert!(disk_b.join("backup/IMG_0001.jpg").is_file());
 
+    // --- Delete selected files (quarantine) + undo ------------------------------------------
+    let victims = vec![kakao.id, shot.id];
+    let rep = journal::delete_files(&db, &victims, &stop, &quiet).unwrap();
+    assert_eq!((rep.deleted, rep.failed, rep.skipped_offline), (2, 0, 0), "{rep:?}");
+    assert!(!disk_b.join("KakaoTalk/KakaoTalk_20210304_101112345.jpg").exists(), "moved out of the folder");
+    assert_eq!(db::query_files(&conn, &FileFilter::default(), 0, 100).unwrap().len(), 6);
+    let batch = journal::list_batches(&conn).unwrap().into_iter().find(|b| b.id == rep.batch_id).unwrap();
+    assert_eq!((batch.kind.as_str(), batch.op_count), ("delete", 2));
+    let undo = journal::undo_batch(&conn, &rep.batch_id).unwrap();
+    assert_eq!((undo.restored, undo.failed), (2, 0), "{undo:?}");
+    assert!(disk_b.join("KakaoTalk/KakaoTalk_20210304_101112345.jpg").is_file(), "restored in place");
+    assert_eq!(db::query_files(&conn, &FileFilter::default(), 0, 100).unwrap().len(), 8);
+
     // --- Similar images (czkawka_core) -------------------------------------------------------
     let ds = dedupe::run(&db, DupKind::SimilarImage, Similarity::High, &stop, &quiet).unwrap();
     let sg = dedupe::list_groups(&conn, "similar_image", 0, 10).unwrap();

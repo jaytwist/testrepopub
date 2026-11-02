@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Virtuoso, type ListRange } from "react-virtuoso";
+import { confirm } from "@tauri-apps/plugin-dialog";
 import {
   absPath, api, fmtBytes, fmtCount, fmtDate, fmtDuration, thumbUrl,
   type FileFilter, type FilteredStats, type GridItem, type GroupBy, type GroupRow, type SortKey,
@@ -68,7 +69,7 @@ function caption(item: GridItem, sort: SortKey): string | null {
 // --- page ------------------------------------------------------------------------------------
 
 export default function Library() {
-  const { version } = useJob();
+  const { version, running, setRunning, lastDone } = useJob();
   const [filter, setFilter] = useState<FileFilter>({});
   const [groupBy, setGroupBy] = useState<GroupBy>(() => (store.get("mo.groupBy") as GroupBy) || "month");
   const [groups, setGroups] = useState<GroupRow[] | null>(null);
@@ -84,6 +85,8 @@ export default function Library() {
   const [bulk, setBulk] = useState<"label" | "date" | null>(null);
   const [bulkValue, setBulkValue] = useState("");
   const [busyGroup, setBusyGroup] = useState<string | null>(null);
+  /** Result of the last delete, shown with an Undo button until dismissed. */
+  const [deleted, setDeleted] = useState<{ batch_id: string; deleted: number; bytes: number; skipped_offline: number; failed: number } | null>(null);
 
   const wrapRef = useRef<HTMLDivElement>(null);
   const gen = useRef(0);
@@ -283,6 +286,58 @@ export default function Library() {
 
   const selectAll = async () => setSelected(new Set(await api.queryIds(filter)));
 
+  // --- actions on the selection ---
+
+  const deleteSelected = useCallback(async () => {
+    if (selected.size === 0 || running) return;
+    const ids = Array.from(selected);
+    let size = "";
+    try {
+      const st = await api.filteredStats({ ids });
+      size = ` (${fmtBytes(st.bytes)})`;
+    } catch { /* size is informational only */ }
+    const ok = await confirm(
+      `선택한 ${fmtCount(ids.length)}개${size}를 삭제할까요?\n\n` +
+        "파일은 같은 드라이브의 격리 폴더로 옮겨집니다. 바로 아래 「되돌리기」나 「작업 기록」에서 복원할 수 있고, " +
+        "「격리함 비우기」를 해야 완전히 지워집니다.",
+      { title: "선택한 파일 삭제", kind: "warning", okLabel: "삭제", cancelLabel: "취소" },
+    );
+    if (!ok) return;
+    try {
+      await api.startDelete(ids);
+      setRunning("delete");
+    } catch (e) {
+      setLoadError(String(e));
+    }
+  }, [selected, running, setRunning]);
+
+  // Delete key = delete the selection (not while typing in a field or viewing a photo).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement).tagName;
+      if (e.key !== "Delete" || viewId != null || tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      e.preventDefault();
+      deleteSelected();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [deleteSelected, viewId]);
+
+  useEffect(() => {
+    if (lastDone?.job === "delete" && lastDone.ok) setDeleted(lastDone.result);
+    if (lastDone?.job === "undo" && lastDone.ok) setDeleted(null);
+  }, [lastDone]);
+
+  const undoDelete = async () => {
+    if (!deleted) return;
+    try {
+      await api.startUndo(deleted.batch_id);
+      setRunning("undo");
+    } catch (e) {
+      setLoadError(String(e));
+    }
+  };
+
   const applyBulk = async () => {
     const ids = Array.from(selected);
     if (bulk === "label" && bulkValue.trim()) await api.addLabel(ids, bulkValue.trim());
@@ -399,11 +454,24 @@ export default function Library() {
         )}
       </div>
 
+      {deleted && deleted.deleted + deleted.skipped_offline + deleted.failed > 0 && (
+        <div className={`alert ${deleted.failed ? "bad" : "ok"} undo-banner`}>
+          <span>
+            {fmtCount(deleted.deleted)}개({fmtBytes(deleted.bytes)})를 격리함으로 옮겼습니다.
+            {deleted.skipped_offline > 0 && ` 연결되지 않은 드라이브의 ${fmtCount(deleted.skipped_offline)}개는 건너뛰었습니다.`}
+            {deleted.failed > 0 && ` ${fmtCount(deleted.failed)}개는 옮기지 못했습니다.`}
+          </span>
+          {deleted.deleted > 0 && <button className="btn small" disabled={!!running} onClick={undoDelete}>되돌리기</button>}
+          <button className="btn small ghost" onClick={() => setDeleted(null)}>닫기</button>
+        </div>
+      )}
+
       {selected.size > 0 && (
         <div className="selbar">
           <b>{fmtCount(selected.size)}개 선택</b>
           <button className="btn small" onClick={() => { setBulk("label"); setBulkValue(""); }}>라벨 추가</button>
           <button className="btn small" onClick={() => { setBulk("date"); setBulkValue(""); }}>날짜 지정</button>
+          <button className="btn small danger" disabled={!!running} onClick={deleteSelected} title="Delete 키">🗑 삭제</button>
           <button className="btn small ghost" onClick={selectAll}>필터 결과 전체 선택</button>
           <button className="btn small ghost" onClick={() => setSelected(new Set())}>선택 해제</button>
           {bulk && (

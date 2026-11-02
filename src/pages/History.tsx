@@ -46,7 +46,7 @@ export default function History() {
       <header className="page-head">
         <div>
           <h1>작업 기록 · 되돌리기</h1>
-          <div className="muted">앱이 한 모든 이동·복사·격리는 기록되어 되돌릴 수 있습니다. 중복 정리로 격리한 파일은 같은 드라이브의 격리 폴더에 보관되며, 「격리함 비우기」를 해야만 실제로 삭제됩니다.</div>
+          <div className="muted">앱이 한 모든 이동·복사·격리는 기록되어 되돌릴 수 있습니다. 중복 정리나 삭제로 지운 파일은 같은 드라이브의 격리 폴더에 보관되며, 「격리함 비우기」를 해야만 실제로 삭제됩니다.</div>
         </div>
       </header>
       {error && <div className="alert bad">{error}</div>}
@@ -63,12 +63,12 @@ export default function History() {
           {rows.map((b) => (
             <tr key={b.id}>
               <td className="muted small">{new Date(b.created_at * 1000).toLocaleString("ko-KR")}</td>
-              <td>{b.kind === "dedupe" ? "🗑 " : "⇲ "}{b.description}</td>
+              <td>{b.kind === "organize" ? "⇲ " : "🗑 "}{b.description}</td>
               <td>{fmtCount(b.op_count)}개 · {fmtBytes(b.bytes)}</td>
               <td><span className={`pill ${b.state === "done" ? "ok" : ""}`}>{STATE_NAMES[b.state] ?? b.state}</span></td>
               <td className="right">
                 <button className="btn small" disabled={!!running || b.state !== "done"} onClick={() => undo(b)}>되돌리기</button>
-                {b.kind === "dedupe" && (
+                {(b.kind === "dedupe" || b.kind === "delete") && (
                   <button className="btn small danger" disabled={!!running || b.state !== "done"} onClick={() => purge(b)}>격리함 비우기</button>
                 )}
               </td>

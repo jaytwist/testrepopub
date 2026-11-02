@@ -14,7 +14,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
-use crate::{db, volumes};
+use crate::{db, volumes, Db, Progress, ProgressFn, StopFlag};
 
 pub fn new_batch(conn: &Connection, kind: &str, description: &str) -> Result<String> {
     let id = format!("{}-{}", chrono::Local::now().format("%Y%m%d-%H%M%S"), &uuid::Uuid::new_v4().simple().to_string()[..6]);
@@ -412,5 +412,65 @@ pub fn purge_batch(conn: &Connection, batch_id: &str) -> Result<UndoReport> {
     if rep.failed == 0 {
         conn.execute("UPDATE batches SET state = 'purged' WHERE id = ?", [batch_id])?;
     }
+    Ok(rep)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Delete selected files (soft: quarantine, undoable)
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct DeleteReport {
+    pub batch_id: String,
+    pub deleted: u64,
+    pub bytes: i64,
+    /// On a drive that is not connected right now.
+    pub skipped_offline: u64,
+    pub failed: u64,
+    pub errors: Vec<String>,
+    pub cancelled: bool,
+}
+
+/// Move the given files into their drives' quarantine folders as one undoable batch.
+pub fn delete_files(db: &Db, ids: &[i64], stop: &StopFlag, progress: ProgressFn) -> Result<DeleteReport> {
+    let conn = db.conn()?;
+    volumes::refresh(&conn)?;
+    let batch = new_batch(&conn, "delete", &format!("선택한 {}개 삭제", ids.len()))?;
+    let mut rep = DeleteReport { batch_id: batch.clone(), ..Default::default() };
+    let total = ids.len() as u64;
+    for (i, id) in ids.iter().enumerate() {
+        if stop.is_stopped() {
+            rep.cancelled = true;
+            break;
+        }
+        if i % 20 == 0 {
+            progress(Progress::new("delete", "quarantine", i as u64, total, ""));
+        }
+        let Some(f) = db::get_file(&conn, *id)? else { continue };
+        if f.quarantined || f.missing {
+            continue;
+        }
+        if !f.online {
+            rep.skipped_offline += 1;
+            continue;
+        }
+        match quarantine(&conn, &batch, &f) {
+            Ok(()) => {
+                rep.deleted += 1;
+                rep.bytes += f.size;
+            }
+            Err(e) => {
+                rep.failed += 1;
+                if rep.errors.len() < 100 {
+                    rep.errors.push(e.to_string());
+                }
+            }
+        }
+    }
+    finish_batch(&conn, &batch)?;
+    if rep.deleted == 0 {
+        conn.execute("DELETE FROM batches WHERE id = ? AND op_count = 0", [&batch])?;
+    }
+    progress(Progress::new("delete", "done", total, total, ""));
     Ok(rep)
 }

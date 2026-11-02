@@ -609,6 +609,15 @@ fn start_undo(app: AppHandle, state: State<AppState>, batch_id: String) -> CmdRe
     })
 }
 
+/// Delete (quarantine) the selected files as one undoable batch.
+#[tauri::command]
+fn start_delete(app: AppHandle, state: State<AppState>, ids: Vec<i64>) -> CmdResult<()> {
+    if ids.is_empty() {
+        return Err("선택한 파일이 없습니다".into());
+    }
+    spawn_job(&app, &state, "delete", move |st, progress| journal::delete_files(&st.db, &ids, &st.stop, progress))
+}
+
 #[tauri::command]
 fn start_purge(app: AppHandle, state: State<AppState>, batch_id: String) -> CmdResult<()> {
     spawn_job(&app, &state, "purge", move |st, _| {
@@ -732,6 +741,7 @@ pub fn run() {
             start_execute,
             batches,
             start_undo,
+            start_delete,
             start_purge,
         ])
         .run(tauri::generate_context!())
