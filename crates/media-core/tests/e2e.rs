@@ -222,6 +222,32 @@ fn full_workflow() {
     assert_eq!(st.count, 8);
     assert_eq!(st.photos, 8);
 
+    // Groups for the library grid: month / year / folder, with exact counts.
+    let months = db::group_summary(&conn, &FileFilter::default(), "month").unwrap();
+    assert_eq!(months.iter().map(|g| g.count).sum::<i64>(), 8);
+    for g in &months {
+        let tl_count = tl.iter().find(|m| Some(m.year) == g.year && Some(m.month) == g.month).map(|m| m.count);
+        assert_eq!(tl_count, Some(g.count), "month group matches timeline: {g:?}");
+        let ids = db::query_ids(&conn, &FileFilter { year: g.year, month: g.month, ..Default::default() }).unwrap();
+        assert_eq!(ids.len() as i64, g.count, "selecting a month group returns exactly its files");
+    }
+    assert!(months.windows(2).all(|w| (w[0].year, w[0].month) >= (w[1].year, w[1].month)), "newest month first");
+    let asc = db::group_summary(&conn, &FileFilter { sort: Some("taken".into()), desc: Some(false), ..Default::default() }, "month").unwrap();
+    assert_eq!(asc.first().map(|g| g.key.clone()), months.last().map(|g| g.key.clone()), "oldest first when sorted ascending");
+    let years = db::group_summary(&conn, &FileFilter::default(), "year").unwrap();
+    assert_eq!(years.iter().find(|g| g.year == Some(2019)).map(|g| g.count), Some(4));
+    let folders = db::group_summary(&conn, &FileFilter::default(), "folder").unwrap();
+    assert_eq!(folders.len(), 8, "every fixture file sits in its own folder: {folders:?}");
+    for g in &folders {
+        let f = FileFilter { volume_id: g.volume_id, dir: g.dir.clone(), ..Default::default() };
+        assert_eq!(db::query_ids(&conn, &f).unwrap().len() as i64, g.count, "{g:?}");
+    }
+    assert!(folders.iter().any(|g| g.dir.as_deref() == Some("Pictures/Screenshots")));
+    let parent_only = FileFilter { volume_id: Some(shot.volume_id), dir: Some("Pictures".into()), ..Default::default() };
+    assert_eq!(db::query_ids(&conn, &parent_only).unwrap().len(), 0, "a folder group does not include its subfolders");
+    let all = db::group_summary(&conn, &FileFilter::default(), "none").unwrap();
+    assert_eq!((all.len(), all[0].count), (1, 8));
+
     // Rescan is incremental: nothing changes.
     let stats = scanner::scan_all(&db, &ScanOptions::default(), &stop, &quiet).unwrap();
     assert_eq!(stats.iter().map(|s| s.unchanged).sum::<u64>(), 8);

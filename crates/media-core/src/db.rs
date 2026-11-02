@@ -195,6 +195,10 @@ pub struct FileRow {
     pub online: bool,
 }
 
+/// SQLite "dirname" of `f.rel_path` (volume-relative, no trailing slash, "" at the volume root).
+/// rtrim(path, <all non-slash chars of path>) strips the file name, then the trailing slash.
+pub const DIR_SQL: &str = "rtrim(rtrim(f.rel_path, replace(f.rel_path, '/', '')), '/')";
+
 pub const FILE_COLS: &str = "f.id, f.volume_id, f.rel_path, f.name, f.ext, f.kind, f.size, f.mtime, f.taken_at, \
     f.date_source, f.width, f.height, f.duration_ms, f.camera, f.lat, f.lon, f.orientation, f.hash, f.missing, \
     f.quarantined, v.mount, v.online";
@@ -281,6 +285,8 @@ pub struct FileFilter {
     pub camera: Option<String>,
     pub ext: Option<String>,
     pub has_gps: Option<bool>,
+    /// Files directly inside this volume-relative folder ("" = volume root). Use with `volume_id`.
+    pub dir: Option<String>,
     /// 'taken' (default) | 'mtime' | 'size' | 'name' | 'resolution' | 'duration'
     pub sort: Option<String>,
     /// Default: true (newest / largest first).
@@ -407,6 +413,10 @@ impl FileFilter {
             } else {
                 w.push(format!("f.ext IN ({})", group.iter().map(|g| format!("'{g}'")).collect::<Vec<_>>().join(",")));
             }
+        }
+        if let Some(d) = &self.dir {
+            w.push(format!("{DIR_SQL} = ?"));
+            p.push(Value::Text(d.trim_matches('/').to_string()));
         }
         match self.has_gps {
             Some(true) => w.push("f.lat IS NOT NULL AND f.lon IS NOT NULL".into()),
@@ -684,4 +694,132 @@ pub fn filtered_stats(conn: &Connection, filter: &FileFilter) -> Result<Filtered
             last_taken: r.get(6)?,
         })
     })?)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Groups (month / year / folder) for the library grid
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Serialize)]
+pub struct GroupRow {
+    /// Stable key, e.g. "m:2024-6", "y:2024", "d:3:DCIM/100CANON", "all".
+    pub key: String,
+    pub count: i64,
+    pub bytes: i64,
+    pub year: Option<i32>,
+    pub month: Option<u32>,
+    pub volume_id: Option<i64>,
+    pub dir: Option<String>,
+    pub mount: Option<String>,
+    pub volume_label: Option<String>,
+}
+
+/// Groups that the current filter produces, in display order, with exact counts.
+/// `group_by`: "month" | "year" | "folder" | anything else = one group.
+pub fn group_summary(conn: &Connection, filter: &FileFilter, group_by: &str) -> Result<Vec<GroupRow>> {
+    let (w, p) = filter.to_sql(conn)?;
+    // Newest first, unless the user sorts by capture date ascending.
+    let time_dir = if filter.sort.as_deref().unwrap_or("taken") == "taken" && filter.desc == Some(false) { "ASC" } else { "DESC" };
+    let rows = match group_by {
+        "month" | "year" => {
+            let with_month = group_by == "month";
+            let sql = format!(
+                "SELECT CAST(strftime('%Y', f.taken_at, 'unixepoch') AS INTEGER) y,
+                        {m} m, COUNT(*), COALESCE(SUM(f.size), 0)
+                 FROM files f JOIN volumes v ON v.id = f.volume_id WHERE {w}
+                 GROUP BY y, m ORDER BY y {time_dir}, m {time_dir}",
+                m = if with_month { "CAST(strftime('%m', f.taken_at, 'unixepoch') AS INTEGER)" } else { "0" }
+            );
+            let mut st = conn.prepare(&sql)?;
+            let rows = st
+                .query_map(params_from_iter(p), |r| {
+                    let y: Option<i32> = r.get(0)?;
+                    let m: Option<u32> = r.get(1)?;
+                    let month = if with_month { m } else { None };
+                    Ok(GroupRow {
+                        key: match month {
+                            Some(mm) => format!("m:{}-{mm}", y.unwrap_or(0)),
+                            None => format!("y:{}", y.unwrap_or(0)),
+                        },
+                        count: r.get(2)?,
+                        bytes: r.get(3)?,
+                        year: y,
+                        month,
+                        volume_id: None,
+                        dir: None,
+                        mount: None,
+                        volume_label: None,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        }
+        "folder" => {
+            let sql = format!(
+                "SELECT f.volume_id, {DIR_SQL} d, v.mount, v.label, COUNT(*), COALESCE(SUM(f.size), 0)
+                 FROM files f JOIN volumes v ON v.id = f.volume_id WHERE {w}
+                 GROUP BY f.volume_id, d ORDER BY v.mount COLLATE NOCASE, d COLLATE NOCASE"
+            );
+            let mut st = conn.prepare(&sql)?;
+            let rows = st
+                .query_map(params_from_iter(p), |r| {
+                    let vid: i64 = r.get(0)?;
+                    let d: String = r.get(1)?;
+                    Ok(GroupRow {
+                        key: format!("d:{vid}:{d}"),
+                        count: r.get(4)?,
+                        bytes: r.get(5)?,
+                        year: None,
+                        month: None,
+                        volume_id: Some(vid),
+                        dir: Some(d),
+                        mount: Some(r.get(2)?),
+                        volume_label: Some(r.get(3)?),
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        }
+        _ => {
+            let st = filtered_stats(conn, filter)?;
+            if st.count == 0 {
+                Vec::new()
+            } else {
+                vec![GroupRow {
+                    key: "all".into(),
+                    count: st.count,
+                    bytes: st.bytes,
+                    year: None,
+                    month: None,
+                    volume_id: None,
+                    dir: None,
+                    mount: None,
+                    volume_label: None,
+                }]
+            }
+        }
+    };
+    Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dirname_sql() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE f(rel_path TEXT)").unwrap();
+        let cases = [
+            ("a.jpg", ""),
+            ("DCIM/a.jpg", "DCIM"),
+            ("DCIM/100CANON/IMG_0001.JPG", "DCIM/100CANON"),
+            ("2015-08 여행/해변 사진.jpg", "2015-08 여행"),
+            ("x.y/z.w/file.name.with.dots.png", "x.y/z.w"),
+        ];
+        for (path, want) in cases {
+            let got: String = c.query_row(&format!("SELECT {DIR_SQL} FROM (SELECT ? AS rel_path) f"), [path], |r| r.get(0)).unwrap();
+            assert_eq!(got, want, "{path}");
+        }
+    }
 }

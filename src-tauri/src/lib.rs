@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use media_core::db::{self, FileFilter, FileRow, FilterOptions, FilteredStats, GridItem, LibraryStats, MonthCount, SourceRow, VolumeRow};
+use media_core::db::{self, FileFilter, FileRow, FilterOptions, FilteredStats, GridItem, GroupRow, LibraryStats, MonthCount, SourceRow, VolumeRow};
 use media_core::dedupe::{self, DupGroup, DupKind, DupSummary, Similarity};
 use media_core::journal::{self, BatchRow};
 use media_core::labels::{self, LabelCount, LabelRow};
@@ -256,6 +256,12 @@ fn filter_options(state: State<AppState>) -> CmdResult<FilterOptions> {
 fn filtered_stats(state: State<AppState>, filter: FileFilter) -> CmdResult<FilteredStats> {
     let conn = state.db.conn().map_err(err)?;
     db::filtered_stats(&conn, &filter).map_err(err)
+}
+
+#[tauri::command]
+fn group_summary(state: State<AppState>, filter: FileFilter, group_by: String) -> CmdResult<Vec<GroupRow>> {
+    let conn = state.db.conn().map_err(err)?;
+    db::group_summary(&conn, &filter, &group_by).map_err(err)
 }
 
 #[tauri::command]
@@ -695,6 +701,7 @@ pub fn run() {
             suggested_folders,
             filter_options,
             filtered_stats,
+            group_summary,
             start_thumbs,
             cancel_job,
             library_stats,

@@ -1,70 +1,56 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Virtuoso } from "react-virtuoso";
-import { api, fmtBytes, fmtCount, fmtDate, fmtDuration, thumbUrl, type FileFilter, type FilteredStats, type GridItem, type MonthCount, type SortKey } from "../api";
+import { Virtuoso, type ListRange } from "react-virtuoso";
+import {
+  absPath, api, fmtBytes, fmtCount, fmtDate, fmtDuration, thumbUrl,
+  type FileFilter, type FilteredStats, type GridItem, type GroupBy, type GroupRow, type SortKey,
+} from "../api";
 import { useJob } from "../App";
 import FilterBar from "../components/FilterBar";
 import Viewer from "../components/Viewer";
 
-const PAGE = 2000;
+/** Items fetched per request inside one group. */
+const PAGE = 300;
 const TILE = 168;
 const GAP = 4;
 
-type Row = { type: "header"; key: string; title: string; count: number } | { type: "tiles"; key: string; items: { item: GridItem; index: number }[] };
+type Row = { type: "header"; key: string; g: GroupRow } | { type: "tiles"; key: string; g: GroupRow; row: number };
 
-function monthKey(ts: number | null) {
-  if (ts == null) return "none";
-  const d = new Date(ts * 1000);
-  return `${d.getUTCFullYear()}-${d.getUTCMonth() + 1}`;
-}
-function monthTitle(key: string, prefix = "") {
-  if (key === "none") return "날짜 없음";
-  const [y, m] = key.split("-");
-  return `${prefix}${y}년 ${m}월`;
-}
-/** mtime is a real UTC timestamp: group by the PC's local month. */
-function localMonthKey(ts: number) {
-  const d = new Date(ts * 1000);
-  return `${d.getFullYear()}-${d.getMonth() + 1}`;
+const GROUP_BYS: { key: GroupBy; name: string }[] = [
+  { key: "month", name: "월별" },
+  { key: "year", name: "연도별" },
+  { key: "folder", name: "폴더별" },
+  { key: "none", name: "묶지 않음" },
+];
+
+// --- small helpers ---------------------------------------------------------------------------
+
+const store = {
+  get(k: string): string | null {
+    try { return localStorage.getItem(k); } catch { return null; }
+  },
+  set(k: string, v: string) {
+    try { localStorage.setItem(k, v); } catch { /* private mode etc. */ }
+  },
+};
+
+/** The filter restricted to one group (same rules the backend used to build the group). */
+function groupFilter(base: FileFilter, g: GroupRow): FileFilter {
+  if (g.key.startsWith("m:")) return { ...base, year: g.year, month: g.month };
+  if (g.key.startsWith("y:")) return { ...base, year: g.year, month: null };
+  if (g.key.startsWith("d:")) return { ...base, volume_id: g.volume_id, dir: g.dir };
+  return base;
 }
 
-const MB = 1024 * 1024;
-const SIZE_BUCKETS: [number, string][] = [[1024 * MB, "1GB 이상"], [100 * MB, "100MB – 1GB"], [10 * MB, "10 – 100MB"], [MB, "1 – 10MB"], [0, "1MB 미만"]];
-const MP_BUCKETS: [number, string][] = [[40, "40MP 이상"], [12, "12 – 40MP"], [2, "2 – 12MP"], [0.000001, "2MP 미만"], [0, "해상도 정보 없음"]];
-const DUR_BUCKETS: [number, string][] = [[600, "10분 이상"], [60, "1 – 10분"], [1, "1분 미만"], [0, "길이 없음 (사진)"]];
-
-function bucket(table: [number, string][], v: number) {
-  return (table.find(([min]) => v >= min) ?? table[table.length - 1])[1];
-}
-
-/** Group key + header title for an item under the current sort. */
-function groupOf(item: GridItem, sort: SortKey): [string, string] {
-  switch (sort) {
-    case "mtime": {
-      const k = localMonthKey(item.mtime);
-      return [k, monthTitle(k, "수정: ")];
-    }
-    case "size": {
-      const t = bucket(SIZE_BUCKETS, item.size);
-      return [t, t];
-    }
-    case "resolution": {
-      const t = bucket(MP_BUCKETS, ((item.width ?? 0) * (item.height ?? 0)) / 1e6);
-      return [t, t];
-    }
-    case "duration": {
-      const t = bucket(DUR_BUCKETS, (item.duration_ms ?? 0) / 1000);
-      return [t, t];
-    }
-    case "name": {
-      const c = (item.name[0] ?? "#").toUpperCase();
-      const k = /[0-9]/.test(c) ? "0-9" : /[A-Z]/.test(c) ? c : /[가-힣]/.test(c) ? "한글" : "기타";
-      return [k, k];
-    }
-    default: {
-      const k = monthKey(item.taken_at);
-      return [k, monthTitle(k)];
-    }
+function groupTitle(g: GroupRow): { title: string; tip?: string } {
+  if (g.key.startsWith("m:")) return { title: g.year ? `${g.year}년 ${g.month}월` : "날짜 없음" };
+  if (g.key.startsWith("y:")) return { title: g.year ? `${g.year}년` : "날짜 없음" };
+  if (g.key.startsWith("d:")) {
+    const full = absPath({ mount: g.mount ?? "", rel_path: g.dir ?? "" });
+    const sep = (g.mount ?? "").includes("\\") ? "\\" : "/";
+    const rel = g.dir ? g.dir.split("/").join(sep) : "(최상위 폴더)";
+    return { title: `${g.volume_label} › ${rel}`, tip: full };
   }
+  return { title: "전체" };
 }
 
 /** Small caption under each tile that shows the value being sorted by. */
@@ -79,67 +65,95 @@ function caption(item: GridItem, sort: SortKey): string | null {
   }
 }
 
+// --- page ------------------------------------------------------------------------------------
+
 export default function Library() {
   const { version } = useJob();
   const [filter, setFilter] = useState<FileFilter>({});
-  const [timeline, setTimeline] = useState<MonthCount[]>([]);
+  const [groupBy, setGroupBy] = useState<GroupBy>(() => (store.get("mo.groupBy") as GroupBy) || "month");
+  const [groups, setGroups] = useState<GroupRow[] | null>(null);
   const [stats, setStats] = useState<FilteredStats | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [items, setItems] = useState<GridItem[]>([]);
-  const [done, setDone] = useState(false);
+  const [loadedSort, setLoadedSort] = useState<SortKey>("taken");
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  const [cacheTick, setCacheTick] = useState(0);
   const [cols, setCols] = useState(6);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [anchor, setAnchor] = useState<number | null>(null);
-  const [viewIndex, setViewIndex] = useState<number | null>(null);
+  const [viewId, setViewId] = useState<number | null>(null);
   const [bulk, setBulk] = useState<"label" | "date" | null>(null);
   const [bulkValue, setBulkValue] = useState("");
-  const loading = useRef(false);
+  const [busyGroup, setBusyGroup] = useState<string | null>(null);
+
   const wrapRef = useRef<HTMLDivElement>(null);
   const gen = useRef(0);
+  /** group key -> items by position (sparse until loaded) */
+  const cache = useRef(new Map<string, (GridItem | undefined)[]>());
+  const inflight = useRef(new Set<string>());
+  /** group key -> every id in the group (fetched when the group checkbox is used) */
+  const groupIds = useRef(new Map<string, number[]>());
+  const lastRange = useRef<ListRange>({ startIndex: 0, endIndex: 30 });
 
-  // Group by the sort the *loaded* items were fetched with (not the one just selected), so a
-  // transitional render never mixes orders.
-  const [loadedSort, setLoadedSort] = useState<SortKey>("taken");
-  const sort: SortKey = loadedSort;
-  const total = stats?.count ?? 0;
-  const monthCounts = useMemo(() => new Map(timeline.map((m) => [`${m.year}-${m.month}`, m.count])), [timeline]);
+  // --- loading ---
 
   const reload = useCallback(() => {
     const g = ++gen.current;
-    loading.current = true;
-    setDone(false);
-    Promise.all([api.timeline(filter), api.grid(filter, 0, PAGE), api.filteredStats(filter)]).then(([tl, first, st]) => {
-      if (g !== gen.current) return;
-      setTimeline(tl);
-      setStats(st);
-      setLoadedSort(filter.sort ?? "taken");
-      setItems(first);
-      setDone(first.length < PAGE);
-      setLoadError(null);
-      loading.current = false;
-    }).catch((e) => {
-      if (g !== gen.current) return;
-      setLoadError(String(e));
-      loading.current = false;
-    });
-  }, [filter]);
+    cache.current = new Map();
+    inflight.current = new Set();
+    groupIds.current = new Map();
+    setCacheTick((t) => t + 1);
+    Promise.all([api.groupSummary(filter, groupBy), api.filteredStats(filter)])
+      .then(([gs, st]) => {
+        if (g !== gen.current) return;
+        setGroups(gs);
+        setStats(st);
+        setLoadedSort(filter.sort ?? "taken");
+        setLoadError(null);
+      })
+      .catch((e) => g === gen.current && setLoadError(String(e)));
+  }, [filter, groupBy]);
 
   useEffect(() => {
     setSelected(new Set());
+    setAnchor(null);
     reload();
   }, [reload, version]);
 
-  const loadMore = useCallback(() => {
-    if (loading.current || done) return;
-    loading.current = true;
-    const g = gen.current;
-    api.grid(filter, items.length, PAGE).then((more) => {
-      if (g !== gen.current) return;
-      setItems((cur) => cur.concat(more));
-      setDone(more.length < PAGE);
-      loading.current = false;
-    });
-  }, [filter, items.length, done]);
+  // Remember folds per grouping mode.
+  useEffect(() => {
+    store.set("mo.groupBy", groupBy);
+    try {
+      setCollapsed(new Set(JSON.parse(store.get(`mo.collapsed.${groupBy}`) ?? "[]")));
+    } catch {
+      setCollapsed(new Set());
+    }
+  }, [groupBy]);
+  const saveCollapsed = (s: Set<string>) => {
+    setCollapsed(s);
+    store.set(`mo.collapsed.${groupBy}`, JSON.stringify(Array.from(s)));
+  };
+
+  const fetchPage = useCallback(
+    (g: GroupRow, page: number) => {
+      const k = `${g.key}#${page}`;
+      const arr = cache.current.get(g.key);
+      if (inflight.current.has(k) || (arr && arr[page * PAGE] !== undefined)) return;
+      inflight.current.add(k);
+      const myGen = gen.current;
+      api
+        .grid(groupFilter(filter, g), page * PAGE, PAGE)
+        .then((items) => {
+          if (myGen !== gen.current) return;
+          const a = cache.current.get(g.key) ?? new Array<GridItem | undefined>(g.count);
+          items.forEach((it, i) => (a[page * PAGE + i] = it));
+          cache.current.set(g.key, a);
+          setCacheTick((t) => t + 1);
+        })
+        .catch((e) => myGen === gen.current && setLoadError(String(e)))
+        .finally(() => inflight.current.delete(k));
+    },
+    [filter],
+  );
 
   // Columns follow the window width.
   useEffect(() => {
@@ -152,36 +166,67 @@ export default function Library() {
 
   const rows: Row[] = useMemo(() => {
     const out: Row[] = [];
-    let cur: string | null = null;
-    let bucketItems: { item: GridItem; index: number }[] = [];
-    // Bucket sizes are exact for capture-date sort (from the timeline); otherwise count what is loaded.
-    const counts = new Map<string, number>();
-    if (sort !== "taken") items.forEach((it) => { const k = groupOf(it, sort)[0]; counts.set(k, (counts.get(k) ?? 0) + 1); });
-    const flush = () => {
-      for (let i = 0; i < bucketItems.length; i += cols) {
-        // Key by the first item's position: unique even if a group label repeats.
-        out.push({ type: "tiles", key: `t-${bucketItems[i].index}`, items: bucketItems.slice(i, i + cols) });
-      }
-      bucketItems = [];
-    };
-    items.forEach((item, index) => {
-      const [k, title] = groupOf(item, sort);
-      if (k !== cur) {
-        flush();
-        cur = k;
-        out.push({ type: "header", key: `h-${index}`, title, count: sort === "taken" ? monthCounts.get(k) ?? 0 : counts.get(k) ?? 0 });
-      }
-      bucketItems.push({ item, index });
-    });
-    flush();
+    for (const g of groups ?? []) {
+      out.push({ type: "header", key: `h:${g.key}`, g });
+      if (collapsed.has(g.key)) continue;
+      const n = Math.ceil(g.count / cols);
+      for (let r = 0; r < n; r++) out.push({ type: "tiles", key: `t:${g.key}:${r}`, g, row: r });
+    }
     return out;
-  }, [items, cols, monthCounts, sort]);
+  }, [groups, collapsed, cols]);
 
-  const onTileClick = (e: React.MouseEvent, index: number, id: number) => {
+  /** Load whatever pages the visible rows (plus a margin) need. */
+  const loadRange = useCallback(
+    (range: ListRange) => {
+      lastRange.current = range;
+      const from = Math.max(0, range.startIndex - 8);
+      const to = Math.min(rows.length - 1, range.endIndex + 12);
+      for (let i = from; i <= to; i++) {
+        const r = rows[i];
+        if (r?.type !== "tiles") continue;
+        const first = r.row * cols;
+        const last = Math.min(r.g.count - 1, first + cols - 1);
+        fetchPage(r.g, Math.floor(first / PAGE));
+        if (Math.floor(last / PAGE) !== Math.floor(first / PAGE)) fetchPage(r.g, Math.floor(last / PAGE));
+      }
+    },
+    [rows, cols, fetchPage],
+  );
+  // Rows changed (filter, fold, resize) but the scroll range didn't: load for the same range again.
+  useEffect(() => loadRange(lastRange.current), [loadRange]);
+
+  // Loaded items in on-screen order: used by the viewer (←/→) and Shift+click ranges.
+  const flat = useMemo(() => {
+    const list: GridItem[] = [];
+    for (const g of groups ?? []) {
+      if (collapsed.has(g.key)) continue;
+      const a = cache.current.get(g.key);
+      if (a) for (const it of a) if (it) list.push(it);
+    }
+    return list;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [groups, collapsed, cacheTick]);
+  const flatIndex = useMemo(() => new Map(flat.map((it, i) => [it.id, i])), [flat]);
+
+  /** Fetch the next not-yet-loaded page in display order (viewer reaching the end). */
+  const loadNext = () => {
+    for (const g of groups ?? []) {
+      if (collapsed.has(g.key)) continue;
+      const a = cache.current.get(g.key);
+      for (let p = 0; p * PAGE < g.count; p++) {
+        if (!a || a[p * PAGE] === undefined) return fetchPage(g, p);
+      }
+    }
+  };
+
+  // --- selection ---
+
+  const onTileClick = (e: React.MouseEvent, id: number) => {
+    const index = flatIndex.get(id) ?? 0;
     if (e.shiftKey && anchor != null) {
       const [a, b] = [Math.min(anchor, index), Math.max(anchor, index)];
       const next = new Set(selected);
-      for (let i = a; i <= b; i++) next.add(items[i].id);
+      for (let i = a; i <= b; i++) next.add(flat[i].id);
       setSelected(next);
     } else if (e.ctrlKey || e.metaKey || selected.size > 0) {
       const next = new Set(selected);
@@ -189,17 +234,52 @@ export default function Library() {
       setSelected(next);
       setAnchor(index);
     } else {
-      setViewIndex(index);
+      setViewId(id);
     }
   };
 
-  const toggle = (e: React.MouseEvent, index: number, id: number) => {
+  const toggleOne = (e: React.MouseEvent, id: number) => {
     e.stopPropagation();
     const next = new Set(selected);
     next.has(id) ? next.delete(id) : next.add(id);
     setSelected(next);
-    setAnchor(index);
+    setAnchor(flatIndex.get(id) ?? null);
   };
+
+  /** How many of a group's files are selected (exact once its ids were fetched). */
+  const selectedIn = (g: GroupRow): number => {
+    const ids = groupIds.current.get(g.key);
+    if (ids) return ids.reduce((n, id) => n + (selected.has(id) ? 1 : 0), 0);
+    const a = cache.current.get(g.key);
+    return a ? a.reduce((n, it) => n + (it && selected.has(it.id) ? 1 : 0), 0) : 0;
+  };
+
+  const toggleGroup = async (g: GroupRow) => {
+    setBusyGroup(g.key);
+    try {
+      let ids = groupIds.current.get(g.key);
+      if (!ids) {
+        ids = await api.queryIds(groupFilter(filter, g));
+        groupIds.current.set(g.key, ids);
+      }
+      const all = ids.every((id) => selected.has(id));
+      const next = new Set(selected);
+      ids.forEach((id) => (all ? next.delete(id) : next.add(id)));
+      setSelected(next);
+    } catch (e) {
+      setLoadError(String(e));
+    } finally {
+      setBusyGroup(null);
+    }
+  };
+
+  const toggleFold = (g: GroupRow) => {
+    const next = new Set(collapsed);
+    next.has(g.key) ? next.delete(g.key) : next.add(g.key);
+    saveCollapsed(next);
+  };
+  const foldAll = () => saveCollapsed(new Set((groups ?? []).map((g) => g.key)));
+  const unfoldAll = () => saveCollapsed(new Set());
 
   const selectAll = async () => setSelected(new Set(await api.queryIds(filter)));
 
@@ -210,6 +290,77 @@ export default function Library() {
     setBulk(null);
     setBulkValue("");
     reload();
+    setSelected(new Set());
+  };
+
+  // --- render ---
+
+  const total = stats?.count ?? 0;
+  const groupCount = groups?.length ?? 0;
+  const foldedCount = (groups ?? []).filter((g) => collapsed.has(g.key)).length;
+  const filtered = Object.keys(filter).some((k) => k !== "sort" && k !== "desc" && (filter as any)[k] != null && (filter as any)[k] !== false);
+  const viewIndex = viewId != null ? flatIndex.get(viewId) : undefined;
+
+  const header = (g: GroupRow) => {
+    const n = selectedIn(g);
+    const state = n === 0 ? "" : n >= g.count ? "on" : "some";
+    const { title, tip } = groupTitle(g);
+    const folded = collapsed.has(g.key);
+    return (
+      <div className={`group-head ${folded ? "folded" : ""}`}>
+        <button
+          className={`gcheck ${state}`}
+          disabled={busyGroup === g.key}
+          onClick={() => toggleGroup(g)}
+          title={state === "on" ? "이 묶음 선택 해제" : "이 묶음 전체 선택"}
+        >
+          {state === "on" ? "✓" : state === "some" ? "–" : ""}
+        </button>
+        <button className="fold" onClick={() => toggleFold(g)} title={folded ? "펼치기" : "접기"}>
+          {folded ? "▸" : "▾"}
+        </button>
+        <span className="group-title" onClick={() => toggleFold(g)} title={tip ?? title}>{title}</span>
+        <span className="muted small">
+          {fmtCount(g.count)}개 · {fmtBytes(g.bytes)}
+          {n > 0 && <b className="accent-text"> · {fmtCount(n)}개 선택</b>}
+        </span>
+      </div>
+    );
+  };
+
+  const tiles = (g: GroupRow, row: number) => {
+    const a = cache.current.get(g.key);
+    const start = row * cols;
+    const end = Math.min(g.count, start + cols);
+    const cells = [];
+    for (let i = start; i < end; i++) {
+      const item = a?.[i];
+      if (!item) {
+        cells.push(<div key={`s${i}`} className="tile skeleton" style={{ width: TILE, height: TILE }} />);
+        continue;
+      }
+      const cap = caption(item, loadedSort);
+      cells.push(
+        <div
+          key={item.id}
+          className={`tile ${selected.has(item.id) ? "sel" : ""} ${item.online ? "" : "offline"}`}
+          style={{ width: TILE, height: TILE }}
+          onClick={(e) => onTileClick(e, item.id)}
+        >
+          <img loading="lazy" src={thumbUrl(item.id)} alt="" draggable={false} onError={(e) => ((e.target as HTMLImageElement).style.visibility = "hidden")} />
+          <button className="check" onClick={(e) => toggleOne(e, item.id)}>{selected.has(item.id) ? "✓" : ""}</button>
+          {item.kind === "video" && <span className="badge-video">▶ {fmtDuration(item.duration_ms)}</span>}
+          {item.kind === "raw" && <span className="badge-raw">RAW</span>}
+          {!item.online && <span className="badge-offline" title="드라이브 연결 안 됨">⏏</span>}
+          {cap && <span className="tile-caption">{cap}</span>}
+        </div>,
+      );
+    }
+    return (
+      <div className="tile-row" style={{ gridTemplateColumns: `repeat(${cols}, ${TILE}px)`, gap: GAP }}>
+        {cells}
+      </div>
+    );
   };
 
   return (
@@ -226,11 +377,27 @@ export default function Library() {
               </>
             ) : "불러오는 중…"}
           </div>
-          <div className="muted small">클릭하면 크게 보기 · Ctrl/Shift+클릭으로 여러 개 선택</div>
+          <div className="muted small">클릭하면 크게 보기 · Ctrl/Shift+클릭으로 여러 개 선택 · 묶음 제목 왼쪽 동그라미로 묶음 전체 선택</div>
         </div>
       </header>
       <FilterBar filter={filter} onChange={setFilter} />
       {loadError && <div className="alert bad">불러오기 실패: {loadError}</div>}
+
+      <div className="grid-toolbar">
+        <label className="muted small">묶기</label>
+        <div className="seg">
+          {GROUP_BYS.map((b) => (
+            <button key={b.key} className={groupBy === b.key ? "on" : ""} onClick={() => setGroupBy(b.key)}>{b.name}</button>
+          ))}
+        </div>
+        {groupBy !== "none" && groupCount > 0 && (
+          <>
+            <span className="muted small">{fmtCount(groupCount)}개 묶음{foldedCount > 0 ? ` · ${fmtCount(foldedCount)}개 접힘` : ""}</span>
+            <button className="btn small" onClick={foldAll} disabled={foldedCount === groupCount}>모두 접기</button>
+            <button className="btn small" onClick={unfoldAll} disabled={foldedCount === 0}>모두 펼치기</button>
+          </>
+        )}
+      </div>
 
       {selected.size > 0 && (
         <div className="selbar">
@@ -255,7 +422,7 @@ export default function Library() {
       {stats && total === 0 ? (
         <div className="empty">
           <div className="empty-icon">⛁</div>
-          {Object.keys(filter).some((k) => k !== "sort" && k !== "desc" && (filter as any)[k] != null && (filter as any)[k] !== false) ? (
+          {filtered ? (
             <>
               <h2>조건에 맞는 항목이 없습니다</h2>
               <p>필터를 줄이거나 「모두 지우기」를 눌러 보세요.</p>
@@ -272,47 +439,23 @@ export default function Library() {
         <Virtuoso
           className="grid-scroller"
           data={rows}
-          endReached={loadMore}
           increaseViewportBy={800}
           computeItemKey={(_, r) => r.key}
-          itemContent={(_, r) =>
-            r.type === "header" ? (
-              <div className="month-head">
-                {r.title} {r.count > 0 && <span className="muted">{fmtCount(r.count)}{sort !== "taken" && !done ? "+" : ""}</span>}
-              </div>
-            ) : (
-              <div className="tile-row" style={{ gridTemplateColumns: `repeat(${cols}, ${TILE}px)`, gap: GAP }}>
-                {r.items.map(({ item, index }) => (
-                  <div
-                    key={item.id}
-                    className={`tile ${selected.has(item.id) ? "sel" : ""} ${item.online ? "" : "offline"}`}
-                    style={{ width: TILE, height: TILE }}
-                    onClick={(e) => onTileClick(e, index, item.id)}
-                  >
-                    <img loading="lazy" src={thumbUrl(item.id)} alt="" draggable={false} onError={(e) => ((e.target as HTMLImageElement).style.visibility = "hidden")} />
-                    <button className="check" onClick={(e) => toggle(e, index, item.id)}>{selected.has(item.id) ? "✓" : ""}</button>
-                    {item.kind === "video" && <span className="badge-video">▶ {fmtDuration(item.duration_ms)}</span>}
-                    {item.kind === "raw" && <span className="badge-raw">RAW</span>}
-                    {!item.online && <span className="badge-offline" title="드라이브 연결 안 됨">⏏</span>}
-                    {caption(item, sort) && <span className="tile-caption">{caption(item, sort)}</span>}
-                  </div>
-                ))}
-              </div>
-            )
-          }
+          rangeChanged={loadRange}
+          itemContent={(_, r) => (r.type === "header" ? header(r.g) : tiles(r.g, r.row))}
         />
       )}
 
-      {viewIndex != null && items[viewIndex] && (
+      {viewIndex != null && (
         <Viewer
-          items={items}
+          items={flat}
           index={viewIndex}
           onIndex={(i) => {
-            setViewIndex(i);
-            if (i > items.length - 50) loadMore();
+            setViewId(flat[i].id);
+            if (i > flat.length - 30) loadNext();
           }}
-          onClose={() => setViewIndex(null)}
-          onChanged={() => { api.timeline(filter).then(setTimeline); api.filteredStats(filter).then(setStats); }}
+          onClose={() => setViewId(null)}
+          onChanged={() => api.filteredStats(filter).then(setStats)}
         />
       )}
     </div>

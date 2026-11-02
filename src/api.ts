@@ -24,10 +24,16 @@ export interface FileFilter {
   camera?: string | null;
   ext?: string | null;
   has_gps?: boolean | null;
+  dir?: string | null;
   sort?: SortKey | null;
   desc?: boolean | null;
 }
 
+export type GroupBy = "month" | "year" | "folder" | "none";
+export interface GroupRow {
+  key: string; count: number; bytes: number; year: number | null; month: number | null;
+  volume_id: number | null; dir: string | null; mount: string | null; volume_label: string | null;
+}
 export type SortKey = "taken" | "mtime" | "size" | "name" | "resolution" | "duration";
 
 export interface VolumeRow {
@@ -116,6 +122,7 @@ export const api = {
   suggestedFolders: () => invoke<SuggestedFolder[]>("suggested_folders"),
   filterOptions: () => invoke<FilterOptions>("filter_options"),
   filteredStats: (filter: FileFilter) => invoke<FilteredStats>("filtered_stats", { filter }),
+  groupSummary: (filter: FileFilter, groupBy: GroupBy) => invoke<GroupRow[]>("group_summary", { filter, groupBy }),
   startThumbs: () => invoke<void>("start_thumbs"),
   cancelJob: () => invoke<void>("cancel_job"),
 
