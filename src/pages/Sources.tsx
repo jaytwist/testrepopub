@@ -101,7 +101,9 @@ export default function Sources() {
         <div className="alert ok">
           <div>
             스캔 완료: 새 파일 <b>{fmtCount(sum((s) => s.added))}</b>개, 변경 {fmtCount(sum((s) => s.updated))}개,
-            목록에서 빠짐 {fmtCount(sum((s) => s.missing))}개 · 그대로 {fmtCount(sum((s) => s.unchanged))}개(다시 읽지 않음) · 썸네일 {fmtCount(scanResult.thumbs.generated)}개 생성
+            목록에서 빠짐 {fmtCount(sum((s) => s.missing))}개 · 그대로 {fmtCount(sum((s) => s.unchanged))}개(다시 읽지 않음)
+            {sum((s) => s.moved) > 0 && <> · 옮겨진 파일 {fmtCount(sum((s) => s.moved))}개 인식</>}
+            {sum((s) => s.reused) > 0 && <> · 복사본 {fmtCount(sum((s) => s.reused))}개는 기존 결과 재사용</>} · 썸네일 {fmtCount(scanResult.thumbs.generated)}개 생성
           </div>
           {skipParts.some(([, n]) => n > 0) && (
             <div className="small muted">

@@ -11,8 +11,9 @@ import History from "./pages/History";
 import Settings from "./pages/Settings";
 import Cleanup from "./pages/Cleanup";
 import Trips from "./pages/Trips";
+import People from "./pages/People";
 
-export type Page = "library" | "trips" | "cleanup" | "sources" | "duplicates" | "organize" | "history" | "settings";
+export type Page = "library" | "people" | "trips" | "cleanup" | "sources" | "duplicates" | "organize" | "history" | "settings";
 
 /** Open the library with a ready-made view (used by cleanup suggestions, people, places). */
 export interface LibraryPreset {
@@ -68,6 +69,7 @@ const NAV: { section: string; items: { id: Page; label: string; icon: string }[]
     section: "보기",
     items: [
       { id: "library", label: "라이브러리", icon: "▦" },
+      { id: "people", label: "인물", icon: "☺" },
       { id: "trips", label: "여행", icon: "✈" },
     ],
   },
@@ -283,6 +285,7 @@ export default function App() {
           {page === "library" && <Library preset={preset} onClearPreset={() => setPreset(null)} onConsumePreset={() => setPreset((p) => p && { ...p, select: undefined, review: undefined })} />}
           {page === "cleanup" && <Cleanup />}
           {page === "trips" && <Trips />}
+          {page === "people" && <People />}
           {page === "sources" && <Sources />}
           {page === "duplicates" && <Duplicates />}
           {page === "organize" && <Organize />}

@@ -104,6 +104,8 @@ pub fn find_exact(db: &Db, stop: &StopFlag, progress: ProgressFn) -> Result<Dedu
     let pre_total: u64 = size_groups.iter().filter(|g| g.iter().all(|f| f.hash.is_none())).map(|g| g.len() as u64).sum();
     let done = AtomicU64::new(0);
     progress(Progress::new(job, "prehash", 0, pre_total, ""));
+    // Kept: the same fingerprint recognises these files later when moved or copied.
+    let fresh_prehashes = std::sync::Mutex::new(Vec::<(i64, String)>::new());
     let pre_groups: Vec<Vec<FileRow>> = size_groups
         .into_par_iter()
         .flat_map(|group| {
@@ -120,6 +122,7 @@ pub fn find_exact(db: &Db, stop: &StopFlag, progress: ProgressFn) -> Result<Dedu
                     progress(Progress::new(job, "prehash", d, pre_total, f.name.clone()));
                 }
                 if let Ok(p) = journal::prehash_file(&f.abs_path(), f.size as u64) {
+                    fresh_prehashes.lock().unwrap().push((f.id, p.clone()));
                     m.entry(p).or_default().push(f);
                 }
             }
@@ -159,6 +162,10 @@ pub fn find_exact(db: &Db, stop: &StopFlag, progress: ProgressFn) -> Result<Dedu
             let mut st = tx.prepare_cached("UPDATE files SET hash = ? WHERE id = ?")?;
             for (id, h) in &hashed {
                 st.execute(params![h, id])?;
+            }
+            let mut st = tx.prepare_cached("UPDATE files SET prehash = ? WHERE id = ? AND prehash IS NULL")?;
+            for (id, p) in fresh_prehashes.into_inner().unwrap() {
+                st.execute(params![p, id])?;
             }
         }
         tx.commit()?;
@@ -467,7 +474,7 @@ pub fn list_groups(conn: &Connection, kind: &str, offset: i64, limit: i64) -> Re
     let mut out = Vec::new();
     for id in ids {
         let members: Vec<DupMember> = st
-            .query_map([id], |r| Ok(DupMember { file: FileRow::from_row(r)?, keep: r.get::<_, i64>(22)? != 0 }))?
+            .query_map([id], |r| Ok(DupMember { file: FileRow::from_row(r)?, keep: r.get::<_, i64>(crate::db::FILE_COLS_LEN)? != 0 }))?
             .collect::<rusqlite::Result<_>>()?;
         let reclaimable_bytes = members.iter().filter(|m| !m.keep).map(|m| m.file.size).sum();
         out.push(DupGroup { id, kind: kind.to_string(), members, reclaimable_bytes });
@@ -520,7 +527,7 @@ pub fn apply(db: &Db, kind: &str, group_ids: Option<Vec<i64>>, stop: &StopFlag, 
         progress(Progress::new("dedupe:apply", "quarantine", i as u64, total, ""));
         let members: Vec<(FileRow, bool)> = {
             let mut st = conn.prepare_cached(&sql)?;
-            let rows = st.query_map([gid], |r| Ok((FileRow::from_row(r)?, r.get::<_, i64>(22)? != 0)))?.collect::<rusqlite::Result<_>>()?;
+            let rows = st.query_map([gid], |r| Ok((FileRow::from_row(r)?, r.get::<_, i64>(crate::db::FILE_COLS_LEN)? != 0)))?.collect::<rusqlite::Result<_>>()?;
             rows
         };
         let keepers: Vec<&FileRow> = members.iter().filter(|(_, k)| *k).map(|(f, _)| f).collect();

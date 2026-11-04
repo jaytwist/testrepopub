@@ -336,3 +336,32 @@ kbd { font: 11px/1 ui-monospace, Consolas, monospace; border: 1px solid var(--li
 .drive-tabs button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
 .drive-tabs button.on .muted { color: rgba(255, 255, 255, 0.8); }
 .drive-tabs button.offline:not(.on) { opacity: 0.7; border-style: dashed; }
+
+/* --- people --- */
+.face { display: inline-block; border-radius: 50%; overflow: hidden; background: var(--panel-2); flex: none; }
+.face img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.people-off { gap: 8px; margin-bottom: 12px; }
+.same-person { flex-direction: row; align-items: center; gap: 24px; margin-bottom: 12px; flex-wrap: wrap; }
+.sp-faces { display: flex; gap: 16px; }
+.sp-faces > div { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+.sp-ask { display: flex; flex-direction: column; gap: 8px; }
+.person-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
+.person-card { position: relative; display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 14px 8px; border: 1px solid transparent; border-radius: var(--radius); cursor: pointer; }
+.person-card:hover { background: var(--panel); border-color: var(--line); }
+.person-card.sel { background: var(--accent-soft); border-color: var(--accent); }
+.person-card.hidden-person { opacity: 0.55; }
+.person-card .check { position: absolute; left: 8px; top: 8px; width: 22px; height: 22px; border-radius: 50%; border: 2px solid var(--line); background: var(--panel); font-size: 12px; opacity: 0; cursor: pointer; }
+.person-card:hover .check, .person-card.sel .check { opacity: 1; }
+.person-card.sel .check { background: var(--accent); border-color: var(--accent); color: #fff; }
+.person-name { cursor: text; text-align: center; }
+.add-name { color: var(--accent); }
+.name-input { width: 130px; text-align: center; }
+.person-head { align-items: center; gap: 14px; justify-content: flex-start; }
+.person-head > div { flex: 1; }
+.person-title { cursor: text; margin: 0; }
+.face-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 8px; }
+.face-tile { position: relative; padding: 0; aspect-ratio: 1; border: 3px solid transparent; border-radius: 10px; overflow: hidden; background: var(--panel-2); cursor: pointer; }
+.face-tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.face-tile.sel { border-color: var(--accent); }
+.face-tile .tick { position: absolute; right: 4px; top: 4px; background: var(--accent); color: #fff; border-radius: 50%; width: 20px; height: 20px; font-size: 12px; display: grid; place-items: center; }
+.people-links a { color: var(--accent); cursor: pointer; }

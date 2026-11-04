@@ -483,6 +483,7 @@ mod tests {
             quarantined: false,
             mount: "/".into(),
             online: true,
+            clone_of: None,
         }
     }
 

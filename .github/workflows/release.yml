@@ -51,6 +51,10 @@ jobs:
         shell: pwsh
         run: ./scripts/fetch-ffmpeg.ps1
 
+      - name: Fetch People runtime and face models (SHA-256 pinned)
+        shell: pwsh
+        run: ./scripts/fetch-ai.ps1
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

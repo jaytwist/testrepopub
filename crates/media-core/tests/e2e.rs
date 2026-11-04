@@ -81,7 +81,9 @@ fn full_workflow() {
     let stop = StopFlag::new();
     let stats = scanner::scan_all(&db, &ScanOptions::default(), &stop, &quiet).unwrap();
     let added: u64 = stats.iter().map(|s| s.added).sum();
-    assert_eq!(added, 8, "{stats:?}");
+    let reused: u64 = stats.iter().map(|s| s.reused).sum();
+    // The backup copy on diskB is recognised as the same content: indexed without reading it.
+    assert_eq!((added, reused), (7, 1), "{stats:?}");
     let sk = |f: fn(&media_core::userfiles::SkipCounts) -> u64| stats.iter().map(|s| f(&s.skipped)).sum::<u64>();
     assert_eq!(sk(|c| c.system_folders), 3, "Program Files, AppData, .thumbnails: {stats:?}");
     assert_eq!(sk(|c| c.hidden_folders), 1, ".hidden");

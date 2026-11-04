@@ -42,8 +42,10 @@ const FACE_MIN_PX: f32 = 32.0;
 pub struct AnalysisOptions {
     /// Start analysing automatically after scans / at app start.
     pub auto: bool,
-    /// People feature (face analysis). Off until the user turns it on.
-    pub faces: bool,
+    /// People feature (face analysis). On by default so faces are found in the same single read
+    /// as sharpness and bursts — turning it on later would mean reading every photo again.
+    /// (Renamed from `faces`, whose stored `false` only ever meant "the old default".)
+    pub people: bool,
     /// Use the GPU (DirectML) when available.
     pub gpu: bool,
     pub pause_on_battery: bool,
@@ -51,7 +53,7 @@ pub struct AnalysisOptions {
 
 impl Default for AnalysisOptions {
     fn default() -> Self {
-        Self { auto: true, faces: false, gpu: true, pause_on_battery: true }
+        Self { auto: true, people: true, gpu: true, pause_on_battery: true }
     }
 }
 

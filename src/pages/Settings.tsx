@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, fmtCount, fmtEta, onAnalysisStatus, type AnalysisOptions, type AppInfo, type LaneStatus } from "../api";
 import ScanSettings from "../components/ScanSettings";
+import { confirm } from "@tauri-apps/plugin-dialog";
 
 const OPEN_SOURCE: [string, string, string][] = [
   ["Tauri", "MIT / Apache-2.0", "앱 틀, 설치 파일, 자동 업데이트"],
@@ -11,6 +12,7 @@ const OPEN_SOURCE: [string, string, string][] = [
   ["ONNX Runtime · ort", "MIT / Apache-2.0", "PC 안에서 AI 모델 실행"],
   ["YuNet (OpenCV Zoo)", "MIT", "얼굴 찾기"],
   ["SFace (OpenCV Zoo)", "Apache-2.0", "얼굴 비교"],
+  ["DirectML", "Microsoft DirectML 라이선스 (앱 포함 재배포 허용)", "그래픽카드로 얼굴 분석 가속"],
   ["reverse_geocoder · GeoNames", "MIT / Apache-2.0 · CC-BY 4.0", "GPS를 지명으로 바꾸기, 여행 묶기 (지명 데이터: geonames.org)"],
   ["ffmpeg", "LGPL", "동영상 썸네일·변환"],
   ["React, react-virtuoso", "MIT", "화면"],
@@ -39,6 +41,16 @@ export default function Settings() {
     await api.setAnalysisOptions(next);
   };
 
+  const clearFaces = async () => {
+    const ok = await confirm("찾은 얼굴과 인물, 붙인 이름을 모두 지우고 인물 찾기를 끕니다. 사진은 그대로입니다.\n\n다시 켜면 얼굴을 찾기 위해 사진을 한 번 더 읽습니다.", {
+      title: "얼굴 데이터 지우기", kind: "warning", okLabel: "모두 지우기", cancelLabel: "취소",
+    });
+    if (!ok) return;
+    await api.clearFaceData();
+    setOpts(await api.getAnalysisOptions());
+    setMsg("얼굴 데이터를 지웠습니다");
+  };
+
   const checkUpdate = async () => {
     setMsg("확인 중…");
     try {
@@ -61,7 +73,7 @@ export default function Settings() {
       <section className="card">
         <h2>사진 분석</h2>
         <p className="muted small">
-          썸네일, 선명도(흐린 사진 찾기), 연사 묶기에 필요한 정보를 뒤에서 조금씩 만듭니다. 다른 작업을 시작하면 잠시 멈췄다가 끝나면 이어서 합니다.
+          썸네일, 선명도(흐린 사진 찾기), 연사, 인물(얼굴)에 필요한 정보를 사진을 한 번만 읽어 뒤에서 조금씩 만듭니다. 다른 작업을 시작하면 잠시 멈췄다가 끝나면 이어서 합니다. 옮기거나 복사한 사진은 다시 읽지 않습니다.
         </p>
         {lane && (
           <div className="kv-inline">
@@ -74,6 +86,10 @@ export default function Settings() {
           <>
             <label className="check-row"><input type="checkbox" checked={opts.auto} onChange={(e) => save({ auto: e.target.checked })} /> 스캔이 끝나면 자동으로 분석</label>
             <label className="check-row"><input type="checkbox" checked={opts.pause_on_battery} onChange={(e) => save({ pause_on_battery: e.target.checked })} /> 노트북이 배터리로 동작할 때는 멈추기</label>
+            <label className="check-row"><input type="checkbox" checked={opts.people} onChange={(e) => save({ people: e.target.checked })} /> 인물 찾기 (같은 사람이 나온 사진 묶기 · 사진을 읽을 때 함께 처리)</label>
+            {opts.people && (
+              <label className="check-row"><input type="checkbox" checked={opts.gpu} onChange={(e) => save({ gpu: e.target.checked })} /> 그래픽카드(GPU)로 더 빠르게 {lane?.provider && lane.provider !== "-" ? <span className="muted small">(지금: {lane.provider})</span> : null}</label>
+            )}
           </>
         )}
         <div className="btn-row">
@@ -85,6 +101,7 @@ export default function Settings() {
             </button>
           )}
           {lane?.last_error && <span className="warn-text small">{lane.last_error}</span>}
+          <button className="btn ghost danger" onClick={clearFaces}>얼굴 데이터 모두 지우기</button>
         </div>
       </section>
 

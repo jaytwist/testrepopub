@@ -6,3 +6,6 @@ src-tauri/binaries/
 *.log
 dist-windows/
 .secrets/
+src-tauri/resources/ai/*
+!src-tauri/resources/ai/README.txt
+!src-tauri/resources/ai/DirectML-LICENSE.txt

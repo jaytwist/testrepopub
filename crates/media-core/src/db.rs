@@ -194,6 +194,20 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY(file_id, kind)
     );
     "#,
+    // 3: never re-read a known file — moved/renamed/copied files are recognised by content
+    // (size + mtime + 64 KiB prehash) and keep or copy everything already derived from them.
+    // People: answered "different person" pairs.
+    r#"
+    ALTER TABLE files ADD COLUMN prehash TEXT;
+    ALTER TABLE files ADD COLUMN clone_of INTEGER;
+    CREATE INDEX IF NOT EXISTS files_size_mtime ON files(size, mtime);
+    ALTER TABLE faces ADD COLUMN src_face INTEGER;
+    CREATE TABLE IF NOT EXISTS person_pairs_no (
+        a INTEGER NOT NULL,
+        b INTEGER NOT NULL,
+        PRIMARY KEY(a, b)
+    );
+    "#,
 ];
 
 pub fn schema_version(conn: &Connection) -> Result<i64> {
@@ -298,7 +312,13 @@ pub struct FileRow {
     /// Joined from volumes.
     pub mount: String,
     pub online: bool,
+    /// The indexed file this one is a byte-identical copy of (its thumbnails can be reused).
+    #[serde(default)]
+    pub clone_of: Option<i64>,
 }
+
+/// Number of columns in `FILE_COLS` (extra columns selected after it start at this index).
+pub const FILE_COLS_LEN: usize = 23;
 
 /// SQLite "dirname" of `f.rel_path` (volume-relative, no trailing slash, "" at the volume root).
 /// rtrim(path, <all non-slash chars of path>) strips the file name, then the trailing slash.
@@ -306,7 +326,7 @@ pub const DIR_SQL: &str = "rtrim(rtrim(f.rel_path, replace(f.rel_path, '/', ''))
 
 pub const FILE_COLS: &str = "f.id, f.volume_id, f.rel_path, f.name, f.ext, f.kind, f.size, f.mtime, f.taken_at, \
     f.date_source, f.width, f.height, f.duration_ms, f.camera, f.lat, f.lon, f.orientation, f.hash, f.missing, \
-    f.quarantined, v.mount, v.online";
+    f.quarantined, v.mount, v.online, f.clone_of";
 
 impl FileRow {
     pub fn from_row(r: &Row) -> rusqlite::Result<Self> {
@@ -333,6 +353,7 @@ impl FileRow {
             quarantined: r.get::<_, i64>(19)? != 0,
             mount: r.get(20)?,
             online: r.get::<_, i64>(21)? != 0,
+            clone_of: r.get(22)?,
         })
     }
 
@@ -404,6 +425,8 @@ pub struct FileFilter {
     pub burst_id: Option<i64>,
     /// Files of this automatic trip.
     pub trip_id: Option<i64>,
+    /// Photos in which all of these people appear.
+    pub person_ids: Option<Vec<i64>>,
     /// Show each burst as its best shot only.
     pub stack_bursts: bool,
     /// 'taken' (default) | 'mtime' | 'size' | 'name' | 'resolution' | 'duration'
@@ -469,9 +492,10 @@ impl FileFilter {
         }
         if let Some(t) = self.text.as_ref().filter(|t| !t.trim().is_empty()) {
             w.push("(f.rel_path LIKE ? ESCAPE '\\' OR f.camera LIKE ? ESCAPE '\\' OR EXISTS (SELECT 1 FROM labels l WHERE l.file_id = f.id AND l.label LIKE ? ESCAPE '\\') \
-                    OR EXISTS (SELECT 1 FROM places pl WHERE pl.file_id = f.id AND (pl.city LIKE ? ESCAPE '\\' OR pl.admin1 LIKE ? ESCAPE '\\')))".into());
+                    OR EXISTS (SELECT 1 FROM places pl WHERE pl.file_id = f.id AND (pl.city LIKE ? ESCAPE '\\' OR pl.admin1 LIKE ? ESCAPE '\\')) \
+                    OR EXISTS (SELECT 1 FROM faces fn JOIN persons pn ON pn.id = fn.person_id WHERE fn.file_id = f.id AND pn.name LIKE ? ESCAPE '\\'))".into());
             let pat = format!("%{}%", t.trim().replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
-            for _ in 0..5 {
+            for _ in 0..6 {
                 p.push(Value::Text(pat.clone()));
             }
         }
@@ -553,6 +577,10 @@ impl FileFilter {
         }
         if self.in_burst {
             w.push("EXISTS (SELECT 1 FROM bursts b WHERE b.file_id = f.id)".into());
+        }
+        for pid in self.person_ids.iter().flatten() {
+            w.push("EXISTS (SELECT 1 FROM faces fp WHERE fp.file_id = f.id AND fp.person_id = ?)".into());
+            p.push(Value::Integer(*pid));
         }
         if let Some(t) = self.trip_id {
             w.push("EXISTS (SELECT 1 FROM trip_files tf WHERE tf.file_id = f.id AND tf.trip_id = ?)".into());

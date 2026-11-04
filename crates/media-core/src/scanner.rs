@@ -2,7 +2,7 @@
 //! files in parallel, and streams results into SQLite in batches (so the timeline fills while the
 //! scan is still running).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
@@ -15,7 +15,8 @@ use walkdir::WalkDir;
 
 use crate::media::{ext_of, kind_for_ext, Kind};
 use crate::userfiles::{AppDirDetector, Rules, Skip, SkipCounts};
-use crate::{labels, meta, volumes, Db, Progress, ProgressFn, StopFlag};
+use crate::identity::{self, Known};
+use crate::{journal, labels, meta, volumes, Db, Progress, ProgressFn, StopFlag};
 
 pub use crate::userfiles::ScanOptions;
 
@@ -26,6 +27,10 @@ pub struct ScanStats {
     pub added: u64,
     pub updated: u64,
     pub unchanged: u64,
+    /// Moved or renamed outside the app, recognised by content: nothing re-read, nothing lost.
+    pub moved: u64,
+    /// Copies of files already indexed elsewhere: results reused instead of re-reading.
+    pub reused: u64,
     pub missing: u64,
     pub errors: u64,
     /// What was deliberately not indexed, and why.
@@ -155,30 +160,64 @@ pub fn scan_source(db: &Db, source_id: i64, opts: &ScanOptions, stop: &StopFlag,
     }
     stats.unchanged = unchanged_ids.len() as u64;
 
+    // 2b. New paths whose content is already indexed: moved/renamed (the row moves with it) or
+    //     copied (results are reused). Costs one 64 KiB read per candidate, only when a file with
+    //     the same size and time exists — never a decode.
+    let now = crate::now_ts();
+    let seen: HashSet<&str> = cands.iter().map(|c| c.rel.as_str()).collect();
+    let gone_here: HashSet<i64> = existing.iter().filter(|(rel, _)| !seen.contains(rel.as_str())).map(|(_, (id, _, _))| *id).collect();
+    let mut moved_ids: HashSet<i64> = HashSet::new();
+    let mut known_rels: HashSet<&str> = HashSet::new();
+    {
+        let tx = conn.transaction()?;
+        for c in todo.iter().filter(|c| !existing.contains_key(&c.rel)) {
+            if stop.is_stopped() {
+                return Err(anyhow!("cancelled"));
+            }
+            match identity::find_known(&tx, &c.abs, c.size as i64, c.mtime, &gone_here, &moved_ids)? {
+                Some(Known::Moved(id)) => {
+                    identity::apply_move(&tx, id, volume_id, &c.rel, &c.name, &c.ext, now)?;
+                    moved_ids.insert(id);
+                    stats.moved += 1;
+                }
+                Some(Known::CopyOf(from)) => {
+                    identity::apply_copy(&tx, from, volume_id, &c.rel, &c.name, &c.ext, now)?;
+                    stats.reused += 1;
+                }
+                None => continue,
+            }
+            known_rels.insert(c.rel.as_str());
+        }
+        tx.commit()?;
+    }
+    todo.retain(|c| !known_rels.contains(c.rel.as_str()));
+
     // 3. Extract metadata in parallel, write in batches.
     let total = todo.len() as u64;
     let done = AtomicU64::new(0);
     progress(Progress::new(&job, "meta", 0, total, ""));
-    let now = crate::now_ts();
     for chunk in todo.chunks(400) {
         if stop.is_stopped() {
             return Err(anyhow!("cancelled"));
         }
-        let metas: Vec<(&Candidate, meta::Meta)> = chunk
+        let metas: Vec<(&Candidate, meta::Meta, Option<String>)> = chunk
             .par_iter()
             .map(|c| {
                 let m = meta::extract(&c.abs, c.kind, c.mtime);
+                // Content fingerprint for recognising this file later at another path or drive
+                // (the header was just read, so this is served from the OS cache).
+                let ph = journal::prehash_file(&c.abs, c.size).ok();
                 let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                 if d % 50 == 0 {
                     progress(Progress::new(&job, "meta", d, total, c.name.clone()));
                 }
-                (*c, m)
+                (*c, m, ph)
             })
             .collect();
         // Icon-sized pictures (stickers, emoji, web thumbnails) are not the user's photos.
         let (metas, small): (Vec<_>, Vec<_>) =
-            metas.into_iter().partition(|(c, m)| c.kind != Kind::Photo || !rules.pixels_too_small(m.width, m.height));
-        for (c, _) in &small {
+            metas.into_iter().partition(|(c, m, _)| c.kind != Kind::Photo || !rules.pixels_too_small(m.width, m.height));
+        for (c, _, _) in &small {
             stats.skipped.add(Skip::TooSmall);
             if let Some((id, _, _)) = existing.get(&c.rel) {
                 conn.execute("UPDATE files SET missing = 1 WHERE id = ?", [id])?;
@@ -189,22 +228,22 @@ pub fn scan_source(db: &Db, source_id: i64, opts: &ScanOptions, stop: &StopFlag,
         {
             let mut up = tx.prepare_cached(
                 "INSERT INTO files(volume_id, rel_path, name, ext, kind, size, mtime, taken_at, date_source, width, height,
-                                   duration_ms, camera, lat, lon, orientation, hash, missing, quarantined, scanned_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, NULL, 0, 0, ?17)
+                                   duration_ms, camera, lat, lon, orientation, hash, prehash, missing, quarantined, scanned_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, NULL, ?18, 0, 0, ?17)
                  ON CONFLICT(volume_id, rel_path) DO UPDATE SET
                     name=excluded.name, ext=excluded.ext, kind=excluded.kind, size=excluded.size, mtime=excluded.mtime,
                     taken_at = CASE WHEN files.date_source = 'user' THEN files.taken_at ELSE excluded.taken_at END,
                     date_source = CASE WHEN files.date_source = 'user' THEN 'user' ELSE excluded.date_source END,
                     width=excluded.width, height=excluded.height, duration_ms=excluded.duration_ms, camera=excluded.camera,
-                    lat=excluded.lat, lon=excluded.lon, orientation=excluded.orientation, hash=NULL, missing=0,
+                    lat=excluded.lat, lon=excluded.lon, orientation=excluded.orientation, hash=NULL, prehash=excluded.prehash, clone_of=NULL, missing=0,
                     quarantined=0, scanned_at=excluded.scanned_at
                  RETURNING id",
             )?;
-            for (c, m) in &metas {
+            for (c, m, ph) in &metas {
                 let id: i64 = up.query_row(
                     params![
                         volume_id, c.rel, c.name, c.ext, c.kind.as_str(), c.size as i64, c.mtime, m.taken_at, m.date_source,
-                        m.width, m.height, m.duration_ms, m.camera, m.lat, m.lon, m.orientation, now
+                        m.width, m.height, m.duration_ms, m.camera, m.lat, m.lon, m.orientation, now, ph
                     ],
                     |r| r.get(0),
                 )?;
@@ -236,9 +275,9 @@ pub fn scan_source(db: &Db, source_id: i64, opts: &ScanOptions, stop: &StopFlag,
         tx.commit()?;
     }
 
-    // 5. Anything indexed under this root that we did not see is gone (moved/deleted outside the app).
-    let seen: std::collections::HashSet<&str> = cands.iter().map(|c| c.rel.as_str()).collect();
-    let gone: Vec<i64> = existing.iter().filter(|(rel, _)| !seen.contains(rel.as_str())).map(|(_, (id, _, _))| *id).collect();
+    // 5. Anything indexed under this root that we did not see is gone (deleted outside the app;
+    //    rows that moved elsewhere were re-pointed in 2b and are skipped here).
+    let gone: Vec<i64> = gone_here.iter().filter(|id| !moved_ids.contains(id)).copied().collect();
     {
         let tx = conn.transaction()?;
         {

@@ -4,6 +4,8 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 if (-not (Test-Path "src-tauri\binaries\ffmpeg-*.exe")) { & "$PSScriptRoot\fetch-ffmpeg.ps1" }
+# People feature runtime + models (verified by SHA-256; skipped quickly when already present).
+& "$PSScriptRoot\fetch-ai.ps1"
 npm ci
 # Auto-update files are signed with the updater key (kept out of git in .secrets\).
 if (-not $env:TAURI_SIGNING_PRIVATE_KEY) {

@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useNav } from "../App";
 import {
   api, DATE_SOURCE_NAMES, fileUrl, fmtBytes, fmtDuration, labelName, thumbUrl, toDatetimeLocal,
   type FileDetail, type GridItem, type LabelCount,
@@ -27,6 +28,7 @@ export interface ReviewProps {
 const REASON_NAMES: Record<string, string> = { blurry: "흐린 사진", burst_extra: "연사" };
 
 export default function Viewer({ items, index, onIndex, onClose, onChanged, review }: Props) {
+  const nav = useNav();
   const item = items[index];
   const [detail, setDetail] = useState<FileDetail | null>(null);
   const [src, setSrc] = useState<string | null>(null);
@@ -264,6 +266,19 @@ export default function Viewer({ items, index, onIndex, onClose, onChanged, revi
               {f.duration_ms && <div><span>길이</span><b>{fmtDuration(f.duration_ms)}</b></div>}
               <div><span>크기</span><b>{fmtBytes(f.size)}</b></div>
               {f.camera && <div><span>카메라</span><b>{f.camera}</b></div>}
+              {detail!.people.length > 0 && (
+                <div>
+                  <span>인물</span>
+                  <b className="people-links">
+                    {detail!.people.map(([pid, name], i) => (
+                      <span key={pid}>
+                        {i > 0 && ", "}
+                        <a onClick={() => { onClose(); nav.openLibrary({ title: `${name}의 사진`, filter: { person_ids: [pid] }, groupBy: "month" }); }}>{name}</a>
+                      </span>
+                    ))}
+                  </b>
+                </div>
+              )}
               {f.lat != null && f.lon != null && (
                 <div><span>장소</span><b title={`${f.lat.toFixed(5)}, ${f.lon.toFixed(5)}`}>{detail!.place ?? `${f.lat.toFixed(5)}, ${f.lon.toFixed(5)}`}</b></div>
               )}

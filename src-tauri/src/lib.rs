@@ -50,6 +50,7 @@ struct AppState {
 pub(crate) fn post_analysis(st: &AppState) -> anyhow::Result<()> {
     let mut conn = st.db.conn()?;
     media_core::cleanup::refresh(&mut conn)?;
+    media_core::people::refresh(&mut conn)?;
     Ok(())
 }
 
@@ -256,6 +257,85 @@ fn suggested_folders(app: AppHandle, state: State<AppState>) -> CmdResult<Vec<Su
 // Cleanup suggestions
 // ---------------------------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------------------------
+// People
+// ---------------------------------------------------------------------------------------------
+
+#[tauri::command]
+fn people_list(state: State<AppState>, include_hidden: bool) -> CmdResult<Vec<media_core::people::PersonRow>> {
+    let conn = state.db.conn().map_err(err)?;
+    media_core::people::list(&conn, include_hidden).map_err(err)
+}
+
+#[tauri::command]
+fn person_faces(state: State<AppState>, person: i64) -> CmdResult<Vec<media_core::people::FaceRow>> {
+    let conn = state.db.conn().map_err(err)?;
+    media_core::people::faces_of(&conn, person, 2000).map_err(err)
+}
+
+#[tauri::command]
+fn people_suggestions(state: State<AppState>) -> CmdResult<Vec<media_core::people::PairSuggestion>> {
+    let conn = state.db.conn().map_err(err)?;
+    media_core::people::suggestions(&conn, 5).map_err(err)
+}
+
+/// Name a person. If someone else already has that name, nothing changes and their id comes
+/// back so the UI can offer to merge the two.
+#[tauri::command]
+fn rename_person(state: State<AppState>, person: i64, name: String) -> CmdResult<Option<i64>> {
+    let mut conn = state.db.conn().map_err(err)?;
+    if let Some(other) = media_core::people::person_named(&conn, &name, person).map_err(err)? {
+        if !name.trim().is_empty() {
+            return Ok(Some(other));
+        }
+    }
+    media_core::people::rename(&mut conn, person, &name).map_err(err)?;
+    Ok(None)
+}
+
+#[tauri::command]
+fn merge_people(state: State<AppState>, into: i64, others: Vec<i64>) -> CmdResult<()> {
+    let mut conn = state.db.conn().map_err(err)?;
+    media_core::people::merge(&mut conn, into, &others).map_err(err)
+}
+
+#[tauri::command]
+fn reject_faces(state: State<AppState>, faces: Vec<i64>, person: i64) -> CmdResult<()> {
+    let mut conn = state.db.conn().map_err(err)?;
+    media_core::people::reject(&mut conn, &faces, person).map_err(err)
+}
+
+#[tauri::command]
+fn hide_people(state: State<AppState>, people: Vec<i64>, hidden: bool) -> CmdResult<()> {
+    let conn = state.db.conn().map_err(err)?;
+    media_core::people::set_hidden(&conn, &people, hidden).map_err(err)
+}
+
+#[tauri::command]
+fn set_person_cover(state: State<AppState>, person: i64, face: i64) -> CmdResult<()> {
+    let conn = state.db.conn().map_err(err)?;
+    media_core::people::set_cover(&conn, person, face).map_err(err)
+}
+
+#[tauri::command]
+fn answer_people_pair(state: State<AppState>, a: i64, b: i64, same: bool) -> CmdResult<()> {
+    let mut conn = state.db.conn().map_err(err)?;
+    media_core::people::answer_pair(&mut conn, a, b, same).map_err(err)
+}
+
+/// "Delete face data": turn the feature off and forget every face, person and crop.
+#[tauri::command]
+fn clear_face_data(state: State<AppState>) -> CmdResult<()> {
+    let mut conn = state.db.conn().map_err(err)?;
+    let mut opts = analysis::load_options(&conn).map_err(err)?;
+    opts.people = false;
+    analysis::save_options(&conn, &opts).map_err(err)?;
+    state.lane.reset_engine();
+    media_core::people::clear_all(&mut conn).map_err(err)?;
+    let _ = std::fs::remove_dir_all(state.thumbs.dir().join("faces"));
+    Ok(())
+}
+
 #[tauri::command]
 fn trips_summary(state: State<AppState>) -> CmdResult<media_core::places::TripsSummary> {
     let conn = state.db.conn().map_err(err)?;
@@ -312,11 +392,11 @@ fn set_analysis_options(app: AppHandle, state: State<AppState>, options: Analysi
     let conn = state.db.conn().map_err(err)?;
     let before = analysis::load_options(&conn).map_err(err)?;
     analysis::save_options(&conn, &options).map_err(err)?;
-    if before.faces != options.faces || before.gpu != options.gpu {
+    if before.people != options.people || before.gpu != options.gpu {
         state.lane.reset_engine();
     }
     // Turning people on (or auto back on) starts work right away.
-    if (options.faces && !before.faces) || (options.auto && !before.auto) {
+    if (options.people && !before.people) || (options.auto && !before.auto) {
         state.lane.kick(&app, true);
     }
     Ok(())
@@ -390,6 +470,8 @@ struct FileDetail {
     thumb_cached: bool,
     /// "Seattle, Washington" when the file has GPS.
     place: Option<String>,
+    /// Named people in the photo.
+    people: Vec<(i64, String)>,
 }
 
 #[tauri::command]
@@ -404,6 +486,7 @@ fn file_detail(state: State<AppState>, id: i64) -> CmdResult<FileDetail> {
         confidence: meta::confidence(&f.date_source).into(),
         thumb_cached: state.thumbs.has_thumb(&f),
         place: media_core::places::place_of(&conn, id).map_err(err)?,
+        people: media_core::people::names_in(&conn, id).map_err(err)?,
         file: f,
     })
 }
@@ -744,16 +827,28 @@ fn start_purge(app: AppHandle, state: State<AppState>, batch_id: String) -> CmdR
 
 fn thumb_response(app: &AppHandle, path: &str) -> Response<Vec<u8>> {
     let not_found = || Response::builder().status(StatusCode::NOT_FOUND).body(Vec::new()).unwrap();
-    let Some(id) = path.trim_matches('/').split('/').next().and_then(|s| s.parse::<i64>().ok()) else { return not_found() };
-    let st = app.state::<AppState>();
-    let Ok(conn) = st.db.conn() else { return not_found() };
-    let Ok(Some(f)) = db::get_file(&conn, id) else { return not_found() };
-    match st.thumbs.ensure_thumb(&f).and_then(|p| Ok(std::fs::read(p)?)) {
-        Ok(bytes) => Response::builder()
+    let jpeg = |bytes: Vec<u8>| {
+        Response::builder()
             .header("Content-Type", "image/jpeg")
             .header("Cache-Control", "max-age=31536000, immutable")
             .body(bytes)
-            .unwrap(),
+            .unwrap()
+    };
+    let key = path.trim_matches('/');
+    let st = app.state::<AppState>();
+    // Face crops: thumb://f-<face id> (cached at analysis time; copies reuse the original's).
+    if let Some(face) = key.strip_prefix("f-").and_then(|s| s.parse::<i64>().ok()) {
+        let src = st.db.conn().ok().and_then(|c| media_core::people::src_face(&c, face).ok()).flatten();
+        return match st.thumbs.face_crop(face, src).and_then(|p| std::fs::read(p).ok()) {
+            Some(bytes) => jpeg(bytes),
+            None => not_found(),
+        };
+    }
+    let Some(id) = key.split('/').next().and_then(|s| s.parse::<i64>().ok()) else { return not_found() };
+    let Ok(conn) = st.db.conn() else { return not_found() };
+    let Ok(Some(f)) = db::get_file(&conn, id) else { return not_found() };
+    match st.thumbs.ensure_thumb(&f).and_then(|p| Ok(std::fs::read(p)?)) {
+        Ok(bytes) => jpeg(bytes),
         Err(_) => not_found(),
     }
 }
@@ -832,6 +927,16 @@ pub fn run() {
             start_scan,
             cleanup_summary,
             trips_summary,
+            people_list,
+            person_faces,
+            people_suggestions,
+            rename_person,
+            merge_people,
+            reject_faces,
+            hide_people,
+            set_person_cover,
+            answer_people_pair,
+            clear_face_data,
             burst_extra_ids,
             dismiss,
             analysis_status,

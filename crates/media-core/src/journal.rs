@@ -213,17 +213,20 @@ pub fn copy_indexed(conn: &Connection, batch: &str, file: &db::FileRow, dst: &Pa
     let name = dst.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     conn.execute(
         "INSERT INTO files(volume_id, rel_path, name, ext, kind, size, mtime, taken_at, date_source, width, height,
-                           duration_ms, camera, lat, lon, orientation, hash, missing, quarantined, scanned_at)
+                           duration_ms, camera, lat, lon, orientation, hash, prehash, missing, quarantined, scanned_at)
          SELECT ?1, ?2, ?3, ext, kind, size, mtime, taken_at, date_source, width, height, duration_ms, camera, lat, lon,
-                orientation, ?4, 0, 0, scanned_at FROM files WHERE id = ?5
+                orientation, ?4, prehash, 0, 0, scanned_at FROM files WHERE id = ?5
          ON CONFLICT(volume_id, rel_path) DO UPDATE SET missing = 0, quarantined = 0, hash = excluded.hash",
         params![dst_vol, dst_rel, name, hash, file.id],
     )?;
     let new_id: i64 = conn.query_row("SELECT id FROM files WHERE volume_id = ? AND rel_path = ?", params![dst_vol, dst_rel], |r| r.get(0))?;
+    // The copy is byte-identical (verified above): it inherits analysis, faces, place, labels and
+    // thumbnails instead of being read and analysed again.
     conn.execute(
         "INSERT OR IGNORE INTO labels(file_id, label, source) SELECT ?, label, source FROM labels WHERE file_id = ?",
         params![new_id, file.id],
     )?;
+    crate::identity::clone_derived(conn, file.id, new_id)?;
     conn.execute("UPDATE files SET hash = ? WHERE id = ?", params![hash, file.id])?;
     record(conn, batch, "copy", file.id, &src, dst, file.volume_id, &file.rel_path, dst_vol, dst_rel, Some(new_id))?;
     Ok(new_id)

@@ -29,6 +29,7 @@ export interface FileFilter {
   in_burst?: boolean;
   burst_id?: number | null;
   trip_id?: number | null;
+  person_ids?: number[] | null;
   stack_bursts?: boolean;
   sort?: SortKey | null;
   desc?: boolean | null;
@@ -40,6 +41,9 @@ export interface GroupRow {
   volume_id: number | null; dir: string | null; mount: string | null; volume_label: string | null;
   burst_id: number | null; first_taken: number | null;
 }
+export interface PersonRow { id: number; name: string | null; cover_face_id: number | null; photos: number; hidden: boolean }
+export interface FaceRow { id: number; file_id: number; locked: boolean }
+export interface PairSuggestion { a: PersonRow; b: PersonRow; similarity: number }
 export interface TripRow { id: number; title: string; start_ts: number; end_ts: number; count: number; cover_file_id: number | null; place: string }
 export interface TripsSummary { trips: TripRow[]; home: string; located: number; total: number }
 export interface Bucket { count: number; bytes: number }
@@ -83,7 +87,7 @@ export interface SkipCounts {
   system_files: number; cloud_only: number; too_small: number;
 }
 export interface ScanStats {
-  source_id: number; seen: number; added: number; updated: number; unchanged: number; missing: number;
+  source_id: number; seen: number; added: number; updated: number; unchanged: number; moved: number; reused: number; missing: number;
   errors: number; skipped: SkipCounts;
 }
 export interface SuggestedFolder { label: string; path: string; kind: "user" | "drive"; already_added: boolean }
@@ -96,6 +100,7 @@ export interface LabelRow { label: string; source: string }
 export interface LabelCount { label: string; count: number; user: boolean }
 export interface FileDetail {
   file: FileRow; reasons: [string, string][]; labels: LabelRow[]; abs_path: string; taken: string; confidence: string; thumb_cached: boolean; place: string | null;
+  people: [number, string][];
 }
 export interface DupMember { file: FileRow; keep: boolean }
 export interface DupGroup { id: number; kind: string; members: DupMember[]; reclaimable_bytes: number }
@@ -126,7 +131,7 @@ export interface LaneStatus {
   eta_secs: number; current: string; provider: string; pending_online: number; pending_offline: number;
   analyzed: number; faces_available: boolean; last_error: string | null;
 }
-export interface AnalysisOptions { auto: boolean; faces: boolean; gpu: boolean; pause_on_battery: boolean }
+export interface AnalysisOptions { auto: boolean; people: boolean; gpu: boolean; pause_on_battery: boolean }
 export interface AppInfo { version: string; data_dir: string; cache_dir: string; ffmpeg: boolean; job: string | null }
 
 export const api = {
@@ -139,6 +144,17 @@ export const api = {
   getScanOptions: () => invoke<ScanOptions>("get_scan_options"),
   cleanupSummary: () => invoke<CleanupSummary>("cleanup_summary"),
   tripsSummary: () => invoke<TripsSummary>("trips_summary"),
+  peopleList: (includeHidden = false) => invoke<PersonRow[]>("people_list", { includeHidden }),
+  personFaces: (person: number) => invoke<FaceRow[]>("person_faces", { person }),
+  peopleSuggestions: () => invoke<PairSuggestion[]>("people_suggestions"),
+  /** Returns the id of another person who already has this name (then nothing changed). */
+  renamePerson: (person: number, name: string) => invoke<number | null>("rename_person", { person, name }),
+  mergePeople: (into: number, others: number[]) => invoke<void>("merge_people", { into, others }),
+  rejectFaces: (faces: number[], person: number) => invoke<void>("reject_faces", { faces, person }),
+  hidePeople: (people: number[], hidden: boolean) => invoke<void>("hide_people", { people, hidden }),
+  setPersonCover: (person: number, face: number) => invoke<void>("set_person_cover", { person, face }),
+  answerPeoplePair: (a: number, b: number, same: boolean) => invoke<void>("answer_people_pair", { a, b, same }),
+  clearFaceData: () => invoke<void>("clear_face_data"),
   burstExtraIds: () => invoke<number[]>("burst_extra_ids"),
   dismiss: (ids: number[], kind: string) => invoke<number>("dismiss", { ids, kind }),
   analysisStatus: () => invoke<LaneStatus>("analysis_status"),
@@ -200,6 +216,7 @@ export function absPath(f: { mount: string; rel_path: string }): string {
 }
 
 export const thumbUrl = (id: number) => convertFileSrc(String(id), "thumb");
+export const faceUrl = (faceId: number) => convertFileSrc(`f-${faceId}`, "thumb");
 export const fileUrl = (path: string) => convertFileSrc(path);
 
 export function onProgress(cb: (p: Progress) => void): Promise<UnlistenFn> {

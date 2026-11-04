@@ -48,9 +48,29 @@ impl ThumbCache {
         &self.dir
     }
 
-    fn keyed(&self, sub: &str, f: &FileRow, ext: &str) -> PathBuf {
+    fn keyed_id(&self, sub: &str, id: i64, f: &FileRow, ext: &str) -> PathBuf {
         // Content identity: a changed file (size/mtime) gets a new cache entry.
-        self.dir.join(sub).join(format!("{:02x}", f.id % 256)).join(format!("{}-{}-{}.{ext}", f.id, f.size, f.mtime))
+        self.dir.join(sub).join(format!("{:02x}", id % 256)).join(format!("{}-{}-{}.{ext}", id, f.size, f.mtime))
+    }
+
+    fn keyed(&self, sub: &str, f: &FileRow, ext: &str) -> PathBuf {
+        self.keyed_id(sub, f.id, f, ext)
+    }
+
+    /// Cached image for this file if there is one — its own, or (for a byte-identical copy) the
+    /// original's, adopted with a file copy instead of decoding the photo again.
+    fn cached(&self, sub: &str, f: &FileRow, ext: &str) -> Option<PathBuf> {
+        let out = self.keyed(sub, f, ext);
+        if out.is_file() {
+            return Some(out);
+        }
+        let src = self.keyed_id(sub, f.clone_of?, f, ext);
+        if !src.is_file() {
+            return None;
+        }
+        std::fs::create_dir_all(out.parent()?).ok()?;
+        std::fs::copy(&src, &out).ok()?;
+        Some(out)
     }
 
     pub fn thumb_path(&self, f: &FileRow) -> PathBuf {
@@ -58,7 +78,7 @@ impl ThumbCache {
     }
 
     pub fn has_thumb(&self, f: &FileRow) -> bool {
-        self.thumb_path(f).is_file()
+        self.cached("thumbs", f, "jpg").is_some()
     }
 
     /// Save a thumbnail from an image the caller already decoded (single-read analysis pipeline).
@@ -72,6 +92,21 @@ impl ThumbCache {
         self.dir.join("faces").join(format!("{:02x}", face_id % 256)).join(format!("{face_id}.jpg"))
     }
 
+    /// Face crop for `face_id`; a face copied with its photo (`src_face`) reuses the original crop.
+    pub fn face_crop(&self, face_id: i64, src_face: Option<i64>) -> Option<PathBuf> {
+        let out = self.face_path(face_id);
+        if out.is_file() {
+            return Some(out);
+        }
+        let src = self.face_path(src_face?);
+        if !src.is_file() {
+            return None;
+        }
+        std::fs::create_dir_all(out.parent()?).ok()?;
+        std::fs::copy(&src, &out).ok()?;
+        Some(out)
+    }
+
     pub fn store_face(&self, face_id: i64, img: &DynamicImage) -> Result<PathBuf> {
         let out = self.face_path(face_id);
         save_jpeg(img, &out, 85)?;
@@ -80,10 +115,10 @@ impl ThumbCache {
 
     /// Thumbnail JPEG path, generating it if needed (requires the drive to be online).
     pub fn ensure_thumb(&self, f: &FileRow) -> Result<PathBuf> {
-        let out = self.thumb_path(f);
-        if out.is_file() {
-            return Ok(out);
+        if let Some(p) = self.cached("thumbs", f, "jpg") {
+            return Ok(p);
         }
+        let out = self.thumb_path(f);
         if !f.online {
             bail!("offline");
         }
@@ -102,10 +137,10 @@ impl ThumbCache {
         if f.online && is_browser_image(&f.ext) {
             return Ok(f.abs_path());
         }
-        let out = self.keyed("previews", f, "jpg");
-        if out.is_file() {
-            return Ok(out);
+        if let Some(p) = self.cached("previews", f, "jpg") {
+            return Ok(p);
         }
+        let out = self.keyed("previews", f, "jpg");
         if !f.online {
             return self.ensure_thumb(f);
         }
@@ -118,8 +153,7 @@ impl ThumbCache {
     /// H.264/AAC 720p transcode for videos the webview cannot play (HEVC, AVI, WMV, MTS...).
     pub fn ensure_video_preview(&self, f: &FileRow) -> Result<PathBuf> {
         for ext in ["mp4", "webm"] {
-            let p = self.keyed("videos", f, ext);
-            if p.is_file() {
+            if let Some(p) = self.cached("videos", f, ext) {
                 return Ok(p);
             }
         }

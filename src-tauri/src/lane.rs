@@ -46,14 +46,30 @@ pub struct Lane {
     engine: Mutex<Option<Arc<Mutex<FaceEngine>>>>,
 }
 
-/// Where the ONNX Runtime library and models are: next to the app (installed), or `MO_AI_DIR` (dev).
+/// Where the ONNX Runtime library and models are: `MO_AI_DIR` (dev), the installer's resources,
+/// or an `ai` folder next to the exe (portable zip) — the first that has everything.
 pub fn face_runtime(app: &AppHandle) -> FaceRuntime {
-    let dir = std::env::var_os("MO_AI_DIR")
-        .map(PathBuf::from)
-        .or_else(|| app.path().resource_dir().ok().map(|d| d.join("ai")))
-        .unwrap_or_default();
     let lib = if cfg!(windows) { "onnxruntime.dll" } else if cfg!(target_os = "macos") { "libonnxruntime.dylib" } else { "libonnxruntime.so" };
-    FaceRuntime { lib: dir.join(lib), models: dir }
+    let dirs = [
+        std::env::var_os("MO_AI_DIR").map(PathBuf::from),
+        app.path().resource_dir().ok().map(|d| d.join("ai")),
+        std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("ai"))),
+    ];
+    let mut first = None;
+    for dir in dirs.into_iter().flatten() {
+        let rt = FaceRuntime { lib: dir.join(lib), models: dir };
+        if rt.available() {
+            return rt;
+        }
+        first.get_or_insert(rt);
+    }
+    first.unwrap_or(FaceRuntime { lib: PathBuf::from(lib), models: PathBuf::new() })
+}
+
+/// Face analysis actually happens only when it is on and the AI files are present; otherwise
+/// face work must not count as pending (the lane would wait for it forever).
+fn people_active(app: &AppHandle, opts: &AnalysisOptions) -> bool {
+    opts.people && face_runtime(app).available()
 }
 
 impl Lane {
@@ -98,7 +114,7 @@ impl Lane {
         let opts = Self::options(app);
         let mut s = self.status.lock().unwrap().clone();
         if let Ok(conn) = st.db.conn() {
-            if let Ok(p) = analysis::pending(&conn, opts.faces) {
+            if let Ok(p) = analysis::pending(&conn, people_active(app, &opts)) {
                 s.pending_online = p.online;
                 s.pending_offline = p.offline;
                 s.analyzed = p.analyzed;
@@ -115,7 +131,7 @@ impl Lane {
     }
 
     fn engine(&self, app: &AppHandle, opts: &AnalysisOptions) -> Result<Option<Arc<Mutex<FaceEngine>>>, String> {
-        if !opts.faces {
+        if !opts.people {
             return Ok(None);
         }
         let mut cached = self.engine.lock().unwrap();
@@ -189,7 +205,7 @@ impl Lane {
                 }
                 let again = !lane.stop.is_stopped()
                     && res.is_ok()
-                    && st.db.conn().ok().and_then(|c| analysis::pending(&c, Self::options(&app).faces).ok()).map(|p| p.online > 0).unwrap_or(false);
+                    && st.db.conn().ok().and_then(|c| analysis::pending(&c, engine.is_some()).ok()).map(|p| p.online > 0).unwrap_or(false);
                 if !again {
                     break;
                 }
