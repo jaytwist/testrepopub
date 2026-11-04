@@ -47,7 +47,9 @@ struct AppState {
 }
 
 /// Recompute data derived from the per-file analysis (bursts, places, trips, people).
-pub(crate) fn post_analysis(_st: &AppState) -> anyhow::Result<()> {
+pub(crate) fn post_analysis(st: &AppState) -> anyhow::Result<()> {
+    let mut conn = st.db.conn()?;
+    media_core::cleanup::refresh(&mut conn)?;
     Ok(())
 }
 
@@ -242,6 +244,29 @@ fn suggested_folders(app: AppHandle, state: State<AppState>) -> CmdResult<Vec<Su
 }
 
 // ---------------------------------------------------------------------------------------------
+// Cleanup suggestions
+// ---------------------------------------------------------------------------------------------
+
+#[tauri::command]
+fn cleanup_summary(state: State<AppState>) -> CmdResult<media_core::cleanup::CleanupSummary> {
+    let conn = state.db.conn().map_err(err)?;
+    media_core::cleanup::summary(&conn).map_err(err)
+}
+
+#[tauri::command]
+fn burst_extra_ids(state: State<AppState>) -> CmdResult<Vec<i64>> {
+    let conn = state.db.conn().map_err(err)?;
+    media_core::cleanup::burst_extra_ids(&conn).map_err(err)
+}
+
+/// "Keep": never suggest these files for `kind` again.
+#[tauri::command]
+fn dismiss(state: State<AppState>, ids: Vec<i64>, kind: String) -> CmdResult<usize> {
+    let mut conn = state.db.conn().map_err(err)?;
+    media_core::cleanup::dismiss(&mut conn, &ids, &kind).map_err(err)
+}
+
+// ---------------------------------------------------------------------------------------------
 // Background analysis
 // ---------------------------------------------------------------------------------------------
 
@@ -341,6 +366,8 @@ fn query_ids(state: State<AppState>, filter: FileFilter) -> CmdResult<Vec<i64>> 
 #[derive(Serialize)]
 struct FileDetail {
     file: FileRow,
+    /// Why this file is in cleanup suggestions: (kind, detail).
+    reasons: Vec<(String, String)>,
     labels: Vec<LabelRow>,
     abs_path: String,
     taken: String,
@@ -353,6 +380,7 @@ fn file_detail(state: State<AppState>, id: i64) -> CmdResult<FileDetail> {
     let conn = state.db.conn().map_err(err)?;
     let f = db::get_file(&conn, id).map_err(err)?.ok_or("not found")?;
     Ok(FileDetail {
+        reasons: media_core::cleanup::reasons(&conn, id).map_err(err)?,
         labels: labels::labels_for(&conn, id).map_err(err)?,
         abs_path: f.abs_path().to_string_lossy().into(),
         taken: f.taken_at.map(meta::fmt_ts).unwrap_or_default(),
@@ -776,6 +804,9 @@ pub fn run() {
             add_source,
             remove_source,
             start_scan,
+            cleanup_summary,
+            burst_extra_ids,
+            dismiss,
             analysis_status,
             analysis_pause,
             analysis_start,

@@ -185,6 +185,15 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY(face_id, person_id)
     );
     "#,
+    // 2: cleanup suggestions (recomputed after each analysis pass)
+    r#"
+    CREATE TABLE IF NOT EXISTS suggestions (
+        file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+        kind    TEXT NOT NULL,
+        detail  TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY(file_id, kind)
+    );
+    "#,
 ];
 
 pub fn schema_version(conn: &Connection) -> Result<i64> {
@@ -346,6 +355,10 @@ pub struct GridItem {
     pub size: i64,
     pub mtime: i64,
     pub name: String,
+    /// Photos in this file's burst (None if not in a burst) and this file's rank (0 = best).
+    pub burst_size: Option<i64>,
+    pub burst_rank: Option<i64>,
+    pub burst_id: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -383,6 +396,13 @@ pub struct FileFilter {
     pub has_gps: Option<bool>,
     /// Files directly inside this volume-relative folder ("" = volume root). Use with `volume_id`.
     pub dir: Option<String>,
+    /// Cleanup suggestion kind ("blurry" | "burst_extra"), excluding ones the user dismissed.
+    pub suggest: Option<String>,
+    /// Only photos that are part of a burst / of this burst.
+    pub in_burst: bool,
+    pub burst_id: Option<i64>,
+    /// Show each burst as its best shot only.
+    pub stack_bursts: bool,
     /// 'taken' (default) | 'mtime' | 'size' | 'name' | 'resolution' | 'duration'
     pub sort: Option<String>,
     /// Default: true (newest / largest first).
@@ -514,6 +534,21 @@ impl FileFilter {
             w.push(format!("{DIR_SQL} = ?"));
             p.push(Value::Text(d.trim_matches('/').to_string()));
         }
+        if let Some(k) = &self.suggest {
+            w.push("EXISTS (SELECT 1 FROM suggestions s WHERE s.file_id = f.id AND s.kind = ?) AND NOT EXISTS (SELECT 1 FROM dismissals d WHERE d.file_id = f.id AND d.kind = ?)".into());
+            p.push(Value::Text(k.clone()));
+            p.push(Value::Text(k.clone()));
+        }
+        if self.in_burst {
+            w.push("EXISTS (SELECT 1 FROM bursts b WHERE b.file_id = f.id)".into());
+        }
+        if let Some(b) = self.burst_id {
+            w.push("EXISTS (SELECT 1 FROM bursts b WHERE b.file_id = f.id AND b.burst_id = ?)".into());
+            p.push(Value::Integer(b));
+        }
+        if self.stack_bursts {
+            w.push("NOT EXISTS (SELECT 1 FROM bursts b WHERE b.file_id = f.id AND b.rank > 0)".into());
+        }
         match self.has_gps {
             Some(true) => w.push("f.lat IS NOT NULL AND f.lon IS NOT NULL".into()),
             Some(false) => w.push("(f.lat IS NULL OR f.lon IS NULL)".into()),
@@ -606,8 +641,9 @@ pub fn query_files(conn: &Connection, filter: &FileFilter, offset: i64, limit: i
 pub fn query_grid(conn: &Connection, filter: &FileFilter, offset: i64, limit: i64) -> Result<Vec<GridItem>> {
     let (w, p) = filter.to_sql(conn)?;
     let sql = format!(
-        "SELECT f.id, f.kind, f.taken_at, f.width, f.height, f.duration_ms, v.online, f.size, f.mtime, f.name
-         FROM files f JOIN volumes v ON v.id = f.volume_id WHERE {w}
+        "SELECT f.id, f.kind, f.taken_at, f.width, f.height, f.duration_ms, v.online, f.size, f.mtime, f.name,
+                (SELECT COUNT(*) FROM bursts b2 WHERE b2.burst_id = bb.burst_id), bb.rank, bb.burst_id
+         FROM files f JOIN volumes v ON v.id = f.volume_id LEFT JOIN bursts bb ON bb.file_id = f.id WHERE {w}
          ORDER BY {} LIMIT {limit} OFFSET {offset}",
         filter.order_sql()
     );
@@ -625,6 +661,9 @@ pub fn query_grid(conn: &Connection, filter: &FileFilter, offset: i64, limit: i6
                 size: r.get(7)?,
                 mtime: r.get(8)?,
                 name: r.get(9)?,
+                burst_size: r.get::<_, Option<i64>>(10)?.filter(|n| *n > 0),
+                burst_rank: r.get(11)?,
+                burst_id: r.get(12)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -796,7 +835,7 @@ pub fn filtered_stats(conn: &Connection, filter: &FileFilter) -> Result<Filtered
 // Groups (month / year / folder) for the library grid
 // ---------------------------------------------------------------------------------------------
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Default)]
 pub struct GroupRow {
     /// Stable key, e.g. "m:2024-6", "y:2024", "d:3:DCIM/100CANON", "all".
     pub key: String,
@@ -808,6 +847,9 @@ pub struct GroupRow {
     pub dir: Option<String>,
     pub mount: Option<String>,
     pub volume_label: Option<String>,
+    pub burst_id: Option<i64>,
+    /// Earliest capture time in the group (burst groups).
+    pub first_taken: Option<i64>,
 }
 
 /// Groups that the current filter produces, in display order, with exact counts.
@@ -845,6 +887,32 @@ pub fn group_summary(conn: &Connection, filter: &FileFilter, group_by: &str) -> 
                         dir: None,
                         mount: None,
                         volume_label: None,
+                        ..Default::default()
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        }
+        "burst" => {
+            let sql = format!(
+                "SELECT b.burst_id, COUNT(*), COALESCE(SUM(f.size), 0), MIN(f.taken_at)
+                 FROM files f JOIN volumes v ON v.id = f.volume_id JOIN bursts b ON b.file_id = f.id WHERE {w}
+                 GROUP BY b.burst_id ORDER BY MIN(f.taken_at) {time_dir}"
+            );
+            let mut st = conn.prepare(&sql)?;
+            let rows = st
+                .query_map(params_from_iter(p), |r| {
+                    let bid: i64 = r.get(0)?;
+                    let first: Option<i64> = r.get(3)?;
+                    Ok(GroupRow {
+                        key: format!("b:{bid}"),
+                        count: r.get(1)?,
+                        bytes: r.get(2)?,
+                        year: None,
+                        month: None,
+                        burst_id: Some(bid),
+                        first_taken: first,
+                        ..Default::default()
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -871,6 +939,7 @@ pub fn group_summary(conn: &Connection, filter: &FileFilter, group_by: &str) -> 
                         dir: Some(d),
                         mount: Some(r.get(2)?),
                         volume_label: Some(r.get(3)?),
+                        ..Default::default()
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -891,6 +960,7 @@ pub fn group_summary(conn: &Connection, filter: &FileFilter, group_by: &str) -> 
                     dir: None,
                     mount: None,
                     volume_label: None,
+                    ..Default::default()
                 }]
             }
         }

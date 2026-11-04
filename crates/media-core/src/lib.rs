@@ -5,6 +5,7 @@
 
 pub mod db;
 pub mod analysis;
+pub mod cleanup;
 pub mod dedupe;
 pub mod faces;
 pub mod journal;
