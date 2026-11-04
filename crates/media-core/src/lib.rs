@@ -5,6 +5,7 @@
 
 pub mod db;
 pub mod dedupe;
+pub mod faces;
 pub mod journal;
 pub mod labels;
 pub mod media;
