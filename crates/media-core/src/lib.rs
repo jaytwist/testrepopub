@@ -13,6 +13,7 @@ pub mod labels;
 pub mod media;
 pub mod meta;
 pub mod organizer;
+pub mod places;
 pub mod power;
 pub mod scanner;
 pub mod thumbs;

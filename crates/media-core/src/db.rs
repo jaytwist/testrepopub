@@ -402,6 +402,8 @@ pub struct FileFilter {
     /// Only photos that are part of a burst / of this burst.
     pub in_burst: bool,
     pub burst_id: Option<i64>,
+    /// Files of this automatic trip.
+    pub trip_id: Option<i64>,
     /// Show each burst as its best shot only.
     pub stack_bursts: bool,
     /// 'taken' (default) | 'mtime' | 'size' | 'name' | 'resolution' | 'duration'
@@ -466,11 +468,12 @@ impl FileFilter {
             p.push(Value::Integer(m as i64));
         }
         if let Some(t) = self.text.as_ref().filter(|t| !t.trim().is_empty()) {
-            w.push("(f.rel_path LIKE ? ESCAPE '\\' OR f.camera LIKE ? ESCAPE '\\' OR EXISTS (SELECT 1 FROM labels l WHERE l.file_id = f.id AND l.label LIKE ? ESCAPE '\\'))".into());
+            w.push("(f.rel_path LIKE ? ESCAPE '\\' OR f.camera LIKE ? ESCAPE '\\' OR EXISTS (SELECT 1 FROM labels l WHERE l.file_id = f.id AND l.label LIKE ? ESCAPE '\\') \
+                    OR EXISTS (SELECT 1 FROM places pl WHERE pl.file_id = f.id AND (pl.city LIKE ? ESCAPE '\\' OR pl.admin1 LIKE ? ESCAPE '\\')))".into());
             let pat = format!("%{}%", t.trim().replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
-            p.push(Value::Text(pat.clone()));
-            p.push(Value::Text(pat.clone()));
-            p.push(Value::Text(pat));
+            for _ in 0..5 {
+                p.push(Value::Text(pat.clone()));
+            }
         }
         if let Some(c) = &self.date_confidence {
             let set = match c.as_str() {
@@ -550,6 +553,10 @@ impl FileFilter {
         }
         if self.in_burst {
             w.push("EXISTS (SELECT 1 FROM bursts b WHERE b.file_id = f.id)".into());
+        }
+        if let Some(t) = self.trip_id {
+            w.push("EXISTS (SELECT 1 FROM trip_files tf WHERE tf.file_id = f.id AND tf.trip_id = ?)".into());
+            p.push(Value::Integer(t));
         }
         if let Some(b) = self.burst_id {
             w.push("EXISTS (SELECT 1 FROM bursts b WHERE b.file_id = f.id AND b.burst_id = ?)".into());

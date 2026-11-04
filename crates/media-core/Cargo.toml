@@ -30,6 +30,7 @@ walkdir = "2.5.0"
 # API pinned to 1.24 because that is the last ONNX Runtime release with DirectML.
 ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic", "api-24"] }
 jpeg-decoder = "0.3"
+reverse_geocoder = "4.1.1"
 
 [target.'cfg(windows)'.dependencies.ort]
 version = "=2.0.0-rc.15"

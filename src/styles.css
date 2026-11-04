@@ -318,3 +318,21 @@ kbd { font: 11px/1 ui-monospace, Consolas, monospace; border: 1px solid var(--li
 .cc-num { font-size: 15px; }
 .cc-num b { font-size: 24px; margin-right: 2px; }
 .cleanup-card p { margin: 0; flex: 1; }
+
+/* --- trips --- */
+.trips-meta { margin-bottom: 14px; }
+.trip-year h2 { font-size: 16px; margin: 18px 0 8px; }
+.trip-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
+.trip-card { display: flex; flex-direction: column; padding: 0; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; background: var(--panel); cursor: pointer; text-align: left; color: inherit; font: inherit; }
+.trip-card:hover { border-color: var(--accent); }
+.trip-cover { aspect-ratio: 4 / 3; background: var(--panel-2); }
+.trip-cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.trip-body { display: flex; flex-direction: column; gap: 3px; padding: 10px 12px; }
+
+/* --- library drive tabs: everything together or one drive at a time --- */
+.drive-tabs { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 8px; }
+.drive-tabs button { border: 1px solid var(--line); background: var(--panel); border-radius: 999px; padding: 5px 12px; cursor: pointer; color: var(--text); font: inherit; }
+.drive-tabs button:hover { border-color: var(--accent); }
+.drive-tabs button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+.drive-tabs button.on .muted { color: rgba(255, 255, 255, 0.8); }
+.drive-tabs button.offline:not(.on) { opacity: 0.7; border-style: dashed; }

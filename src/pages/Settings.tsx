@@ -11,7 +11,7 @@ const OPEN_SOURCE: [string, string, string][] = [
   ["ONNX Runtime · ort", "MIT / Apache-2.0", "PC 안에서 AI 모델 실행"],
   ["YuNet (OpenCV Zoo)", "MIT", "얼굴 찾기"],
   ["SFace (OpenCV Zoo)", "Apache-2.0", "얼굴 비교"],
-  ["reverse_geocoder · GeoNames", "MIT / Apache-2.0 · CC-BY 4.0", "GPS를 지명으로 바꾸기 (지명 데이터: geonames.org)"],
+  ["reverse_geocoder · GeoNames", "MIT / Apache-2.0 · CC-BY 4.0", "GPS를 지명으로 바꾸기, 여행 묶기 (지명 데이터: geonames.org)"],
   ["ffmpeg", "LGPL", "동영상 썸네일·변환"],
   ["React, react-virtuoso", "MIT", "화면"],
 ];

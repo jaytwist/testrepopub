@@ -96,15 +96,22 @@ pub fn find_exact(db: &Db, stop: &StopFlag, progress: ProgressFn) -> Result<Dedu
     for f in cands {
         by_size.entry(f.size).or_default().push(f);
     }
-    let pre_total: u64 = by_size.values().map(|v| v.len() as u64).sum();
+    // Repeat runs must be quick: a file with a unique size can't have a copy (no read at all), and a
+    // stored full hash is still valid (the scanner clears it when the file changes). Only groups
+    // where nobody has a full hash yet are narrowed down with a 64 KiB prehash; a new file next to
+    // already-hashed ones is fully hashed directly below.
+    let size_groups: Vec<Vec<FileRow>> = by_size.into_values().filter(|g| g.len() > 1).collect();
+    let pre_total: u64 = size_groups.iter().filter(|g| g.iter().all(|f| f.hash.is_none())).map(|g| g.len() as u64).sum();
     let done = AtomicU64::new(0);
     progress(Progress::new(job, "prehash", 0, pre_total, ""));
-    let size_groups: Vec<Vec<FileRow>> = by_size.into_values().collect();
     let pre_groups: Vec<Vec<FileRow>> = size_groups
         .into_par_iter()
         .flat_map(|group| {
             if stop.is_stopped() {
                 return Vec::new();
+            }
+            if group.iter().any(|f| f.hash.is_some()) {
+                return vec![group];
             }
             let mut m: HashMap<String, Vec<FileRow>> = HashMap::new();
             for f in group {
@@ -116,8 +123,7 @@ pub fn find_exact(db: &Db, stop: &StopFlag, progress: ProgressFn) -> Result<Dedu
                     m.entry(p).or_default().push(f);
                 }
             }
-            // Only groups with >1 member can contain duplicates. Members that already have a stored
-            // full hash (still valid: the scanner clears it on change) skip the expensive pass below.
+            // Only groups with >1 member can contain duplicates.
             m.into_values().filter(|v| v.len() > 1).collect::<Vec<_>>()
         })
         .collect();

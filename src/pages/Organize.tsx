@@ -10,6 +10,7 @@ const PRESETS = [
   { tpl: "{kind}/{year}/{year}-{month}", name: "종류 / 연도 / 연-월", example: "사진/2019/2019-05/…, 동영상/…, 스크린샷/…" },
   { tpl: "{year}/{year}-{month} {label}", name: "연-월 + 라벨", example: "2019/2019-05 가족여행/…" },
   { tpl: "{source}/{year}", name: "출처 / 연도", example: "카메라/2019, 카카오톡/2021, 다운로드/…" },
+  { tpl: "{year}/{trip}", name: "연도 / 여행", example: "2024/2024년 6월 Honolulu 여행/…, 여행 아닌 사진은 2024/" },
 ];
 
 const ACTION_NAMES: Record<string, string> = {
@@ -143,7 +144,7 @@ export default function Organize() {
           <div className="inline-form">
             <input className="grow mono" value={opts.template} onChange={(e) => set({ template: e.target.value })} />
           </div>
-          <div className="muted small">사용 가능: {"{year} {month} {day} {date} {kind} {camera} {source} {label}"}</div>
+          <div className="muted small">사용 가능: {"{year} {month} {day} {date} {kind} {camera} {source} {label} {trip}"}</div>
         </div>
 
         <label>파일 이름</label>

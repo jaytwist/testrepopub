@@ -203,6 +203,9 @@ fn full_workflow() {
     // --- Exact duplicates --------------------------------------------------------------------
     let ds = dedupe::run(&db, DupKind::Exact, Similarity::High, &stop, &quiet).unwrap();
     assert_eq!((ds.groups, ds.files), (1, 2), "{ds:?}");
+    // A repeat run reuses stored hashes (no re-reading) and finds the same thing.
+    let ds = dedupe::run(&db, DupKind::Exact, Similarity::High, &stop, &quiet).unwrap();
+    assert_eq!((ds.groups, ds.files), (1, 2), "{ds:?}");
     let groups = dedupe::list_groups(&conn, "exact", 0, 10).unwrap();
     assert_eq!(groups[0].members.iter().filter(|m| m.keep).count(), 1);
     let rep = dedupe::apply(&db, "exact", None, &stop, &quiet).unwrap();
@@ -300,4 +303,36 @@ fn walk_media(root: &Path) -> Vec<(PathBuf, String)> {
         .collect();
     v.sort();
     v
+}
+
+/// GPS photos -> place names (search) -> an automatic trip (filter).
+#[test]
+fn trips_from_gps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = drive(tmp.path(), "diskA");
+    // Everyday life in San Jose on 12 different days, then 2 days in Honolulu.
+    for d in 0..12u32 {
+        write_jpeg_gps(&a.join(format!("DCIM/home_{d:02}.jpg")), &picture(d, 640, 480), &format!("2024:03:{:02} 12:00:00", d + 1), (37.3382, -121.8863));
+    }
+    for i in 0..12u32 {
+        write_jpeg_gps(&a.join(format!("DCIM/hnl_{i:02}.jpg")), &picture(100 + i, 640, 480), &format!("2024:06:{:02} {:02}:00:00", 10 + i / 6, 8 + i % 6 * 2), (21.3069, -157.8583));
+    }
+    let db = Db::open(tmp.path().join("appdata/library.db")).unwrap();
+    let mut conn = db.conn().unwrap();
+    volumes::add_source(&conn, &a).unwrap();
+    scanner::scan_all(&db, &ScanOptions::default(), &StopFlag::new(), &quiet).unwrap();
+    media_core::places::refresh(&mut conn).unwrap();
+
+    let s = media_core::places::summary(&conn).unwrap();
+    assert_eq!(s.home, "San Jose, California");
+    assert_eq!((s.located, s.total), (24, 24));
+    assert_eq!(s.trips.len(), 1, "{:?}", s.trips);
+    assert_eq!(s.trips[0].title, "2024년 6월 Honolulu 여행");
+    assert_eq!(s.trips[0].count, 12);
+    let in_trip = db::query_ids(&conn, &FileFilter { trip_id: Some(s.trips[0].id), ..Default::default() }).unwrap();
+    assert_eq!(in_trip.len(), 12);
+    // The search box finds places.
+    let found = db::query_ids(&conn, &FileFilter { text: Some("honolulu".into()), ..Default::default() }).unwrap();
+    assert_eq!(found.len(), 12);
+    assert_eq!(media_core::places::place_of(&conn, in_trip[0]).unwrap().as_deref(), Some("Honolulu, Hawaii"));
 }

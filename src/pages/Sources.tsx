@@ -92,7 +92,7 @@ export default function Sources() {
         </div>
         <div className="btn-row">
           <button className="btn" onClick={() => reload(true)}>드라이브 새로고침</button>
-          <button className="btn" disabled={!!running || sources.length === 0} onClick={() => scan()}>전체 다시 스캔</button>
+          <button className="btn" disabled={!!running || sources.length === 0} onClick={() => scan()} title="바뀐 파일만 다시 읽습니다. 처음 스캔보다 훨씬 빠릅니다.">새 파일 확인</button>
           <button className="btn primary" onClick={addFolder}>+ 폴더 추가</button>
         </div>
       </header>
@@ -101,7 +101,7 @@ export default function Sources() {
         <div className="alert ok">
           <div>
             스캔 완료: 새 파일 <b>{fmtCount(sum((s) => s.added))}</b>개, 변경 {fmtCount(sum((s) => s.updated))}개,
-            목록에서 빠짐 {fmtCount(sum((s) => s.missing))}개 · 썸네일 {fmtCount(scanResult.thumbs.generated)}개 생성
+            목록에서 빠짐 {fmtCount(sum((s) => s.missing))}개 · 그대로 {fmtCount(sum((s) => s.unchanged))}개(다시 읽지 않음) · 썸네일 {fmtCount(scanResult.thumbs.generated)}개 생성
           </div>
           {skipParts.some(([, n]) => n > 0) && (
             <div className="small muted">
@@ -170,7 +170,7 @@ export default function Sources() {
               <td>{s.volume_label} {s.online ? "" : <span className="pill">연결 안 됨</span>}</td>
               <td className="muted">{ago(s.last_scan)}</td>
               <td className="right">
-                <button className="btn small" disabled={!s.online || !!running} onClick={() => scan(s.id)}>스캔</button>
+                <button className="btn small" disabled={!s.online || !!running} onClick={() => scan(s.id)} title="바뀐 파일만 다시 읽습니다">새 파일 확인</button>
                 <button className="btn small ghost" onClick={() => remove(s)}>제거</button>
               </td>
             </tr>

@@ -264,7 +264,9 @@ export default function Viewer({ items, index, onIndex, onClose, onChanged, revi
               {f.duration_ms && <div><span>길이</span><b>{fmtDuration(f.duration_ms)}</b></div>}
               <div><span>크기</span><b>{fmtBytes(f.size)}</b></div>
               {f.camera && <div><span>카메라</span><b>{f.camera}</b></div>}
-              {f.lat != null && f.lon != null && <div><span>위치</span><b>{f.lat.toFixed(5)}, {f.lon.toFixed(5)}</b></div>}
+              {f.lat != null && f.lon != null && (
+                <div><span>장소</span><b title={`${f.lat.toFixed(5)}, ${f.lon.toFixed(5)}`}>{detail!.place ?? `${f.lat.toFixed(5)}, ${f.lon.toFixed(5)}`}</b></div>
+              )}
               <div><span>드라이브</span><b className={f.online ? "" : "warn-text"}>{f.online ? "연결됨" : "연결 안 됨"}</b></div>
             </section>
             <div className="info-path" title={detail!.abs_path}>{detail!.abs_path}</div>

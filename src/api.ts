@@ -28,6 +28,7 @@ export interface FileFilter {
   suggest?: string | null;
   in_burst?: boolean;
   burst_id?: number | null;
+  trip_id?: number | null;
   stack_bursts?: boolean;
   sort?: SortKey | null;
   desc?: boolean | null;
@@ -39,6 +40,8 @@ export interface GroupRow {
   volume_id: number | null; dir: string | null; mount: string | null; volume_label: string | null;
   burst_id: number | null; first_taken: number | null;
 }
+export interface TripRow { id: number; title: string; start_ts: number; end_ts: number; count: number; cover_file_id: number | null; place: string }
+export interface TripsSummary { trips: TripRow[]; home: string; located: number; total: number }
 export interface Bucket { count: number; bytes: number }
 export interface CleanupSummary {
   blurry: Bucket; burst_extras: Bucket; burst_groups: number; screenshots: Bucket; large_videos: Bucket;
@@ -92,7 +95,7 @@ export interface LibraryStats {
 export interface LabelRow { label: string; source: string }
 export interface LabelCount { label: string; count: number; user: boolean }
 export interface FileDetail {
-  file: FileRow; reasons: [string, string][]; labels: LabelRow[]; abs_path: string; taken: string; confidence: string; thumb_cached: boolean;
+  file: FileRow; reasons: [string, string][]; labels: LabelRow[]; abs_path: string; taken: string; confidence: string; thumb_cached: boolean; place: string | null;
 }
 export interface DupMember { file: FileRow; keep: boolean }
 export interface DupGroup { id: number; kind: string; members: DupMember[]; reclaimable_bytes: number }
@@ -135,6 +138,7 @@ export const api = {
   startScan: (sourceId?: number) => invoke<void>("start_scan", { sourceId: sourceId ?? null }),
   getScanOptions: () => invoke<ScanOptions>("get_scan_options"),
   cleanupSummary: () => invoke<CleanupSummary>("cleanup_summary"),
+  tripsSummary: () => invoke<TripsSummary>("trips_summary"),
   burstExtraIds: () => invoke<number[]>("burst_extra_ids"),
   dismiss: (ids: number[], kind: string) => invoke<number>("dismiss", { ids, kind }),
   analysisStatus: () => invoke<LaneStatus>("analysis_status"),

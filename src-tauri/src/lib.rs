@@ -53,6 +53,11 @@ pub(crate) fn post_analysis(st: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub(crate) fn refresh_places(st: &AppState) -> anyhow::Result<()> {
+    let mut conn = st.db.conn()?;
+    media_core::places::refresh(&mut conn)
+}
+
 #[derive(Clone, Serialize)]
 struct JobDone {
     job: String,
@@ -96,6 +101,10 @@ where
         st.lane.set_job_active(&app, false);
         if name == "scan" {
             st.lane.kick(&app, false);
+        }
+        // New GPS files, deletions, moves: keep places and trips current (cheap).
+        if let Err(e) = refresh_places(&st) {
+            eprintln!("places refresh failed: {e:#}");
         }
         let done = match res {
             Ok(r) => JobDone { job: name, ok: true, error: None, result: serde_json::to_value(r).unwrap_or_default() },
@@ -248,6 +257,12 @@ fn suggested_folders(app: AppHandle, state: State<AppState>) -> CmdResult<Vec<Su
 // ---------------------------------------------------------------------------------------------
 
 #[tauri::command]
+fn trips_summary(state: State<AppState>) -> CmdResult<media_core::places::TripsSummary> {
+    let conn = state.db.conn().map_err(err)?;
+    media_core::places::summary(&conn).map_err(err)
+}
+
+#[tauri::command]
 fn cleanup_summary(state: State<AppState>) -> CmdResult<media_core::cleanup::CleanupSummary> {
     let conn = state.db.conn().map_err(err)?;
     media_core::cleanup::summary(&conn).map_err(err)
@@ -373,6 +388,8 @@ struct FileDetail {
     taken: String,
     confidence: String,
     thumb_cached: bool,
+    /// "Seattle, Washington" when the file has GPS.
+    place: Option<String>,
 }
 
 #[tauri::command]
@@ -386,6 +403,7 @@ fn file_detail(state: State<AppState>, id: i64) -> CmdResult<FileDetail> {
         taken: f.taken_at.map(meta::fmt_ts).unwrap_or_default(),
         confidence: meta::confidence(&f.date_source).into(),
         thumb_cached: state.thumbs.has_thumb(&f),
+        place: media_core::places::place_of(&conn, id).map_err(err)?,
         file: f,
     })
 }
@@ -586,13 +604,17 @@ fn set_date(state: State<AppState>, ids: Vec<i64>, datetime: String) -> CmdResul
         .or_else(|_| chrono::NaiveDateTime::parse_from_str(&datetime, "%Y-%m-%dT%H:%M:%S"))
         .map_err(err)?;
     let mut conn = state.db.conn().map_err(err)?;
-    labels::set_taken_at(&mut conn, &ids, meta::to_ts(dt)).map_err(err)
+    let n = labels::set_taken_at(&mut conn, &ids, meta::to_ts(dt)).map_err(err)?;
+    media_core::places::refresh(&mut conn).map_err(err)?;
+    Ok(n)
 }
 
 #[tauri::command]
 fn shift_date(state: State<AppState>, ids: Vec<i64>, delta_secs: i64) -> CmdResult<usize> {
     let mut conn = state.db.conn().map_err(err)?;
-    labels::shift_taken_at(&mut conn, &ids, delta_secs).map_err(err)
+    let n = labels::shift_taken_at(&mut conn, &ids, delta_secs).map_err(err)?;
+    media_core::places::refresh(&mut conn).map_err(err)?;
+    Ok(n)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -792,6 +814,10 @@ pub fn run() {
             st.lane.watch_power(&handle);
             let lane = st.lane.clone();
             std::thread::spawn(move || {
+                // Libraries scanned before places existed already have GPS: name them now.
+                if let Err(e) = refresh_places(&handle.state::<AppState>()) {
+                    eprintln!("places refresh failed: {e:#}");
+                }
                 std::thread::sleep(std::time::Duration::from_secs(5));
                 lane.kick(&handle, false);
             });
@@ -805,6 +831,7 @@ pub fn run() {
             remove_source,
             start_scan,
             cleanup_summary,
+            trips_summary,
             burst_extra_ids,
             dismiss,
             analysis_status,

@@ -38,36 +38,84 @@ fn picture(seed: u32, w: u32, h: u32) -> DynamicImage {
 }
 
 fn exif_app1(datetime: &str, make: &str, model: &str) -> Vec<u8> {
-    let mut t: Vec<u8> = Vec::new();
-    let p16 = |v: &mut Vec<u8>, x: u16| v.extend_from_slice(&x.to_le_bytes());
-    let p32 = |v: &mut Vec<u8>, x: u32| v.extend_from_slice(&x.to_le_bytes());
-    let (mk, md, dt) = (format!("{make}\0").into_bytes(), format!("{model}\0").into_bytes(), format!("{datetime}\0").into_bytes());
-    let exif_off = 8 + 42u32;
-    let data = exif_off + 18;
-    t.extend_from_slice(b"II");
-    p16(&mut t, 42);
-    p32(&mut t, 8);
-    p16(&mut t, 3);
-    for (tag, typ, cnt, val) in [(0x010fu16, 2u16, mk.len() as u32, data), (0x0110, 2, md.len() as u32, data + mk.len() as u32), (0x8769, 4, 1, exif_off)] {
-        p16(&mut t, tag);
-        p16(&mut t, typ);
-        p32(&mut t, cnt);
-        p32(&mut t, val);
+    exif_app1_gps(datetime, make, model, None)
+}
+
+/// EXIF APP1 with DateTimeOriginal, Make/Model and optionally GPS (decimal degrees).
+fn exif_app1_gps(datetime: &str, make: &str, model: &str, gps: Option<(f64, f64)>) -> Vec<u8> {
+    let mut tiff: Vec<u8> = Vec::new();
+    let le16 = |v: &mut Vec<u8>, x: u16| v.extend_from_slice(&x.to_le_bytes());
+    let le32 = |v: &mut Vec<u8>, x: u32| v.extend_from_slice(&x.to_le_bytes());
+    let make_b = format!("{make}\0").into_bytes();
+    let model_b = format!("{model}\0").into_bytes();
+    let dt_b = format!("{datetime}\0").into_bytes();
+    let n0: u32 = if gps.is_some() { 4 } else { 3 };
+    // Layout: header(8) | IFD0 | ExifIFD (18) | GPS IFD (54, optional) | data
+    let ifd0_off = 8u32;
+    let exif_off = ifd0_off + 2 + 12 * n0 + 4;
+    let gps_off = exif_off + 18;
+    let data_off = gps_off + if gps.is_some() { 54 } else { 0 };
+    let make_off = data_off;
+    let model_off = make_off + make_b.len() as u32;
+    let dt_off = model_off + model_b.len() as u32;
+    let lat_off = dt_off + dt_b.len() as u32;
+    let lon_off = lat_off + 24;
+    tiff.extend_from_slice(b"II");
+    le16(&mut tiff, 42);
+    le32(&mut tiff, ifd0_off);
+    le16(&mut tiff, n0 as u16);
+    let mut entries = vec![(0x010fu16, 2u16, make_b.len() as u32, make_off), (0x0110, 2, model_b.len() as u32, model_off), (0x8769, 4, 1, exif_off)];
+    if gps.is_some() {
+        entries.push((0x8825, 4, 1, gps_off));
     }
-    p32(&mut t, 0);
-    p16(&mut t, 1);
-    p16(&mut t, 0x9003);
-    p16(&mut t, 2);
-    p32(&mut t, dt.len() as u32);
-    p32(&mut t, data + mk.len() as u32 + md.len() as u32);
-    p32(&mut t, 0);
-    t.extend_from_slice(&mk);
-    t.extend_from_slice(&md);
-    t.extend_from_slice(&dt);
+    for (tag, typ, count, val) in entries {
+        le16(&mut tiff, tag);
+        le16(&mut tiff, typ);
+        le32(&mut tiff, count);
+        le32(&mut tiff, val);
+    }
+    le32(&mut tiff, 0);
+    le16(&mut tiff, 1);
+    le16(&mut tiff, 0x9003);
+    le16(&mut tiff, 2);
+    le32(&mut tiff, dt_b.len() as u32);
+    le32(&mut tiff, dt_off);
+    le32(&mut tiff, 0);
+    if let Some((lat, lon)) = gps {
+        le16(&mut tiff, 4);
+        let refs = [(0x0001u16, if lat >= 0.0 { b'N' } else { b'S' }), (0x0003, if lon >= 0.0 { b'E' } else { b'W' })];
+        for (i, (tag, r)) in refs.iter().enumerate() {
+            le16(&mut tiff, *tag);
+            le16(&mut tiff, 2);
+            le32(&mut tiff, 2);
+            tiff.extend_from_slice(&[*r, 0, 0, 0]);
+            le16(&mut tiff, tag + 1);
+            le16(&mut tiff, 5);
+            le32(&mut tiff, 3);
+            le32(&mut tiff, if i == 0 { lat_off } else { lon_off });
+        }
+        le32(&mut tiff, 0);
+    }
+    tiff.extend_from_slice(&make_b);
+    tiff.extend_from_slice(&model_b);
+    tiff.extend_from_slice(&dt_b);
+    if let Some((lat, lon)) = gps {
+        for v in [lat.abs(), lon.abs()] {
+            let deg = v.floor();
+            let min = ((v - deg) * 60.0).floor();
+            let sec = ((v - deg) * 60.0 - min) * 60.0;
+            for (n, d) in [(deg as u32, 1u32), (min as u32, 1), ((sec * 1000.0).round() as u32, 1000)] {
+                le32(&mut tiff, n);
+                le32(&mut tiff, d);
+            }
+        }
+    }
+
     let mut seg = vec![0xFF, 0xE1];
-    seg.extend_from_slice(&((8 + t.len()) as u16).to_be_bytes());
+    let len = (2 + 6 + tiff.len()) as u16;
+    seg.extend_from_slice(&len.to_be_bytes());
     seg.extend_from_slice(b"Exif\0\0");
-    seg.extend_from_slice(&t);
+    seg.extend_from_slice(&tiff);
     seg
 }
 
@@ -196,6 +244,32 @@ fn main() {
     }
     for (i, sigma) in [(0u32, 5.0f32), (1, 6.0)] {
         jpeg(&day.join(format!("IMG_52{i}.jpg")), &blurred(&textured(720 + i, 1600, 1200), sigma), Some((&format!("2024:06:15 {:02}:45:00", 12 + i * 5), "Apple", "iPhone 15")));
+    }
+
+    // GPS: everyday life around San Jose through 2024, and a 4-day Hawaii trip in June.
+    let gps = c.join("Users/me/Pictures/iCloud Photos");
+    for d in 0..14u32 {
+        let (m, day) = (1 + d / 3, 3 + (d % 3) * 9);
+        let dt = format!("2024:{m:02}:{day:02} 17:{:02}:00", d * 3);
+        let path = gps.join(format!("IMG_{:04}.jpg", 7000 + d));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut buf = Vec::new();
+        textured(800 + d, 1200, 900).write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg).unwrap();
+        let mut out = vec![0xFF, 0xD8];
+        out.extend(exif_app1_gps(&dt, "Apple", "iPhone 15", Some((37.33 + d as f64 * 0.003, -121.89))));
+        out.extend_from_slice(&buf[2..]);
+        fs::write(path, out).unwrap();
+    }
+    let spots = [(21.2793, -157.8292), (21.3069, -157.8583), (20.8893, -156.4729), (20.7984, -156.3319)];
+    for i in 0..16u32 {
+        let dt = format!("2024:06:{:02} {:02}:{:02}:00", 10 + i / 4, 9 + (i % 4) * 3, i * 2);
+        let path = gps.join(format!("IMG_{:04}.jpg", 7100 + i));
+        let mut buf = Vec::new();
+        textured(900 + i, 1200, 900).write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg).unwrap();
+        let mut out = vec![0xFF, 0xD8];
+        out.extend(exif_app1_gps(&dt, "Apple", "iPhone 15", Some(spots[(i / 4) as usize])));
+        out.extend_from_slice(&buf[2..]);
+        fs::write(path, out).unwrap();
     }
 
     // Videos.

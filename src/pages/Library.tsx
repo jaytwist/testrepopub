@@ -3,7 +3,7 @@ import { Virtuoso, type ListRange } from "react-virtuoso";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import {
   absPath, api, fmtBytes, fmtCount, fmtDate, fmtDuration, thumbUrl,
-  type FileFilter, type FilteredStats, type GridItem, type GroupBy, type GroupRow, type SortKey,
+  type FileFilter, type FilteredStats, type GridItem, type GroupBy, type GroupRow, type SortKey, type VolumeRow,
 } from "../api";
 import { useJob, type LibraryPreset } from "../App";
 import FilterBar from "../components/FilterBar";
@@ -104,6 +104,7 @@ export default function Library({ preset, onClearPreset, onConsumePreset }: Libr
   const [review, setReview] = useState<{ kind: string; title: string } | null>(() => (preset?.review ? { kind: preset.review, title: preset.title } : null));
   const [kept, setKept] = useState<Set<number>>(new Set());
   const reviewOpened = useRef(false);
+  const [volumes, setVolumes] = useState<VolumeRow[]>([]);
   /** Result of the last delete, shown with an Undo button until dismissed. */
   const [deleted, setDeleted] = useState<{ batch_id: string; deleted: number; bytes: number; skipped_offline: number; failed: number } | null>(null);
 
@@ -140,6 +141,10 @@ export default function Library({ preset, onClearPreset, onConsumePreset }: Libr
     setKept(new Set());
     reviewOpened.current = false;
   }, [preset?.key]);
+
+  useEffect(() => {
+    api.listVolumes().then(setVolumes).catch(() => {});
+  }, [version]);
 
   // --- loading ---
 
@@ -502,6 +507,23 @@ export default function Library({ preset, onClearPreset, onConsumePreset }: Libr
           <span><b>{preset.title}</b>{selected.size > 0 && ` · ${fmtCount(selected.size)}개 선택됨`}{kept.size > 0 && ` · ${fmtCount(kept.size)}개 남김`}</span>
           {review && flat.length > 0 && <button className="btn small primary" onClick={() => setViewId(flat[0].id)}>한 장씩 검토</button>}
           <button className="btn small ghost" onClick={() => { onClearPreset?.(); setFilter({}); }}>닫고 전체 보기</button>
+        </div>
+      )}
+      {volumes.filter((v) => v.file_count > 0).length > 1 && (
+        <div className="drive-tabs" role="tablist" title="모든 드라이브를 합쳐 보거나 드라이브별로 따로 봅니다">
+          <button className={filter.volume_id == null ? "on" : ""} onClick={() => setFilter({ ...filter, volume_id: null })}>
+            모든 드라이브
+          </button>
+          {volumes.filter((v) => v.file_count > 0).map((v) => (
+            <button
+              key={v.id}
+              className={`${filter.volume_id === v.id ? "on" : ""} ${v.online ? "" : "offline"}`}
+              onClick={() => setFilter({ ...filter, volume_id: v.id })}
+              title={`${v.mount}${v.online ? "" : " · 연결 안 됨 (썸네일만)"}`}
+            >
+              {v.removable ? "⏏" : "⛁"} {v.label} <span className="muted">{fmtCount(v.file_count)}</span>
+            </button>
+          ))}
         </div>
       )}
       <FilterBar filter={filter} onChange={setFilter} />

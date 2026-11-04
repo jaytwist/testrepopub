@@ -10,8 +10,9 @@ import Organize from "./pages/Organize";
 import History from "./pages/History";
 import Settings from "./pages/Settings";
 import Cleanup from "./pages/Cleanup";
+import Trips from "./pages/Trips";
 
-export type Page = "library" | "cleanup" | "sources" | "duplicates" | "organize" | "history" | "settings";
+export type Page = "library" | "trips" | "cleanup" | "sources" | "duplicates" | "organize" | "history" | "settings";
 
 /** Open the library with a ready-made view (used by cleanup suggestions, people, places). */
 export interface LibraryPreset {
@@ -63,7 +64,13 @@ function stageName(p: Progress): string {
 }
 
 const NAV: { section: string; items: { id: Page; label: string; icon: string }[] }[] = [
-  { section: "보기", items: [{ id: "library", label: "라이브러리", icon: "▦" }] },
+  {
+    section: "보기",
+    items: [
+      { id: "library", label: "라이브러리", icon: "▦" },
+      { id: "trips", label: "여행", icon: "✈" },
+    ],
+  },
   {
     section: "정리하기",
     items: [
@@ -275,6 +282,7 @@ export default function App() {
         <main className="content">
           {page === "library" && <Library preset={preset} onClearPreset={() => setPreset(null)} onConsumePreset={() => setPreset((p) => p && { ...p, select: undefined, review: undefined })} />}
           {page === "cleanup" && <Cleanup />}
+          {page === "trips" && <Trips />}
           {page === "sources" && <Sources />}
           {page === "duplicates" && <Duplicates />}
           {page === "organize" && <Organize />}
