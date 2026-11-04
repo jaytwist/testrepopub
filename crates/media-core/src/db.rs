@@ -107,6 +107,101 @@ CREATE TABLE IF NOT EXISTS journal (
 CREATE INDEX IF NOT EXISTS journal_batch ON journal(batch_id);
 "#;
 
+/// Ordered schema upgrades; index + 1 = `PRAGMA user_version` after applying.
+/// Never edit a released step — append a new one. Installed apps auto-update and must keep data.
+const MIGRATIONS: &[&str] = &[
+    // 1: photo analysis, cleanup suggestions, places & trips, people
+    r#"
+    CREATE TABLE IF NOT EXISTS analysis (
+        file_id      INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+        version      INTEGER NOT NULL,
+        sharpness    REAL,
+        dhash        INTEGER,
+        face_count   INTEGER,
+        face_version INTEGER NOT NULL DEFAULT 0,
+        analyzed_at  INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS dismissals (
+        file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+        kind    TEXT NOT NULL,
+        PRIMARY KEY(file_id, kind)
+    );
+    CREATE TABLE IF NOT EXISTS bursts (
+        file_id  INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+        burst_id INTEGER NOT NULL,
+        rank     INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS bursts_id ON bursts(burst_id);
+    CREATE TABLE IF NOT EXISTS places (
+        file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+        city    TEXT NOT NULL,
+        admin1  TEXT NOT NULL,
+        cc      TEXT NOT NULL,
+        source  TEXT NOT NULL,
+        dist_km REAL
+    );
+    CREATE INDEX IF NOT EXISTS places_key ON places(cc, admin1, city);
+    CREATE TABLE IF NOT EXISTS trips (
+        id            INTEGER PRIMARY KEY,
+        title         TEXT NOT NULL,
+        start_ts      INTEGER NOT NULL,
+        end_ts        INTEGER NOT NULL,
+        cc            TEXT,
+        admin1        TEXT,
+        city          TEXT,
+        count         INTEGER NOT NULL,
+        cover_file_id INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS trip_files (
+        trip_id INTEGER NOT NULL REFERENCES trips(id) ON DELETE CASCADE,
+        file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+        PRIMARY KEY(trip_id, file_id)
+    );
+    CREATE INDEX IF NOT EXISTS trip_files_file ON trip_files(file_id);
+    CREATE TABLE IF NOT EXISTS persons (
+        id            INTEGER PRIMARY KEY,
+        name          TEXT,
+        cover_face_id INTEGER,
+        hidden        INTEGER NOT NULL DEFAULT 0,
+        created_at    INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS faces (
+        id        INTEGER PRIMARY KEY,
+        file_id   INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+        x REAL NOT NULL, y REAL NOT NULL, w REAL NOT NULL, h REAL NOT NULL,
+        score     REAL NOT NULL,
+        sharpness REAL,
+        model     TEXT NOT NULL,
+        embedding BLOB NOT NULL,
+        person_id INTEGER REFERENCES persons(id) ON DELETE SET NULL,
+        locked    INTEGER NOT NULL DEFAULT 0,
+        hidden    INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS faces_file ON faces(file_id);
+    CREATE INDEX IF NOT EXISTS faces_person ON faces(person_id);
+    CREATE TABLE IF NOT EXISTS face_rejects (
+        face_id   INTEGER NOT NULL REFERENCES faces(id) ON DELETE CASCADE,
+        person_id INTEGER NOT NULL REFERENCES persons(id) ON DELETE CASCADE,
+        PRIMARY KEY(face_id, person_id)
+    );
+    "#,
+];
+
+pub fn schema_version(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("PRAGMA user_version", [], |r| r.get(0))?)
+}
+
+/// Apply pending migrations, each in its own transaction.
+pub fn migrate(conn: &Connection) -> Result<()> {
+    let mut v = schema_version(conn)? as usize;
+    while v < MIGRATIONS.len() {
+        conn.execute_batch(&format!("BEGIN; {} PRAGMA user_version = {}; COMMIT;", MIGRATIONS[v], v + 1))
+            .with_context(|| format!("migration {}", v + 1))?;
+        v += 1;
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct Db {
     path: PathBuf,
@@ -120,6 +215,7 @@ impl Db {
         }
         let conn = db.conn()?;
         conn.execute_batch(SCHEMA).context("creating schema")?;
+        migrate(&conn).context("upgrading database")?;
         Ok(db)
     }
 
@@ -805,6 +901,37 @@ pub fn group_summary(conn: &Connection, filter: &FileFilter, group_by: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migrates_old_database_and_keeps_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        {
+            // A v0.1 database: base schema only, user_version 0, one indexed file.
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(SCHEMA).unwrap();
+            c.execute("INSERT INTO volumes(uid, label, mount) VALUES ('mount:/x', 'x', '/x')", []).unwrap();
+            c.execute("INSERT INTO files(volume_id, rel_path, name, ext, kind, size, mtime) VALUES (1, 'a.jpg', 'a.jpg', 'jpg', 'photo', 10, 0)", []).unwrap();
+            assert_eq!(schema_version(&c).unwrap(), 0);
+        }
+        let db = Db::open(&path).unwrap();
+        let c = db.conn().unwrap();
+        assert_eq!(schema_version(&c).unwrap() as usize, MIGRATIONS.len());
+        let n: i64 = c.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1, "existing data survives");
+        for t in ["analysis", "bursts", "places", "trips", "trip_files", "dismissals", "persons", "faces", "face_rejects"] {
+            c.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get::<_, i64>(0)).unwrap_or_else(|e| panic!("{t}: {e}"));
+        }
+        // Opening again is a no-op.
+        drop(c);
+        Db::open(&path).unwrap();
+        // Deleting a file cascades to its analysis.
+        let c = db.conn().unwrap();
+        c.execute("INSERT INTO analysis(file_id, version, analyzed_at) VALUES (1, 1, 0)", []).unwrap();
+        c.execute("DELETE FROM files WHERE id = 1", []).unwrap();
+        let n: i64 = c.query_row("SELECT COUNT(*) FROM analysis", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0);
+    }
 
     #[test]
     fn dirname_sql() {

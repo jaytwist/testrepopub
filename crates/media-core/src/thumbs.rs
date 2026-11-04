@@ -61,6 +61,23 @@ impl ThumbCache {
         self.thumb_path(f).is_file()
     }
 
+    /// Save a thumbnail from an image the caller already decoded (single-read analysis pipeline).
+    pub fn store_thumb(&self, f: &FileRow, img: &DynamicImage) -> Result<PathBuf> {
+        let out = self.thumb_path(f);
+        save_jpeg(&img.thumbnail(THUMB_SIZE, THUMB_SIZE), &out, 80)?;
+        Ok(out)
+    }
+
+    pub fn face_path(&self, face_id: i64) -> PathBuf {
+        self.dir.join("faces").join(format!("{:02x}", face_id % 256)).join(format!("{face_id}.jpg"))
+    }
+
+    pub fn store_face(&self, face_id: i64, img: &DynamicImage) -> Result<PathBuf> {
+        let out = self.face_path(face_id);
+        save_jpeg(img, &out, 85)?;
+        Ok(out)
+    }
+
     /// Thumbnail JPEG path, generating it if needed (requires the drive to be online).
     pub fn ensure_thumb(&self, f: &FileRow) -> Result<PathBuf> {
         let out = self.thumb_path(f);

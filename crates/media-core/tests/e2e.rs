@@ -266,6 +266,22 @@ fn full_workflow() {
     let t = image::open(tc.thumb_path(&img1)).unwrap();
     assert!(t.width() <= thumbs::THUMB_SIZE && t.height() <= thumbs::THUMB_SIZE);
 
+    // --- Background analysis (single read: thumbnail + sharpness + dHash) ----------------------
+    let pause = media_core::analysis::PauseFlag::default();
+    let st = media_core::analysis::run(&db, &tc, None, 2, &stop, &pause, &quiet).unwrap();
+    assert_eq!((st.processed, st.failed), (8, 0), "{st:?}");
+    let p = media_core::analysis::pending(&conn, false).unwrap();
+    assert_eq!((p.online, p.analyzed), (0, 8), "{p:?}");
+    let sharp: Vec<f64> = {
+        let mut q = conn.prepare("SELECT sharpness FROM analysis WHERE sharpness IS NOT NULL").unwrap();
+        let v = q.query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect();
+        v
+    };
+    assert_eq!(sharp.len(), 8);
+    // Running again does nothing (resumable / idempotent).
+    let st = media_core::analysis::run(&db, &tc, None, 2, &stop, &pause, &quiet).unwrap();
+    assert_eq!(st.processed, 0);
+
     // --- Exact duplicates --------------------------------------------------------------------
     let ds = dedupe::run(&db, DupKind::Exact, Similarity::High, &stop, &quiet).unwrap();
     assert_eq!((ds.groups, ds.files), (1, 2), "{ds:?}");

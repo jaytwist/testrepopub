@@ -4,6 +4,7 @@
 //! scanning, labeling, de-duplication and organizing logic can be tested headlessly.
 
 pub mod db;
+pub mod analysis;
 pub mod dedupe;
 pub mod faces;
 pub mod journal;
@@ -11,6 +12,7 @@ pub mod labels;
 pub mod media;
 pub mod meta;
 pub mod organizer;
+pub mod power;
 pub mod scanner;
 pub mod thumbs;
 pub mod userfiles;

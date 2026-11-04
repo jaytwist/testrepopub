@@ -210,6 +210,10 @@ pub fn scan_source(db: &Db, source_id: i64, opts: &ScanOptions, stop: &StopFlag,
                 )?;
                 if existing.contains_key(&c.rel) {
                     stats.updated += 1;
+                    // Content changed: derived analysis (sharpness, faces, place) must be recomputed.
+                    tx.execute("DELETE FROM analysis WHERE file_id = ?", [id])?;
+                    tx.execute("DELETE FROM faces WHERE file_id = ?", [id])?;
+                    tx.execute("DELETE FROM places WHERE file_id = ?", [id])?;
                 } else {
                     stats.added += 1;
                 }
