@@ -1,5 +1,7 @@
 # Builds the signed Windows installers and the auto-update feed (latest.json) and publishes them
-# as a GitHub Release. Triggered by pushing a version tag (scripts/release.mjs does this).
+# as a GitHub Release. Triggered by pushing a version tag (scripts/release.mjs does this), or run
+# by hand from the Actions tab: it then builds the current branch's version and takes the notes
+# from RELEASE_NOTES.md (tauri-action creates the vX.Y.Z tag).
 #
 # One-time setup: repository secret TAURI_SIGNING_PRIVATE_KEY = contents of the updater private key.
 # (Add TAURI_SIGNING_PRIVATE_KEY_PASSWORD only if the key has a password.)
@@ -27,6 +29,8 @@ jobs:
         run: |
           tag="${GITHUB_REF_NAME}"
           notes="$(git tag -l --format='%(contents)' "$tag" 2>/dev/null)"
+          # Manual runs (Actions tab) build the current branch: use the committed notes file.
+          [ -z "$notes" ] && [ -f RELEASE_NOTES.md ] && notes="$(cat RELEASE_NOTES.md)"
           [ -z "$notes" ] && notes="Media Organizer $tag"
           { echo "body<<__NOTES__"; echo "$notes"; echo "__NOTES__"; } >> "$GITHUB_OUTPUT"
 
