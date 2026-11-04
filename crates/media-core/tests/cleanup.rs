@@ -58,6 +58,9 @@ fn bursts_and_blur() {
     // One isolated blurry photo.
     write_jpeg(&a.join("DCIM/IMG_300.jpg"), &blurred(&textured(30), 5.0), Some(("2023:08:15 18:00:00", "Apple", "iPhone 13")));
 
+    // A screenshot (by name).
+    write_png(&a.join("Pictures/Screenshot_20230815.png"), &picture(40, 1080, 2340));
+
     let db = Db::open(cache.join("library.db")).unwrap();
     let mut conn = db.conn().unwrap();
     volumes::add_source(&conn, &a).unwrap();
@@ -66,7 +69,7 @@ fn bursts_and_blur() {
     scanner::scan_all(&db, &ScanOptions::default(), &stop, &quiet).unwrap();
     let tc = thumbs::ThumbCache::new(cache.join("cache"));
     let st = analysis::run(&db, &tc, None, 2, &stop, &analysis::PauseFlag::default(), &quiet).unwrap();
-    assert_eq!((st.processed, st.failed), (12, 0), "{st:?}");
+    assert_eq!((st.processed, st.failed), (13, 0), "{st:?}");
     cleanup::refresh(&mut conn).unwrap();
 
     let name_of = |id: i64| db::get_file(&conn, id).unwrap().unwrap().rel_path;
@@ -108,4 +111,13 @@ fn bursts_and_blur() {
     assert_eq!(s2.blurry.count, s1.blurry.count - 1);
     let still = db::query_ids(&conn, &FileFilter { suggest: Some("blurry".into()), ..Default::default() }).unwrap();
     assert!(!still.contains(&img300));
+
+    // --- screenshots / large videos use the same suggest filter and dismissals ---
+    let shots = db::query_ids(&conn, &FileFilter { suggest: Some("screenshot".into()), ..Default::default() }).unwrap();
+    assert_eq!(shots.len(), 1);
+    assert_eq!(s2.screenshots.count, 1);
+    cleanup::dismiss(&mut conn, &shots, "screenshot").unwrap();
+    assert!(db::query_ids(&conn, &FileFilter { suggest: Some("screenshot".into()), ..Default::default() }).unwrap().is_empty());
+    assert_eq!(cleanup::summary(&conn).unwrap().screenshots.count, 0);
+    assert!(db::query_ids(&conn, &FileFilter { suggest: Some("large_video".into()), ..Default::default() }).unwrap().is_empty());
 }

@@ -21,6 +21,8 @@ const GROUP_BYS: { key: GroupBy; name: string }[] = [
   { key: "year", name: "연도별" },
   { key: "folder", name: "폴더별" },
   { key: "none", name: "묶지 않음" },
+  // Only offered when a cleanup preset opens it.
+  { key: "burst", name: "연사별" },
 ];
 
 // --- small helpers ---------------------------------------------------------------------------
@@ -39,6 +41,7 @@ function groupFilter(base: FileFilter, g: GroupRow): FileFilter {
   if (g.key.startsWith("m:")) return { ...base, year: g.year, month: g.month };
   if (g.key.startsWith("y:")) return { ...base, year: g.year, month: null };
   if (g.key.startsWith("d:")) return { ...base, volume_id: g.volume_id, dir: g.dir };
+  if (g.key.startsWith("b:")) return { ...base, burst_id: g.burst_id };
   return base;
 }
 
@@ -51,6 +54,7 @@ function groupTitle(g: GroupRow): { title: string; tip?: string } {
     const rel = g.dir ? g.dir.split("/").join(sep) : "(최상위 폴더)";
     return { title: `${g.volume_label} › ${rel}`, tip: full };
   }
+  if (g.key.startsWith("b:")) return { title: `연사 · ${fmtDate(g.first_taken, true)}` };
   return { title: "전체" };
 }
 
@@ -68,10 +72,19 @@ function caption(item: GridItem, sort: SortKey): string | null {
 
 // --- page ------------------------------------------------------------------------------------
 
-export default function Library({ preset, onClearPreset }: { preset?: LibraryPreset | null; onClearPreset?: () => void }) {
+interface LibraryProps {
+  preset?: LibraryPreset | null;
+  onClearPreset?: () => void;
+  /** The preset's one-shot parts (pre-selection, review) were used: don't repeat them on return. */
+  onConsumePreset?: () => void;
+}
+
+export default function Library({ preset, onClearPreset, onConsumePreset }: LibraryProps) {
   const { version, running, setRunning, lastDone } = useJob();
-  const [filter, setFilter] = useState<FileFilter>({});
-  const [groupBy, setGroupBy] = useState<GroupBy>(() => (store.get("mo.groupBy") as GroupBy) || "month");
+  // A preset (from cleanup suggestions, people, places) decides the first view, so the first load
+  // already uses its filter and pre-selection.
+  const [filter, setFilter] = useState<FileFilter>(() => preset?.filter ?? {});
+  const [groupBy, setGroupBy] = useState<GroupBy>(() => preset?.groupBy ?? ((store.get("mo.groupBy") as GroupBy) || "month"));
   const [groups, setGroups] = useState<GroupRow[] | null>(null);
   const [stats, setStats] = useState<FilteredStats | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -85,6 +98,12 @@ export default function Library({ preset, onClearPreset }: { preset?: LibraryPre
   const [bulk, setBulk] = useState<"label" | "date" | null>(null);
   const [bulkValue, setBulkValue] = useState("");
   const [busyGroup, setBusyGroup] = useState<string | null>(null);
+  /** Show each burst as its best shot with a "+N" badge. */
+  const [stack, setStack] = useState<boolean>(() => store.get("mo.stackBursts") === "1");
+  /** One-by-one review (from cleanup suggestions): kind + files marked "keep" this session. */
+  const [review, setReview] = useState<{ kind: string; title: string } | null>(() => (preset?.review ? { kind: preset.review, title: preset.title } : null));
+  const [kept, setKept] = useState<Set<number>>(new Set());
+  const reviewOpened = useRef(false);
   /** Result of the last delete, shown with an Undo button until dismissed. */
   const [deleted, setDeleted] = useState<{ batch_id: string; deleted: number; bytes: number; skipped_offline: number; failed: number } | null>(null);
 
@@ -97,17 +116,35 @@ export default function Library({ preset, onClearPreset }: { preset?: LibraryPre
   const groupIds = useRef(new Map<string, number[]>());
   const lastRange = useRef<ListRange>({ startIndex: 0, endIndex: 30 });
   /** Ids to select once the preset's view has loaded. */
-  const pendingSelect = useRef<number[] | null>(null);
+  /** Ids to select when the view for this exact filter object (and job version) loads. Idempotent,
+   *  so React's double-run of effects in development doesn't lose it. */
+  const pendingSelect = useRef<{ ids: number[]; filter: FileFilter; version: number } | null>(
+    preset?.select ? { ids: preset.select, filter: preset.filter, version } : null,
+  );
+  const appliedPreset = useRef(preset?.key);
 
-  // A preset (from cleanup suggestions, people, places) replaces the current view.
   useEffect(() => {
-    if (!preset) return;
-    pendingSelect.current = preset.select ?? null;
+    if (preset?.select || preset?.review) onConsumePreset?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // A new preset while the library is open replaces the current view.
+  useEffect(() => {
+    if (!preset || preset.key === appliedPreset.current) return;
+    appliedPreset.current = preset.key;
+    if (preset.select || preset.review) onConsumePreset?.();
+    pendingSelect.current = preset.select ? { ids: preset.select, filter: preset.filter, version } : null;
     setFilter(preset.filter);
     if (preset.groupBy) setGroupBy(preset.groupBy);
+    setReview(preset.review ? { kind: preset.review, title: preset.title } : null);
+    setKept(new Set());
+    reviewOpened.current = false;
   }, [preset?.key]);
 
   // --- loading ---
+
+  /** The filter actually sent to the backend (stacking applies outside the burst view). */
+  const qf: FileFilter = useMemo(() => ({ ...filter, stack_bursts: stack && groupBy !== "burst" }), [filter, stack, groupBy]);
 
   const reload = useCallback(() => {
     const g = ++gen.current;
@@ -115,7 +152,7 @@ export default function Library({ preset, onClearPreset }: { preset?: LibraryPre
     inflight.current = new Set();
     groupIds.current = new Map();
     setCacheTick((t) => t + 1);
-    Promise.all([api.groupSummary(filter, groupBy), api.filteredStats(filter)])
+    Promise.all([api.groupSummary(qf, groupBy), api.filteredStats(qf)])
       .then(([gs, st]) => {
         if (g !== gen.current) return;
         setGroups(gs);
@@ -124,18 +161,19 @@ export default function Library({ preset, onClearPreset }: { preset?: LibraryPre
         setLoadError(null);
       })
       .catch((e) => g === gen.current && setLoadError(String(e)));
-  }, [filter, groupBy]);
+  }, [qf, groupBy]);
 
   useEffect(() => {
-    setSelected(new Set(pendingSelect.current ?? []));
-    pendingSelect.current = null;
+    const p = pendingSelect.current;
+    const keep = p != null && p.filter === filter && p.version === version;
+    if (!keep) pendingSelect.current = null;
+    setSelected(new Set(keep ? p.ids : []));
     setAnchor(null);
     reload();
   }, [reload, version]);
 
   // Remember folds per grouping mode.
   useEffect(() => {
-    store.set("mo.groupBy", groupBy);
     try {
       setCollapsed(new Set(JSON.parse(store.get(`mo.collapsed.${groupBy}`) ?? "[]")));
     } catch {
@@ -155,7 +193,7 @@ export default function Library({ preset, onClearPreset }: { preset?: LibraryPre
       inflight.current.add(k);
       const myGen = gen.current;
       api
-        .grid(groupFilter(filter, g), page * PAGE, PAGE)
+        .grid(groupFilter(qf, g), page * PAGE, PAGE)
         .then((items) => {
           if (myGen !== gen.current) return;
           const a = cache.current.get(g.key) ?? new Array<GridItem | undefined>(g.count);
@@ -166,7 +204,7 @@ export default function Library({ preset, onClearPreset }: { preset?: LibraryPre
         .catch((e) => myGen === gen.current && setLoadError(String(e)))
         .finally(() => inflight.current.delete(k));
     },
-    [filter],
+    [qf],
   );
 
   // Columns follow the window width.
@@ -233,6 +271,14 @@ export default function Library({ preset, onClearPreset }: { preset?: LibraryPre
     }
   };
 
+  // A review preset opens the viewer on the first candidate as soon as it has loaded.
+  useEffect(() => {
+    if (review && !reviewOpened.current && flat.length > 0) {
+      reviewOpened.current = true;
+      setViewId(flat[0].id);
+    }
+  }, [review, flat]);
+
   // --- selection ---
 
   const onTileClick = (e: React.MouseEvent, id: number) => {
@@ -273,7 +319,7 @@ export default function Library({ preset, onClearPreset }: { preset?: LibraryPre
     try {
       let ids = groupIds.current.get(g.key);
       if (!ids) {
-        ids = await api.queryIds(groupFilter(filter, g));
+        ids = await api.queryIds(groupFilter(qf, g));
         groupIds.current.set(g.key, ids);
       }
       const all = ids.every((id) => selected.has(id));
@@ -295,7 +341,7 @@ export default function Library({ preset, onClearPreset }: { preset?: LibraryPre
   const foldAll = () => saveCollapsed(new Set((groups ?? []).map((g) => g.key)));
   const unfoldAll = () => saveCollapsed(new Set());
 
-  const selectAll = async () => setSelected(new Set(await api.queryIds(filter)));
+  const selectAll = async () => setSelected(new Set(await api.queryIds(qf)));
 
   // --- actions on the selection ---
 
@@ -419,6 +465,11 @@ export default function Library({ preset, onClearPreset }: { preset?: LibraryPre
           {item.kind === "raw" && <span className="badge-raw">RAW</span>}
           {!item.online && <span className="badge-offline" title="드라이브 연결 안 됨">⏏</span>}
           {cap && <span className="tile-caption">{cap}</span>}
+          {stack && groupBy !== "burst" && item.burst_rank === 0 && (item.burst_size ?? 0) > 1 && (
+            <span className="badge-stack" title="연사 · 가장 잘 나온 사진">+{(item.burst_size ?? 1) - 1}</span>
+          )}
+          {groupBy === "burst" && item.burst_rank === 0 && <span className="badge-best">★ 베스트</span>}
+          {kept.has(item.id) && <span className="badge-kept">남김</span>}
         </div>,
       );
     }
@@ -448,7 +499,8 @@ export default function Library({ preset, onClearPreset }: { preset?: LibraryPre
       </header>
       {preset && (
         <div className="alert ok preset-banner">
-          <span><b>{preset.title}</b>{selected.size > 0 && ` · ${fmtCount(selected.size)}개 선택됨`}</span>
+          <span><b>{preset.title}</b>{selected.size > 0 && ` · ${fmtCount(selected.size)}개 선택됨`}{kept.size > 0 && ` · ${fmtCount(kept.size)}개 남김`}</span>
+          {review && flat.length > 0 && <button className="btn small primary" onClick={() => setViewId(flat[0].id)}>한 장씩 검토</button>}
           <button className="btn small ghost" onClick={() => { onClearPreset?.(); setFilter({}); }}>닫고 전체 보기</button>
         </div>
       )}
@@ -458,8 +510,8 @@ export default function Library({ preset, onClearPreset }: { preset?: LibraryPre
       <div className="grid-toolbar">
         <label className="muted small">묶기</label>
         <div className="seg">
-          {GROUP_BYS.map((b) => (
-            <button key={b.key} className={groupBy === b.key ? "on" : ""} onClick={() => setGroupBy(b.key)}>{b.name}</button>
+          {GROUP_BYS.filter((b) => b.key !== "burst" || groupBy === "burst").map((b) => (
+            <button key={b.key} className={groupBy === b.key ? "on" : ""} onClick={() => { setGroupBy(b.key); store.set("mo.groupBy", b.key); }}>{b.name}</button>
           ))}
         </div>
         {groupBy !== "none" && groupCount > 0 && (
@@ -468,6 +520,12 @@ export default function Library({ preset, onClearPreset }: { preset?: LibraryPre
             <button className="btn small" onClick={foldAll} disabled={foldedCount === groupCount}>모두 접기</button>
             <button className="btn small" onClick={unfoldAll} disabled={foldedCount === 0}>모두 펼치기</button>
           </>
+        )}
+        {groupBy !== "burst" && (
+          <label className="check-row small stack-toggle" title="연사로 찍은 사진을 가장 잘 나온 한 장으로 보여줍니다">
+            <input type="checkbox" checked={stack} onChange={(e) => { setStack(e.target.checked); store.set("mo.stackBursts", e.target.checked ? "1" : "0"); }} />
+            연사 겹쳐 보기
+          </label>
         )}
       </div>
 
@@ -540,7 +598,26 @@ export default function Library({ preset, onClearPreset }: { preset?: LibraryPre
             if (i > flat.length - 30) loadNext();
           }}
           onClose={() => setViewId(null)}
-          onChanged={() => api.filteredStats(filter).then(setStats)}
+          onChanged={() => api.filteredStats(qf).then(setStats)}
+          review={review ? {
+            title: review.title,
+            marked: selected,
+            kept,
+            onMark: (id) => {
+              const next = new Set(selected);
+              next.has(id) ? next.delete(id) : next.add(id);
+              setSelected(next);
+            },
+            onKeep: (id) => {
+              api.dismiss([id], review.kind).catch((e) => setLoadError(String(e)));
+              setKept((k) => new Set(k).add(id));
+              setSelected((s) => { const n = new Set(s); n.delete(id); return n; });
+            },
+            onFinish: () => {
+              setViewId(null);
+              if (selected.size > 0) deleteSelected();
+            },
+          } : undefined}
         />
       )}
     </div>

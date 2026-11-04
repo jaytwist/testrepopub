@@ -84,6 +84,21 @@ fn jpeg(path: &Path, img: &DynamicImage, exif: Option<(&str, &str, &str)>) {
     fs::write(path, buf).unwrap();
 }
 
+/// A picture with fine texture, so focus can be measured (a smooth gradient has none).
+fn textured(seed: u32, w: u32, h: u32) -> DynamicImage {
+    let scene = picture(seed, w, h).to_rgb8();
+    DynamicImage::ImageRgb8(ImageBuffer::from_fn(w, h, |x, y| {
+        let p = scene.get_pixel(x, y).0;
+        let t = if ((x / 3) + (y / 3)) % 2 == 0 { 28i16 } else { -28 };
+        let c = |v: u8| (v as i16 + t).clamp(0, 255) as u8;
+        Rgb([c(p[0]), c(p[1]), c(p[2])])
+    }))
+}
+
+fn blurred(img: &DynamicImage, sigma: f32) -> DynamicImage {
+    DynamicImage::ImageRgb8(DynamicImage::ImageRgba8(image::imageops::blur(&img.to_rgba8(), sigma)).to_rgb8())
+}
+
 fn drive(root: &Path, name: &str) -> PathBuf {
     let d = root.join(name);
     fs::create_dir_all(&d).unwrap();
@@ -163,6 +178,25 @@ fn main() {
     // Two different photos that collide on name.
     jpeg(&a.join("DCIM/100CANON/IMG_0001.jpg"), &picture(900, 1600, 1067), Some(("2024:06:15 10:00:00", "Canon", "Canon EOS R6")));
     jpeg(&b.join("DCIM/100CANON/IMG_0001.jpg"), &picture(901, 1600, 1067), Some(("2024:06:16 11:00:00", "Canon", "Canon EOS R6")));
+
+    // A day out on the phone (cleanup suggestions): a 5-shot burst with one shaken frame, sharp
+    // photos through the day, and two blurry ones.
+    let day = a.join("DCIM/101APPLE");
+    let base = textured(700, 1600, 1200);
+    for i in 0..5u32 {
+        let src = if i == 3 { blurred(&base, 4.0) } else { base.clone() }.to_rgb8();
+        let img = DynamicImage::ImageRgb8(ImageBuffer::from_fn(src.width(), src.height(), |x, y| {
+            let p = src.get_pixel(x, y).0;
+            Rgb([p[0].saturating_add(i as u8 * 2), p[1], p[2]])
+        }));
+        jpeg(&day.join(format!("IMG_50{i}.jpg")), &img, Some((&format!("2024:06:15 14:20:0{}", i * 2), "Apple", "iPhone 15")));
+    }
+    for i in 0..6u32 {
+        jpeg(&day.join(format!("IMG_51{i}.jpg")), &textured(710 + i, 1600, 1200), Some((&format!("2024:06:15 {:02}:10:00", 9 + i * 2), "Apple", "iPhone 15")));
+    }
+    for (i, sigma) in [(0u32, 5.0f32), (1, 6.0)] {
+        jpeg(&day.join(format!("IMG_52{i}.jpg")), &blurred(&textured(720 + i, 1600, 1200), sigma), Some((&format!("2024:06:15 {:02}:45:00", 12 + i * 5), "Apple", "iPhone 15")));
+    }
 
     // Videos.
     let v1 = c.join("Users/me/Videos/VID_20230415_120000.mp4");

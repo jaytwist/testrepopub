@@ -10,9 +10,23 @@ interface Props {
   onIndex: (i: number) => void;
   onClose: () => void;
   onChanged?: () => void;
+  /** One-by-one review of cleanup suggestions: K keeps (remembered), Delete marks for deletion. */
+  review?: ReviewProps;
 }
 
-export default function Viewer({ items, index, onIndex, onClose, onChanged }: Props) {
+export interface ReviewProps {
+  title: string;
+  marked: Set<number>;
+  kept: Set<number>;
+  onMark: (id: number) => void;
+  onKeep: (id: number) => void;
+  /** Close the review; the marked files are deleted together (after one confirmation). */
+  onFinish: () => void;
+}
+
+const REASON_NAMES: Record<string, string> = { blurry: "흐린 사진", burst_extra: "연사" };
+
+export default function Viewer({ items, index, onIndex, onClose, onChanged, review }: Props) {
   const item = items[index];
   const [detail, setDetail] = useState<FileDetail | null>(null);
   const [src, setSrc] = useState<string | null>(null);
@@ -58,16 +72,32 @@ export default function Viewer({ items, index, onIndex, onClose, onChanged }: Pr
     api.openInVlc(item.id).then(() => setVlcMsg("VLC에서 재생합니다")).catch((e) => setVlcMsg(String(e)));
   };
 
+  const close = review ? review.onFinish : onClose;
+  const next = () => index < items.length - 1 && onIndex(index + 1);
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") return onClose();
+      if (e.key === "Escape") return close();
       if ((e.target as HTMLElement).tagName === "INPUT") return;
-      if (e.key === "ArrowRight" && index < items.length - 1) onIndex(index + 1);
+      if (e.key === "ArrowRight") next();
       if (e.key === "ArrowLeft" && index > 0) onIndex(index - 1);
+      if (!review) return;
+      if (e.key === "k" || e.key === "K" || e.key === "ㅏ") {
+        review.onKeep(item.id);
+        next();
+      } else if (e.key === "Delete" || e.key === "d" || e.key === "D" || e.key === "ㅇ") {
+        e.preventDefault();
+        const wasMarked = review.marked.has(item.id);
+        review.onMark(item.id);
+        if (!wasMarked) next();
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [index, items.length, onClose, onIndex]);
+  }, [index, items.length, close, onIndex, review, item.id]);
+
+  // Other shots of the same burst, for side-by-side comparison.
+  const burst = item.burst_id != null ? items.filter((it) => it.burst_id === item.burst_id) : [];
 
   // The webview can't play this codec (HEVC, AVI, WMV...): transcode a preview with the bundled ffmpeg.
   const convertVideo = () => {
@@ -112,9 +142,24 @@ export default function Viewer({ items, index, onIndex, onClose, onChanged }: Pr
   const suggestions = allLabels.filter((l) => l.user && !userLabels.some((u) => u.label === l.label)).slice(0, 8);
 
   return (
-    <div className="viewer" onClick={onClose}>
+    <div className={`viewer ${review ? "reviewing" : ""}`} onClick={close}>
       <div className="viewer-stage" onClick={(e) => e.stopPropagation()}>
-        <button className="viewer-close" onClick={onClose} title="닫기 (Esc)">✕</button>
+        <button className="viewer-close" onClick={close} title="닫기 (Esc)">✕</button>
+        {review && (
+          <div className="review-bar">
+            <b>{review.title}</b>
+            <span className="muted">{index + 1} / {items.length}</span>
+            {review.marked.has(item.id) ? <span className="mark del">삭제할 목록에 있음</span> : review.kept.has(item.id) ? <span className="mark keep">남기기로 함</span> : null}
+            <span className="spacer" />
+            <button className="btn small" onClick={() => { review.onKeep(item.id); next(); }} title="K">남기기 <kbd>K</kbd></button>
+            <button className={`btn small ${review.marked.has(item.id) ? "" : "danger"}`} onClick={() => { const was = review.marked.has(item.id); review.onMark(item.id); if (!was) next(); }} title="Delete">
+              {review.marked.has(item.id) ? "삭제 취소" : "삭제 목록에 담기"} <kbd>Del</kbd>
+            </button>
+            <button className="btn small primary" onClick={review.onFinish}>
+              {review.marked.size > 0 ? `끝내고 ${review.marked.size}개 삭제` : "검토 끝내기"}
+            </button>
+          </div>
+        )}
         {index > 0 && <button className="viewer-nav left" onClick={() => onIndex(index - 1)}>‹</button>}
         {index < items.length - 1 && <button className="viewer-nav right" onClick={() => onIndex(index + 1)}>›</button>}
 
@@ -145,12 +190,34 @@ export default function Viewer({ items, index, onIndex, onClose, onChanged }: Pr
             </span>
           </div>
         )}
+        {burst.length > 1 && (
+          <div className="burst-strip">
+            {burst.map((b) => {
+              const i = items.indexOf(b);
+              return (
+                <button key={b.id} className={`burst-thumb ${b.id === item.id ? "cur" : ""} ${review?.marked.has(b.id) ? "marked" : ""}`} onClick={() => onIndex(i)} title={b.burst_rank === 0 ? "가장 잘 나온 사진" : ""}>
+                  <img src={thumbUrl(b.id)} alt="" />
+                  {b.burst_rank === 0 && <span className="star">★</span>}
+                  {review?.marked.has(b.id) && <span className="x">🗑</span>}
+                </button>
+              );
+            })}
+          </div>
+        )}
       </div>
 
       <aside className="viewer-info" onClick={(e) => e.stopPropagation()}>
         {f ? (
           <>
             <div className="info-name" title={f.name}>{f.name}</div>
+            {detail!.reasons.length > 0 && (
+              <section className="reasons">
+                <h4>정리 제안</h4>
+                {detail!.reasons.map(([k, d]) => (
+                  <div key={k} className="reason"><b>{REASON_NAMES[k] ?? k}</b> {d}</div>
+                ))}
+              </section>
+            )}
             <section>
               <h4>촬영 날짜</h4>
               {editDate == null ? (
@@ -207,7 +274,9 @@ export default function Viewer({ items, index, onIndex, onClose, onChanged }: Pr
               {f.kind === "video" && vlc && <button className="btn small" disabled={!f.online} onClick={playInVlc}>VLC로 재생</button>}
             </div>
             {vlcMsg && <div className="small muted">{vlcMsg}</div>}
-            <div className="muted small">← → 이동 · Esc 닫기 · {index + 1} / {items.length}</div>
+            <div className="muted small">
+              ← → 이동 · {review ? "K 남기기 · Delete 삭제 목록 · " : ""}Esc {review ? "끝내기" : "닫기"} · {index + 1} / {items.length}
+            </div>
           </>
         ) : (
           <div className="muted">불러오는 중…</div>

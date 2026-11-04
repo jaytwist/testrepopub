@@ -9,8 +9,9 @@ import Duplicates from "./pages/Duplicates";
 import Organize from "./pages/Organize";
 import History from "./pages/History";
 import Settings from "./pages/Settings";
+import Cleanup from "./pages/Cleanup";
 
-export type Page = "library" | "sources" | "duplicates" | "organize" | "history" | "settings";
+export type Page = "library" | "cleanup" | "sources" | "duplicates" | "organize" | "history" | "settings";
 
 /** Open the library with a ready-made view (used by cleanup suggestions, people, places). */
 export interface LibraryPreset {
@@ -20,6 +21,8 @@ export interface LibraryPreset {
   groupBy?: GroupBy;
   /** File ids to pre-select (e.g. "everything but the best shot"). */
   select?: number[];
+  /** Open the one-by-one review (keep / delete) for this suggestion kind. */
+  review?: string;
 }
 
 interface NavCtx {
@@ -64,6 +67,7 @@ const NAV: { section: string; items: { id: Page; label: string; icon: string }[]
   {
     section: "정리하기",
     items: [
+      { id: "cleanup", label: "정리 제안", icon: "✦" },
       { id: "duplicates", label: "중복 정리", icon: "⧉" },
       { id: "organize", label: "한 곳으로 정리", icon: "⇲" },
     ],
@@ -269,7 +273,8 @@ export default function App() {
         </aside>
 
         <main className="content">
-          {page === "library" && <Library preset={preset} onClearPreset={() => setPreset(null)} />}
+          {page === "library" && <Library preset={preset} onClearPreset={() => setPreset(null)} onConsumePreset={() => setPreset((p) => p && { ...p, select: undefined, review: undefined })} />}
+          {page === "cleanup" && <Cleanup />}
           {page === "sources" && <Sources />}
           {page === "duplicates" && <Duplicates />}
           {page === "organize" && <Organize />}

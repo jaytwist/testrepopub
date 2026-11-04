@@ -396,7 +396,8 @@ pub struct FileFilter {
     pub has_gps: Option<bool>,
     /// Files directly inside this volume-relative folder ("" = volume root). Use with `volume_id`.
     pub dir: Option<String>,
-    /// Cleanup suggestion kind ("blurry" | "burst_extra"), excluding ones the user dismissed.
+    /// Cleanup suggestion kind ("blurry" | "burst_extra" | "screenshot" | "large_video"), excluding
+    /// ones the user dismissed.
     pub suggest: Option<String>,
     /// Only photos that are part of a burst / of this burst.
     pub in_burst: bool,
@@ -535,8 +536,16 @@ impl FileFilter {
             p.push(Value::Text(d.trim_matches('/').to_string()));
         }
         if let Some(k) = &self.suggest {
-            w.push("EXISTS (SELECT 1 FROM suggestions s WHERE s.file_id = f.id AND s.kind = ?) AND NOT EXISTS (SELECT 1 FROM dismissals d WHERE d.file_id = f.id AND d.kind = ?)".into());
-            p.push(Value::Text(k.clone()));
+            // Screenshots and large videos come straight from labels / sizes; the rest from `suggestions`.
+            w.push(match k.as_str() {
+                "screenshot" => "EXISTS (SELECT 1 FROM labels l WHERE l.file_id = f.id AND l.label = 'screenshot')".to_string(),
+                "large_video" => format!("f.kind = 'video' AND f.size >= {}", crate::cleanup::LARGE_VIDEO_BYTES),
+                _ => {
+                    p.push(Value::Text(k.clone()));
+                    "EXISTS (SELECT 1 FROM suggestions s WHERE s.file_id = f.id AND s.kind = ?)".to_string()
+                }
+            });
+            w.push("NOT EXISTS (SELECT 1 FROM dismissals d WHERE d.file_id = f.id AND d.kind = ?)".into());
             p.push(Value::Text(k.clone()));
         }
         if self.in_burst {

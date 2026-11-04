@@ -25,14 +25,24 @@ export interface FileFilter {
   ext?: string | null;
   has_gps?: boolean | null;
   dir?: string | null;
+  suggest?: string | null;
+  in_burst?: boolean;
+  burst_id?: number | null;
+  stack_bursts?: boolean;
   sort?: SortKey | null;
   desc?: boolean | null;
 }
 
-export type GroupBy = "month" | "year" | "folder" | "none";
+export type GroupBy = "month" | "year" | "folder" | "burst" | "none";
 export interface GroupRow {
   key: string; count: number; bytes: number; year: number | null; month: number | null;
   volume_id: number | null; dir: string | null; mount: string | null; volume_label: string | null;
+  burst_id: number | null; first_taken: number | null;
+}
+export interface Bucket { count: number; bytes: number }
+export interface CleanupSummary {
+  blurry: Bucket; burst_extras: Bucket; burst_groups: number; screenshots: Bucket; large_videos: Bucket;
+  exact_duplicates: Bucket; total_bytes: number; analyzed: number; pending: number;
 }
 export type SortKey = "taken" | "mtime" | "size" | "name" | "resolution" | "duration";
 
@@ -53,6 +63,7 @@ export interface FileRow {
 export interface GridItem {
   id: number; kind: string; taken_at: number | null; width: number | null; height: number | null;
   duration_ms: number | null; online: boolean; size: number; mtime: number; name: string;
+  burst_size: number | null; burst_rank: number | null; burst_id: number | null;
 }
 export interface ValueCount { value: string; count: number }
 export interface FilterOptions { cameras: ValueCount[]; exts: ValueCount[]; years: number[]; max_size: number; with_gps: number }
@@ -81,7 +92,7 @@ export interface LibraryStats {
 export interface LabelRow { label: string; source: string }
 export interface LabelCount { label: string; count: number; user: boolean }
 export interface FileDetail {
-  file: FileRow; labels: LabelRow[]; abs_path: string; taken: string; confidence: string; thumb_cached: boolean;
+  file: FileRow; reasons: [string, string][]; labels: LabelRow[]; abs_path: string; taken: string; confidence: string; thumb_cached: boolean;
 }
 export interface DupMember { file: FileRow; keep: boolean }
 export interface DupGroup { id: number; kind: string; members: DupMember[]; reclaimable_bytes: number }
@@ -123,6 +134,9 @@ export const api = {
   removeSource: (id: number) => invoke<void>("remove_source", { id }),
   startScan: (sourceId?: number) => invoke<void>("start_scan", { sourceId: sourceId ?? null }),
   getScanOptions: () => invoke<ScanOptions>("get_scan_options"),
+  cleanupSummary: () => invoke<CleanupSummary>("cleanup_summary"),
+  burstExtraIds: () => invoke<number[]>("burst_extra_ids"),
+  dismiss: (ids: number[], kind: string) => invoke<number>("dismiss", { ids, kind }),
   analysisStatus: () => invoke<LaneStatus>("analysis_status"),
   analysisPause: (paused: boolean) => invoke<void>("analysis_pause", { paused }),
   analysisStart: () => invoke<void>("analysis_start"),
