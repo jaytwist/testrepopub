@@ -1,15 +1,33 @@
 import { createContext, useContext, useEffect, useState } from "react";
 import {
-  api, onJobDone, onProgress, onUpdateProgress, type AppInfo, type JobDone, type LibraryStats, type Progress,
-  type UpdateInfo, type UpdateProgress, fmtBytes, fmtCount,
+  api, onAnalysisStatus, onJobDone, onProgress, onUpdateProgress, type AppInfo, type FileFilter, type GroupBy, type JobDone,
+  type LaneStatus, type LibraryStats, type Progress, type UpdateInfo, type UpdateProgress, fmtBytes, fmtCount, fmtEta,
 } from "./api";
 import Library from "./pages/Library";
 import Sources from "./pages/Sources";
 import Duplicates from "./pages/Duplicates";
 import Organize from "./pages/Organize";
 import History from "./pages/History";
+import Settings from "./pages/Settings";
 
-type Page = "library" | "sources" | "duplicates" | "organize" | "history";
+export type Page = "library" | "sources" | "duplicates" | "organize" | "history" | "settings";
+
+/** Open the library with a ready-made view (used by cleanup suggestions, people, places). */
+export interface LibraryPreset {
+  key: number;
+  title: string;
+  filter: FileFilter;
+  groupBy?: GroupBy;
+  /** File ids to pre-select (e.g. "everything but the best shot"). */
+  select?: number[];
+}
+
+interface NavCtx {
+  go: (p: Page) => void;
+  openLibrary: (p: Omit<LibraryPreset, "key">) => void;
+}
+export const NavContext = createContext<NavCtx>({ go: () => {}, openLibrary: () => {} });
+export const useNav = () => useContext(NavContext);
 
 interface JobCtx {
   running: string | null;
@@ -41,13 +59,26 @@ function stageName(p: Progress): string {
   return p.stage;
 }
 
-const NAV: { id: Page; label: string; icon: string }[] = [
-  { id: "library", label: "라이브러리", icon: "▦" },
-  { id: "sources", label: "드라이브 · 폴더", icon: "⛁" },
-  { id: "duplicates", label: "중복 정리", icon: "⧉" },
-  { id: "organize", label: "한 곳으로 정리", icon: "⇲" },
-  { id: "history", label: "작업 기록 · 되돌리기", icon: "↺" },
+const NAV: { section: string; items: { id: Page; label: string; icon: string }[] }[] = [
+  { section: "보기", items: [{ id: "library", label: "라이브러리", icon: "▦" }] },
+  {
+    section: "정리하기",
+    items: [
+      { id: "duplicates", label: "중복 정리", icon: "⧉" },
+      { id: "organize", label: "한 곳으로 정리", icon: "⇲" },
+    ],
+  },
+  {
+    section: "관리",
+    items: [
+      { id: "sources", label: "드라이브 · 폴더", icon: "⛁" },
+      { id: "history", label: "작업 기록 · 되돌리기", icon: "↺" },
+      { id: "settings", label: "설정", icon: "⚙" },
+    ],
+  },
 ];
+
+const LANE_REASON: Record<string, string> = { user: "일시정지됨", job: "다른 작업이 끝나면 이어서", battery: "배터리 사용 중이라 쉬는 중" };
 
 export default function App() {
   const [page, setPage] = useState<Page>("library");
@@ -61,6 +92,27 @@ export default function App() {
   const [update, setUpdate] = useState<UpdateInfo | null>(null);
   const [updating, setUpdating] = useState<UpdateProgress | null>(null);
   const [checking, setChecking] = useState(false);
+  const [lane, setLane] = useState<LaneStatus | null>(null);
+  const [preset, setPreset] = useState<LibraryPreset | null>(null);
+
+  const nav: NavCtx = {
+    go: (p) => setPage(p),
+    openLibrary: (p) => {
+      setPreset({ ...p, key: Date.now() });
+      setPage("library");
+    },
+  };
+
+  // Background analysis status (separate from user jobs).
+  useEffect(() => {
+    api.analysisStatus().then(setLane).catch(() => {});
+    const un = onAnalysisStatus((s) => setLane((cur) => ({ ...(cur ?? s), ...s })));
+    const t = setInterval(() => api.analysisStatus().then(setLane).catch(() => {}), 15000);
+    return () => {
+      clearInterval(t);
+      un.then((u) => u());
+    };
+  }, []);
 
   // Quietly look for a new version shortly after start; never interrupts the user.
   useEffect(() => {
@@ -131,6 +183,7 @@ export default function App() {
   const pct = progress && progress.total > 0 ? Math.min(100, (progress.done / progress.total) * 100) : null;
 
   return (
+    <NavContext.Provider value={nav}>
     <JobContext.Provider value={{ running, progress, lastDone, version, setRunning }}>
       <div className="app">
         <aside className="sidebar">
@@ -142,13 +195,38 @@ export default function App() {
             </div>
           </div>
           <nav>
-            {NAV.map((n) => (
-              <button key={n.id} className={`nav-item ${page === n.id ? "active" : ""}`} onClick={() => setPage(n.id)}>
-                <span className="nav-icon">{n.icon}</span>
-                {n.label}
-              </button>
+            {NAV.map((sec) => (
+              <div key={sec.section} className="nav-section">
+                <div className="nav-section-title">{sec.section}</div>
+                {sec.items.map((n) => (
+                  <button key={n.id} className={`nav-item ${page === n.id ? "active" : ""}`} onClick={() => setPage(n.id)}>
+                    <span className="nav-icon">{n.icon}</span>
+                    {n.label}
+                  </button>
+                ))}
+              </div>
             ))}
           </nav>
+          {lane && (lane.running || lane.pending_online > 0) && (
+            <div className="lane-card" title="썸네일·선명도 등 사진 정보를 뒤에서 만드는 중">
+              <div className="row-between">
+                <span className="small"><b>사진 분석</b> {lane.running && !lane.paused && <span className="spinner tiny" />}</span>
+                {lane.running && !lane.paused ? (
+                  <button className="btn small ghost" onClick={() => api.analysisPause(true)}>일시정지</button>
+                ) : (
+                  <button className="btn small ghost" onClick={() => api.analysisStart()}>{lane.paused ? "재개" : "시작"}</button>
+                )}
+              </div>
+              {lane.running && lane.total > 0 && (
+                <div className="bar"><div className="bar-fill" style={{ width: `${Math.min(100, (lane.done / lane.total) * 100)}%` }} /></div>
+              )}
+              <span className="muted small">
+                {lane.paused && lane.reason ? LANE_REASON[lane.reason] : lane.running
+                  ? `${fmtCount(lane.done)} / ${fmtCount(lane.total)}${lane.eta_secs ? ` · ${fmtEta(lane.eta_secs)} 남음` : ""}`
+                  : `${fmtCount(lane.pending_online)}개 대기 중`}
+              </span>
+            </div>
+          )}
           {update?.available && (
             <div className="update-card">
               <b>새 버전 v{update.version}</b>
@@ -191,11 +269,12 @@ export default function App() {
         </aside>
 
         <main className="content">
-          {page === "library" && <Library />}
+          {page === "library" && <Library preset={preset} onClearPreset={() => setPreset(null)} />}
           {page === "sources" && <Sources />}
           {page === "duplicates" && <Duplicates />}
           {page === "organize" && <Organize />}
           {page === "history" && <History />}
+          {page === "settings" && <Settings />}
         </main>
 
         {running && (
@@ -216,5 +295,6 @@ export default function App() {
         {toast && <div className={`toast ${toast.ok ? "ok" : "bad"}`} onClick={() => setToast(null)}>{toast.text}</div>}
       </div>
     </JobContext.Provider>
+    </NavContext.Provider>
   );
 }

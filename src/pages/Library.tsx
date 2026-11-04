@@ -5,7 +5,7 @@ import {
   absPath, api, fmtBytes, fmtCount, fmtDate, fmtDuration, thumbUrl,
   type FileFilter, type FilteredStats, type GridItem, type GroupBy, type GroupRow, type SortKey,
 } from "../api";
-import { useJob } from "../App";
+import { useJob, type LibraryPreset } from "../App";
 import FilterBar from "../components/FilterBar";
 import Viewer from "../components/Viewer";
 
@@ -68,7 +68,7 @@ function caption(item: GridItem, sort: SortKey): string | null {
 
 // --- page ------------------------------------------------------------------------------------
 
-export default function Library() {
+export default function Library({ preset, onClearPreset }: { preset?: LibraryPreset | null; onClearPreset?: () => void }) {
   const { version, running, setRunning, lastDone } = useJob();
   const [filter, setFilter] = useState<FileFilter>({});
   const [groupBy, setGroupBy] = useState<GroupBy>(() => (store.get("mo.groupBy") as GroupBy) || "month");
@@ -96,6 +96,16 @@ export default function Library() {
   /** group key -> every id in the group (fetched when the group checkbox is used) */
   const groupIds = useRef(new Map<string, number[]>());
   const lastRange = useRef<ListRange>({ startIndex: 0, endIndex: 30 });
+  /** Ids to select once the preset's view has loaded. */
+  const pendingSelect = useRef<number[] | null>(null);
+
+  // A preset (from cleanup suggestions, people, places) replaces the current view.
+  useEffect(() => {
+    if (!preset) return;
+    pendingSelect.current = preset.select ?? null;
+    setFilter(preset.filter);
+    if (preset.groupBy) setGroupBy(preset.groupBy);
+  }, [preset?.key]);
 
   // --- loading ---
 
@@ -117,7 +127,8 @@ export default function Library() {
   }, [filter, groupBy]);
 
   useEffect(() => {
-    setSelected(new Set());
+    setSelected(new Set(pendingSelect.current ?? []));
+    pendingSelect.current = null;
     setAnchor(null);
     reload();
   }, [reload, version]);
@@ -435,6 +446,12 @@ export default function Library() {
           <div className="muted small">클릭하면 크게 보기 · Ctrl/Shift+클릭으로 여러 개 선택 · 묶음 제목 왼쪽 동그라미로 묶음 전체 선택</div>
         </div>
       </header>
+      {preset && (
+        <div className="alert ok preset-banner">
+          <span><b>{preset.title}</b>{selected.size > 0 && ` · ${fmtCount(selected.size)}개 선택됨`}</span>
+          <button className="btn small ghost" onClick={() => { onClearPreset?.(); setFilter({}); }}>닫고 전체 보기</button>
+        </div>
+      )}
       <FilterBar filter={filter} onChange={setFilter} />
       {loadError && <div className="alert bad">불러오기 실패: {loadError}</div>}
 

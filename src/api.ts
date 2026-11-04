@@ -107,6 +107,12 @@ export interface Progress { job: string; stage: string; done: number; total: num
 export interface JobDone { job: string; ok: boolean; error: string | null; result: any }
 export interface UpdateInfo { current: string; available: boolean; version: string | null; notes: string | null; date: string | null }
 export interface UpdateProgress { downloaded: number; total: number | null }
+export interface LaneStatus {
+  running: boolean; paused: boolean; reason: "user" | "job" | "battery" | null; done: number; total: number;
+  eta_secs: number; current: string; provider: string; pending_online: number; pending_offline: number;
+  analyzed: number; faces_available: boolean; last_error: string | null;
+}
+export interface AnalysisOptions { auto: boolean; faces: boolean; gpu: boolean; pause_on_battery: boolean }
 export interface AppInfo { version: string; data_dir: string; cache_dir: string; ffmpeg: boolean; job: string | null }
 
 export const api = {
@@ -117,6 +123,11 @@ export const api = {
   removeSource: (id: number) => invoke<void>("remove_source", { id }),
   startScan: (sourceId?: number) => invoke<void>("start_scan", { sourceId: sourceId ?? null }),
   getScanOptions: () => invoke<ScanOptions>("get_scan_options"),
+  analysisStatus: () => invoke<LaneStatus>("analysis_status"),
+  analysisPause: (paused: boolean) => invoke<void>("analysis_pause", { paused }),
+  analysisStart: () => invoke<void>("analysis_start"),
+  getAnalysisOptions: () => invoke<AnalysisOptions>("get_analysis_options"),
+  setAnalysisOptions: (options: AnalysisOptions) => invoke<void>("set_analysis_options", { options }),
   setScanOptions: (options: ScanOptions) => invoke<void>("set_scan_options", { options }),
   defaultScanOptions: () => invoke<ScanOptions>("default_scan_options"),
   suggestedFolders: () => invoke<SuggestedFolder[]>("suggested_folders"),
@@ -179,6 +190,12 @@ export function onProgress(cb: (p: Progress) => void): Promise<UnlistenFn> {
 export function onUpdateProgress(cb: (p: UpdateProgress) => void): Promise<UnlistenFn> {
   return listen<UpdateProgress>("update-progress", (e) => cb(e.payload));
 }
+export function onAnalysisStatus(cb: (s: LaneStatus) => void): Promise<UnlistenFn> {
+  return listen<LaneStatus>("analysis-status", (e) => cb(e.payload));
+}
+export function onAnalysisDone(cb: () => void): Promise<UnlistenFn> {
+  return listen("analysis-done", () => cb());
+}
 export function onJobDone(cb: (d: JobDone) => void): Promise<UnlistenFn> {
   return listen<JobDone>("job-done", (e) => cb(e.payload));
 }
@@ -238,6 +255,15 @@ export function toDatetimeLocal(ts: number | null): string {
   const d = new Date(ts * 1000);
   const p = (x: number) => String(x).padStart(2, "0");
   return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())}T${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
+}
+
+/** "약 2시간 10분" style remaining time. */
+export function fmtEta(secs: number): string {
+  if (!secs || secs < 60) return "1분 이내";
+  const m = Math.round(secs / 60);
+  if (m < 60) return `약 ${m}분`;
+  const h = Math.floor(m / 60);
+  return `약 ${h}시간${m % 60 ? ` ${m % 60}분` : ""}`;
 }
 
 export function fmtDuration(ms: number | null): string {
