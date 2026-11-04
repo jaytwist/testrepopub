@@ -297,7 +297,7 @@ fn analyze_one(f: &FileRow, cache: &ThumbCache, engine: Option<&Mutex<FaceEngine
     Ok(FileOut { id: f.id, sharpness: Some(sharp), dhash: Some(hash), faces })
 }
 
-fn save(conn: &mut Connection, cache: &ThumbCache, outs: Vec<Result<FileOut, (i64, String)>>, stats: &mut AnalysisStats) -> Result<()> {
+fn save(conn: &mut Connection, cache: &ThumbCache, outs: Vec<Result<FileOut, (i64, String, bool)>>, stats: &mut AnalysisStats) -> Result<()> {
     let now = crate::now_ts();
     let tx = conn.transaction()?;
     let mut crops: Vec<(i64, DynamicImage)> = Vec::new();
@@ -336,7 +336,11 @@ fn save(conn: &mut Connection, cache: &ThumbCache, outs: Vec<Result<FileOut, (i6
                 }
                 stats.processed += 1;
             }
-            Err((id, e)) => {
+            Err((_, _, false)) => {
+                // The file moved or vanished mid-run (organize/delete): leave it pending, the next
+                // pass sees it at its new place.
+            }
+            Err((id, e, true)) => {
                 log::warn!("analysis failed for {id}: {e}");
                 // Record the attempt so a broken file is not retried on every pass.
                 tx.execute(
@@ -413,10 +417,10 @@ pub fn run(
         if rows.is_empty() {
             break;
         }
-        let outs: Vec<Result<FileOut, (i64, String)>> = pool.install(|| {
+        let outs: Vec<Result<FileOut, (i64, String, bool)>> = pool.install(|| {
             rows.par_iter()
                 .map(|f| {
-                    let r = analyze_one(f, cache, engine).map_err(|e| (f.id, format!("{e:#}")));
+                    let r = analyze_one(f, cache, engine).map_err(|e| (f.id, format!("{e:#}"), f.abs_path().exists()));
                     let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                     let eta = if d > 0 { (started.elapsed().as_secs_f64() / d as f64 * (total.saturating_sub(d)) as f64) as u64 } else { 0 };
                     progress(Progress::new("analysis", "analyze", d, total, format!("{}|{eta}", f.name)));

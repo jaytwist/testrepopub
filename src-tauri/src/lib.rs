@@ -24,6 +24,11 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_updater::UpdaterExt;
 
+mod lane;
+
+use lane::{Lane, LaneStatus};
+use media_core::analysis::{self, AnalysisOptions};
+
 type CmdResult<T> = Result<T, String>;
 
 fn err<E: std::fmt::Display>(e: E) -> String {
@@ -38,6 +43,12 @@ struct AppState {
     stop: StopFlag,
     job: Mutex<Option<String>>,
     plans: Mutex<HashMap<String, Arc<Plan>>>,
+    lane: Arc<Lane>,
+}
+
+/// Recompute data derived from the per-file analysis (bursts, places, trips, people).
+pub(crate) fn post_analysis(_st: &AppState) -> anyhow::Result<()> {
+    Ok(())
 }
 
 #[derive(Clone, Serialize)]
@@ -62,6 +73,8 @@ where
         *j = Some(name.to_string());
     }
     state.stop.reset();
+    // Background analysis yields to anything the user starts.
+    state.lane.set_job_active(app, true);
     let app = app.clone();
     let name = name.to_string();
     std::thread::spawn(move || {
@@ -78,6 +91,10 @@ where
         };
         let res = f(&st, &progress);
         *st.job.lock().unwrap() = None;
+        st.lane.set_job_active(&app, false);
+        if name == "scan" {
+            st.lane.kick(&app, false);
+        }
         let done = match res {
             Ok(r) => JobDone { job: name, ok: true, error: None, result: serde_json::to_value(r).unwrap_or_default() },
             Err(e) => JobDone { job: name, ok: false, error: Some(format!("{e:#}")), result: serde_json::Value::Null },
@@ -142,13 +159,17 @@ fn remove_source(state: State<AppState>, id: i64) -> CmdResult<()> {
 #[tauri::command]
 fn start_scan(app: AppHandle, state: State<AppState>, source_id: Option<i64>) -> CmdResult<()> {
     spawn_job(&app, &state, "scan", move |st, progress| {
-        let opts = userfiles::load_options(&st.db.conn()?)?;
+        let conn = st.db.conn()?;
+        let opts = userfiles::load_options(&conn)?;
+        let auto_analysis = analysis::load_options(&conn)?.auto;
+        drop(conn);
         let stats = match source_id {
             Some(id) => vec![scanner::scan_source(&st.db, id, &opts, &st.stop, progress)?],
             None => scanner::scan_all(&st.db, &opts, &st.stop, progress)?,
         };
-        // Thumbnails right away, so the drive can be unplugged and still browsed.
-        let warm = thumbs::warm(&st.db, &st.thumbs, &st.stop, progress)?;
+        // With background analysis on, thumbnails come from its single-read pass right after this
+        // job; otherwise make them here so the drive can be unplugged and still browsed.
+        let warm = if auto_analysis { thumbs::WarmStats::default() } else { thumbs::warm(&st.db, &st.thumbs, &st.stop, progress)? };
         Ok(serde_json::json!({ "scan": stats, "thumbs": warm }))
     })
 }
@@ -218,6 +239,47 @@ fn suggested_folders(app: AppHandle, state: State<AppState>) -> CmdResult<Vec<Su
         });
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Background analysis
+// ---------------------------------------------------------------------------------------------
+
+#[tauri::command]
+fn analysis_status(app: AppHandle, state: State<AppState>) -> LaneStatus {
+    state.lane.status(&app)
+}
+
+#[tauri::command]
+fn analysis_pause(app: AppHandle, state: State<AppState>, paused: bool) {
+    state.lane.set_user_paused(&app, paused);
+}
+
+#[tauri::command]
+fn analysis_start(app: AppHandle, state: State<AppState>) {
+    state.lane.set_user_paused(&app, false);
+    state.lane.kick(&app, true);
+}
+
+#[tauri::command]
+fn get_analysis_options(state: State<AppState>) -> CmdResult<AnalysisOptions> {
+    let conn = state.db.conn().map_err(err)?;
+    analysis::load_options(&conn).map_err(err)
+}
+
+#[tauri::command]
+fn set_analysis_options(app: AppHandle, state: State<AppState>, options: AnalysisOptions) -> CmdResult<()> {
+    let conn = state.db.conn().map_err(err)?;
+    let before = analysis::load_options(&conn).map_err(err)?;
+    analysis::save_options(&conn, &options).map_err(err)?;
+    if before.faces != options.faces || before.gpu != options.gpu {
+        state.lane.reset_engine();
+    }
+    // Turning people on (or auto back on) starts work right away.
+    if (options.faces && !before.faces) || (options.auto && !before.auto) {
+        state.lane.kick(&app, true);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -694,6 +756,16 @@ pub fn run() {
                 stop: StopFlag::new(),
                 job: Mutex::new(None),
                 plans: Mutex::new(HashMap::new()),
+                lane: Arc::new(Lane::default()),
+            });
+            // Resume background analysis a few seconds after start (let the window settle first).
+            let handle = app.handle().clone();
+            let st = app.state::<AppState>();
+            st.lane.watch_power(&handle);
+            let lane = st.lane.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                lane.kick(&handle, false);
             });
             Ok(())
         })
@@ -704,6 +776,11 @@ pub fn run() {
             add_source,
             remove_source,
             start_scan,
+            analysis_status,
+            analysis_pause,
+            analysis_start,
+            get_analysis_options,
+            set_analysis_options,
             get_scan_options,
             set_scan_options,
             default_scan_options,
