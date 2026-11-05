@@ -9,6 +9,7 @@ import { useJob, type LibraryPreset } from "../App";
 import FilterBar from "../components/FilterBar";
 import Viewer from "../components/Viewer";
 import TimelineScrubber, { type ScrubSegment } from "../components/TimelineScrubber";
+import Compare from "../components/Compare";
 
 /** Items fetched per request inside one group. */
 const PAGE = 300;
@@ -100,6 +101,7 @@ export default function Library({ preset, onClearPreset, onConsumePreset }: Libr
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [anchor, setAnchor] = useState<number | null>(null);
   const [viewId, setViewId] = useState<number | null>(null);
+  const [comparing, setComparing] = useState<number[] | null>(null);
   const [bulk, setBulk] = useState<"label" | "date" | null>(null);
   const [bulkValue, setBulkValue] = useState("");
   const [busyGroup, setBusyGroup] = useState<string | null>(null);
@@ -259,8 +261,11 @@ export default function Library({ preset, onClearPreset, onConsumePreset }: Libr
     if (!s) return;
     const top = s.getBoundingClientRect().top;
     for (const it of Array.from(s.querySelectorAll<HTMLElement>("[data-index]"))) {
-      if (it.getBoundingClientRect().bottom > top + 1) {
-        setTopRow(Number(it.dataset.index));
+      const r = it.getBoundingClientRect();
+      if (r.bottom > top + 1) {
+        // Fractional: how far into this row the top of the view is (smooth position line).
+        const into = r.height > 0 ? Math.min(1, Math.max(0, (top - r.top) / r.height)) : 0;
+        setTopRow(Number(it.dataset.index) + into);
         return;
       }
     }
@@ -289,6 +294,7 @@ export default function Library({ preset, onClearPreset, onConsumePreset }: Libr
     const t = setTimeout(measureTop, 50);
     return () => clearTimeout(t);
   }, [rows, measureTop]);
+  const wheelBy = useCallback((dy: number) => scrollEl.current?.scrollBy({ top: dy }), []);
   const jumpTo = useCallback((row: number) => virtuoso.current?.scrollToIndex({ index: row, align: "start" }), []);
 
   /** Load whatever pages the visible rows (plus a margin) need. */
@@ -627,6 +633,14 @@ export default function Library({ preset, onClearPreset, onConsumePreset }: Libr
           <b>{fmtCount(selected.size)}개 선택</b>
           <button className="btn small" onClick={() => { setBulk("label"); setBulkValue(""); }}>라벨 추가</button>
           <button className="btn small" onClick={() => { setBulk("date"); setBulkValue(""); }}>날짜 지정</button>
+          <button
+            className="btn small"
+            disabled={selected.size < 2 || selected.size > 4}
+            onClick={() => setComparing(Array.from(selected))}
+            title={selected.size > 4 ? "한 번에 4장까지 비교할 수 있습니다" : "골라 둔 2–4장을 나란히 비교"}
+          >
+            ⇆ 비교{selected.size > 4 ? " (최대 4장)" : ""}
+          </button>
           <button className="btn small danger" disabled={!!running} onClick={deleteSelected} title="Delete 키">🗑 삭제</button>
           <button className="btn small ghost" onClick={selectAll}>필터 결과 전체 선택</button>
           <button className="btn small ghost" onClick={() => setSelected(new Set())}>선택 해제</button>
@@ -672,9 +686,11 @@ export default function Library({ preset, onClearPreset, onConsumePreset }: Libr
             rangeChanged={loadRange}
             itemContent={(_, r) => (r.type === "header" ? header(r.g) : tiles(r.g, r.row))}
           />
-          {showScrub && <TimelineScrubber segments={segments} topRow={topRow} onJump={jumpTo} />}
+          {showScrub && <TimelineScrubber segments={segments} totalRows={rows.length} topRow={topRow} onJump={jumpTo} onWheel={wheelBy} />}
         </div>
       )}
+
+      {comparing && <Compare ids={comparing} onClose={() => setComparing(null)} />}
 
       {viewIndex != null && (
         <Viewer

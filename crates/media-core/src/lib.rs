@@ -3,9 +3,12 @@
 //! The Tauri shell (`src-tauri`) is a thin command layer over this crate, so all of the
 //! scanning, labeling, de-duplication and organizing logic can be tested headlessly.
 
+/// Re-exported so the app can pass connections around without its own dependency.
+pub use rusqlite;
 pub mod db;
 pub mod analysis;
 pub mod cleanup;
+pub mod compare;
 pub mod dedupe;
 pub mod faces;
 pub mod identity;

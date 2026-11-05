@@ -477,7 +477,32 @@ struct FileDetail {
 #[tauri::command]
 fn file_detail(state: State<AppState>, id: i64) -> CmdResult<FileDetail> {
     let conn = state.db.conn().map_err(err)?;
-    let f = db::get_file(&conn, id).map_err(err)?.ok_or("not found")?;
+    detail_of(&state, &conn, id)
+}
+
+#[derive(Serialize)]
+struct CompareInfo {
+    files: Vec<FileDetail>,
+    #[serde(flatten)]
+    comparison: media_core::compare::Comparison,
+}
+
+/// Several files side by side: details, which are byte-identical, which one to keep.
+#[tauri::command]
+async fn compare_files(app: AppHandle, ids: Vec<i64>) -> CmdResult<CompareInfo> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let conn = state.db.conn().map_err(err)?;
+        let files = ids.iter().map(|id| detail_of(&state, &conn, *id)).collect::<CmdResult<Vec<_>>>()?;
+        let comparison = media_core::compare::compare(&conn, &ids).map_err(err)?;
+        Ok(CompareInfo { files, comparison })
+    })
+    .await
+    .map_err(err)?
+}
+
+fn detail_of(state: &AppState, conn: &media_core::rusqlite::Connection, id: i64) -> CmdResult<FileDetail> {
+    let f = db::get_file(conn, id).map_err(err)?.ok_or("not found")?;
     Ok(FileDetail {
         reasons: media_core::cleanup::reasons(&conn, id).map_err(err)?,
         labels: labels::labels_for(&conn, id).map_err(err)?,
@@ -927,6 +952,7 @@ pub fn run() {
             start_scan,
             cleanup_summary,
             trips_summary,
+            compare_files,
             people_list,
             person_faces,
             people_suggestions,

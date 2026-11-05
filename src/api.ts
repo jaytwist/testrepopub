@@ -41,6 +41,7 @@ export interface GroupRow {
   volume_id: number | null; dir: string | null; mount: string | null; volume_label: string | null;
   burst_id: number | null; first_taken: number | null;
 }
+export interface CompareInfo { files: FileDetail[]; identical: number[][]; recommended: number | null }
 export interface PersonRow { id: number; name: string | null; cover_face_id: number | null; photos: number; hidden: boolean }
 export interface FaceRow { id: number; file_id: number; locked: boolean }
 export interface PairSuggestion { a: PersonRow; b: PersonRow; similarity: number }
@@ -144,6 +145,7 @@ export const api = {
   getScanOptions: () => invoke<ScanOptions>("get_scan_options"),
   cleanupSummary: () => invoke<CleanupSummary>("cleanup_summary"),
   tripsSummary: () => invoke<TripsSummary>("trips_summary"),
+  compareFiles: (ids: number[]) => invoke<CompareInfo>("compare_files", { ids }),
   peopleList: (includeHidden = false) => invoke<PersonRow[]>("people_list", { includeHidden }),
   personFaces: (person: number) => invoke<FaceRow[]>("person_faces", { person }),
   peopleSuggestions: () => invoke<PairSuggestion[]>("people_suggestions"),

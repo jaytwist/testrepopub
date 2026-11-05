@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import { absPath, api, fmtBytes, fmtCount, fmtDate, thumbUrl, type DupGroup, type DupSummary } from "../api";
 import { useJob } from "../App";
+import Compare from "../components/Compare";
 
 const KINDS = [
   { id: "exact", title: "완전히 같은 파일", desc: "바이트 단위로 동일한 파일 (여러 드라이브에 복사된 사본)", safe: true },
@@ -16,6 +17,7 @@ export default function Duplicates() {
   const [groups, setGroups] = useState<DupGroup[]>([]);
   const [similarity, setSimilarity] = useState("high");
   const [error, setError] = useState<string | null>(null);
+  const [comparing, setComparing] = useState<number[] | null>(null);
   const [limit, setLimit] = useState(50);
 
   const reload = () => {
@@ -110,7 +112,10 @@ export default function Duplicates() {
           <div key={g.id} className="dup-group">
             <div className="row-between">
               <span className="muted small">{g.members.length}개 · {fmtBytes(g.reclaimable_bytes)} 확보 가능</span>
-              <button className="btn small" disabled={!!running || !g.members.some((m) => m.keep)} onClick={() => apply([g.id])}>이 그룹만 적용</button>
+              <span className="btn-row">
+                <button className="btn small" onClick={() => setComparing(g.members.slice(0, 4).map((m) => m.file.id))} title="나란히 놓고 날짜·폴더·크기 비교">⇆ 비교</button>
+                <button className="btn small" disabled={!!running || !g.members.some((m) => m.keep)} onClick={() => apply([g.id])}>이 그룹만 적용</button>
+              </span>
             </div>
             <div className="dup-members">
               {g.members.map((m) => (
@@ -135,6 +140,7 @@ export default function Duplicates() {
         {groups.length >= limit && <button className="btn" onClick={() => setLimit(limit + 50)}>더 보기</button>}
         {cur == null && <div className="empty small"><p>위에서 「찾기」를 누르면 결과가 여기에 표시됩니다.</p></div>}
       </div>
+      {comparing && <Compare ids={comparing} onClose={() => setComparing(null)} />}
     </div>
   );
 }

@@ -98,3 +98,40 @@ fn moved_renamed_and_copied_files_are_not_read_again() {
     let live = db::query_ids(&conn, &FileFilter::default()).unwrap();
     assert_eq!(live.len(), 10);
 }
+
+/// Comparing a few files: byte-identical copies are recognised (full hash computed once and
+/// stored), a same-size but different file is not, and a keeper is recommended.
+#[test]
+fn compare_finds_identical_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let a = drive(root, "diskA");
+    let b = drive(root, "diskB");
+    write_jpeg(&a.join("DCIM/IMG_1.jpg"), &picture(1, 900, 600), Some(("2023:05:01 10:00:00", "Apple", "iPhone 13")));
+    fs::create_dir_all(b.join("backup")).unwrap();
+    fs::copy(a.join("DCIM/IMG_1.jpg"), b.join("backup/IMG_1.jpg")).unwrap(); // new mtime: indexed as a new file
+    let mut other = fs::read(a.join("DCIM/IMG_1.jpg")).unwrap();
+    let n = other.len();
+    other[n / 2] ^= 0xFF;
+    fs::write(b.join("backup/IMG_1_edit.jpg"), &other).unwrap();
+    write_jpeg(&a.join("small/IMG_1_small.jpg"), &picture(1, 450, 300), None);
+
+    let db = Db::open(root.join("appdata/library.db")).unwrap();
+    let conn = db.conn().unwrap();
+    volumes::add_source(&conn, &a).unwrap();
+    volumes::add_source(&conn, &b).unwrap();
+    scanner::scan_all(&db, &ScanOptions::default(), &StopFlag::new(), &quiet).unwrap();
+    let orig = id_of(&conn, "DCIM/IMG_1.jpg").unwrap();
+    let copy = id_of(&conn, "backup/IMG_1.jpg").unwrap();
+    let edit = id_of(&conn, "backup/IMG_1_edit.jpg").unwrap();
+    let small = id_of(&conn, "small/IMG_1_small.jpg").unwrap();
+
+    let c = media_core::compare::compare(&conn, &[small, edit, copy, orig]).unwrap();
+    let mut pair = vec![orig, copy];
+    pair.sort();
+    assert_eq!(c.identical, vec![pair], "same size + same bytes only");
+    assert!(c.recommended == Some(orig) || c.recommended == Some(copy), "full resolution with EXIF is kept: {c:?}");
+    // Hashes were stored: comparing again reads nothing.
+    let hashed: i64 = conn.query_row("SELECT COUNT(*) FROM files WHERE hash IS NOT NULL", [], |r| r.get(0)).unwrap();
+    assert_eq!(hashed, 3);
+}
