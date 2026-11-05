@@ -487,6 +487,65 @@ struct CompareInfo {
     comparison: media_core::compare::Comparison,
 }
 
+/// Photos that look like this one (resized / recompressed / edited copies), most similar first.
+#[tauri::command]
+fn similar_to(state: State<AppState>, id: i64) -> CmdResult<Vec<i64>> {
+    let conn = state.db.conn().map_err(err)?;
+    media_core::compare::similar_to(&conn, id, 3).map_err(err)
+}
+
+/// Before the backup check: fingerprint older entries that could have a copy (once).
+#[tauri::command]
+async fn prepare_copies(app: AppHandle) -> CmdResult<usize> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let conn = st.db.conn().map_err(err)?;
+        volumes::refresh(&conn).map_err(err)?;
+        media_core::identity::backfill_prehashes(&conn).map_err(err)
+    })
+    .await
+    .map_err(err)?
+}
+
+#[derive(Clone, Serialize)]
+struct DriveConnected {
+    volume_id: i64,
+    label: String,
+}
+
+/// Notice drives being plugged in (every few seconds) so the UI can offer "check for new files".
+/// Only drives that hold a registered folder are announced.
+fn watch_drives(app: &AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let mut known: Option<std::collections::HashSet<i64>> = None;
+        loop {
+            let online = (|| -> anyhow::Result<(std::collections::HashSet<i64>, Vec<(i64, String)>)> {
+                let st = app.state::<AppState>();
+                let conn = st.db.conn()?;
+                volumes::refresh(&conn)?;
+                let mut set = std::collections::HashSet::new();
+                let mut labels = Vec::new();
+                for s in db::list_sources(&conn)?.into_iter().filter(|s| s.online) {
+                    if set.insert(s.volume_id) {
+                        labels.push((s.volume_id, s.volume_label));
+                    }
+                }
+                Ok((set, labels))
+            })();
+            if let Ok((set, labels)) = online {
+                if let Some(prev) = &known {
+                    for (id, label) in labels.into_iter().filter(|(id, _)| !prev.contains(id)) {
+                        let _ = app.emit("drive-connected", DriveConnected { volume_id: id, label });
+                    }
+                }
+                known = Some(set);
+            }
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
+    });
+}
+
 /// Several files side by side: details, which are byte-identical, which one to keep.
 #[tauri::command]
 async fn compare_files(app: AppHandle, ids: Vec<i64>) -> CmdResult<CompareInfo> {
@@ -932,6 +991,7 @@ pub fn run() {
             let handle = app.handle().clone();
             let st = app.state::<AppState>();
             st.lane.watch_power(&handle);
+            watch_drives(&handle);
             let lane = st.lane.clone();
             std::thread::spawn(move || {
                 // Libraries scanned before places existed already have GPS: name them now.
@@ -953,6 +1013,8 @@ pub fn run() {
             cleanup_summary,
             trips_summary,
             compare_files,
+            similar_to,
+            prepare_copies,
             people_list,
             person_faces,
             people_suggestions,

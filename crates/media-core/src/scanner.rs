@@ -317,6 +317,8 @@ pub fn scan_all(db: &Db, opts: &ScanOptions, stop: &StopFlag, progress: Progress
         }
         out.push(scan_source(db, id, opts, stop, progress)?);
     }
+    // Older entries that could have a copy get their content fingerprint (once).
+    identity::backfill_prehashes(&db.conn()?)?;
     Ok(out)
 }
 

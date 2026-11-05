@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useState } from "react";
 import {
-  api, onAnalysisStatus, onJobDone, onProgress, onUpdateProgress, type AppInfo, type FileFilter, type GroupBy, type JobDone,
+  api, onAnalysisStatus, onDriveConnected, onJobDone, onProgress, onUpdateProgress, type AppInfo, type FileFilter, type GroupBy, type JobDone,
   type LaneStatus, type LibraryStats, type Progress, type UpdateInfo, type UpdateProgress, fmtBytes, fmtCount, fmtEta,
 } from "./api";
 import Library from "./pages/Library";
@@ -102,6 +102,23 @@ export default function App() {
   const [stats, setStats] = useState<LibraryStats | null>(null);
   const [info, setInfo] = useState<AppInfo | null>(null);
   const [toast, setToast] = useState<{ ok: boolean; text: string } | null>(null);
+  /** A drive with registered folders was just plugged in. */
+  const [plugged, setPlugged] = useState<{ volume_id: number; label: string } | null>(null);
+  useEffect(() => {
+    const un = onDriveConnected(setPlugged);
+    return () => {
+      un.then((u) => u());
+    };
+  }, []);
+  const checkPlugged = async () => {
+    setPlugged(null);
+    try {
+      await api.startScan();
+      setRunning("scan");
+    } catch (e) {
+      setToast({ ok: false, text: String(e) });
+    }
+  };
   const [update, setUpdate] = useState<UpdateInfo | null>(null);
   const [updating, setUpdating] = useState<UpdateProgress | null>(null);
   const [checking, setChecking] = useState(false);
@@ -309,6 +326,13 @@ export default function App() {
           </div>
         )}
         {toast && <div className={`toast ${toast.ok ? "ok" : "bad"}`} onClick={() => setToast(null)}>{toast.text}</div>}
+        {plugged && (
+          <div className="toast ok drive-toast">
+            <span>⏏ <b>{plugged.label}</b> 드라이브가 연결되었습니다</span>
+            <button className="btn small primary" disabled={!!running} onClick={checkPlugged}>새 파일 확인</button>
+            <button className="btn small ghost" onClick={() => setPlugged(null)}>닫기</button>
+          </div>
+        )}
       </div>
     </JobContext.Provider>
     </NavContext.Provider>

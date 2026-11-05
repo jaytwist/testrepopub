@@ -13,7 +13,11 @@ import Compare from "../components/Compare";
 
 /** Items fetched per request inside one group. */
 const PAGE = 300;
-const TILE = 168;
+/** Thumbnail size: adjustable (Ctrl+wheel / slider), remembered. */
+const TILE_DEFAULT = 168;
+const TILE_MIN = 96;
+const TILE_MAX = 320;
+const clampTile = (v: number) => Math.round(Math.min(TILE_MAX, Math.max(TILE_MIN, v)));
 const GAP = 4;
 /** Approximate list heights (CSS .group-head / .tile-row), for the date scrubber's proportions. */
 const HEAD_PX = 48;
@@ -98,6 +102,12 @@ export default function Library({ preset, onClearPreset, onConsumePreset }: Libr
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [cacheTick, setCacheTick] = useState(0);
   const [cols, setCols] = useState(6);
+  const [tile, setTile] = useState(() => clampTile(Number(store.get("mo.tileSize")) || TILE_DEFAULT));
+  const changeTile = useCallback((v: number) => {
+    const t = clampTile(v);
+    setTile(t);
+    store.set("mo.tileSize", String(t));
+  }, []);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [anchor, setAnchor] = useState<number | null>(null);
   const [viewId, setViewId] = useState<number | null>(null);
@@ -156,7 +166,12 @@ export default function Library({ preset, onClearPreset, onConsumePreset }: Libr
   // --- loading ---
 
   /** The filter actually sent to the backend (stacking applies outside the burst view). */
-  const qf: FileFilter = useMemo(() => ({ ...filter, stack_bursts: stack && groupBy !== "burst" }), [filter, stack, groupBy]);
+  /** "Show only the selection": the ids frozen when it was turned on. */
+  const [onlySel, setOnlySel] = useState<number[] | null>(null);
+  const qf: FileFilter = useMemo(
+    () => ({ ...filter, stack_bursts: stack && groupBy !== "burst", ...(onlySel ? { ids: onlySel } : {}) }),
+    [filter, stack, groupBy, onlySel],
+  );
 
   const reload = useCallback(() => {
     const g = ++gen.current;
@@ -227,10 +242,10 @@ export default function Library({ preset, onClearPreset, onConsumePreset }: Libr
   useEffect(() => {
     const el = wrapRef.current;
     if (!el) return;
-    const ro = new ResizeObserver(() => setCols(Math.max(2, Math.floor((el.clientWidth - 24 - scrubW) / (TILE + GAP)))));
+    const ro = new ResizeObserver(() => setCols(Math.max(2, Math.floor((el.clientWidth - 24 - scrubW) / (tile + GAP)))));
     ro.observe(el);
     return () => ro.disconnect();
-  }, [scrubW]);
+  }, [scrubW, tile]);
 
   const { rows, segments } = useMemo(() => {
     const out: Row[] = [];
@@ -244,13 +259,13 @@ export default function Library({ preset, onClearPreset, onConsumePreset }: Libr
         month: g.key.startsWith("m:") ? g.month : null,
         label: groupTitle(g).title,
         startRow: out.length,
-        px: (folded ? HEAD_FOLDED_PX : HEAD_PX) + n * (TILE + GAP),
+        px: (folded ? HEAD_FOLDED_PX : HEAD_PX) + n * (tile + GAP),
       });
       out.push({ type: "header", key: `h:${g.key}`, g });
       for (let r = 0; r < n; r++) out.push({ type: "tiles", key: `t:${g.key}:${r}`, g, row: r });
     }
     return { rows: out, segments: segs };
-  }, [groups, collapsed, cols]);
+  }, [groups, collapsed, cols, tile]);
 
   const virtuoso = useRef<VirtuosoHandle>(null);
   const [topRow, setTopRow] = useState(0);
@@ -349,9 +364,127 @@ export default function Library({ preset, onClearPreset, onConsumePreset }: Libr
     }
   }, [review, flat]);
 
+  // --- drag a box to select (also started on a photo; a plain click still opens it) ---
+  const gridRef = useRef<HTMLDivElement>(null);
+  const suppressClick = useRef(false);
+  const dragSel = useRef<{ x0: number; y0: number; x: number; y: number; base: Set<number>; hits: Set<number>; active: boolean } | null>(null);
+  const [selRect, setSelRect] = useState<{ l: number; t: number; w: number; h: number } | null>(null);
+
+  const evalDrag = useCallback(() => {
+    const d = dragSel.current;
+    const g = gridRef.current;
+    if (!d || !g) return;
+    const gr = g.getBoundingClientRect();
+    const [l, r] = [Math.min(d.x0, d.x), Math.max(d.x0, d.x)];
+    const [t, b] = [Math.min(d.y0, d.y), Math.max(d.y0, d.y)];
+    setSelRect({ l: l - gr.left, t: t - gr.top, w: r - l, h: b - t });
+    for (const el of Array.from(g.querySelectorAll<HTMLElement>(".tile[data-id]"))) {
+      const er = el.getBoundingClientRect();
+      if (er.right > l && er.left < r && er.bottom > t && er.top < b) d.hits.add(Number(el.dataset.id));
+    }
+    setSelected(new Set([...d.base, ...d.hits]));
+  }, []);
+
+  // While dragging near the top/bottom edge, keep scrolling (and keep collecting photos).
+  const autoScroll = useCallback(() => {
+    const d = dragSel.current;
+    const s = scrollEl.current;
+    if (!d?.active || !s) return;
+    const sr = s.getBoundingClientRect();
+    const edge = 48;
+    const dy = d.y < sr.top + edge ? -(sr.top + edge - d.y) / 2 : d.y > sr.bottom - edge ? (d.y - (sr.bottom - edge)) / 2 : 0;
+    if (dy !== 0) {
+      s.scrollBy({ top: dy });
+      evalDrag();
+    }
+    requestAnimationFrame(autoScroll);
+  }, [evalDrag]);
+
+  const onGridPointerDown = (e: React.PointerEvent) => {
+    if (e.button !== 0 || (e.target as HTMLElement).closest("button, input, a, .scrubber, .group-head")) return;
+    const keep = e.ctrlKey || e.metaKey || e.shiftKey;
+    dragSel.current = { x0: e.clientX, y0: e.clientY, x: e.clientX, y: e.clientY, base: keep ? new Set(selected) : new Set(), hits: new Set(), active: false };
+  };
+  const onGridPointerMove = (e: React.PointerEvent) => {
+    const d = dragSel.current;
+    if (!d) return;
+    d.x = e.clientX;
+    d.y = e.clientY;
+    if (!d.active) {
+      if (Math.hypot(d.x - d.x0, d.y - d.y0) < 8) return;
+      d.active = true;
+      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+      requestAnimationFrame(autoScroll);
+    }
+    evalDrag();
+  };
+  const onGridPointerUp = () => {
+    const d = dragSel.current;
+    dragSel.current = null;
+    if (d?.active) {
+      setSelRect(null);
+      setAnchor(null);
+      // The click that ends a drag must not open the photo under the pointer.
+      suppressClick.current = true;
+      setTimeout(() => (suppressClick.current = false), 60);
+    }
+  };
+
+  // Ctrl + wheel over the grid: bigger / smaller thumbnails (instead of zooming the whole page).
+  useEffect(() => {
+    const g = gridRef.current;
+    if (!g) return;
+    const onWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey) return;
+      e.preventDefault();
+      changeTile(tile * Math.exp(-e.deltaY * 0.0015));
+    };
+    g.addEventListener("wheel", onWheel, { passive: false });
+    return () => g.removeEventListener("wheel", onWheel);
+  });
+
+  // Selection summary: how many, how big, which dates.
+  const [selInfo, setSelInfo] = useState<FilteredStats | null>(null);
+  useEffect(() => {
+    if (selected.size === 0) {
+      setSelInfo(null);
+      return;
+    }
+    const t = setTimeout(() => api.filteredStats({ ids: Array.from(selected) }).then(setSelInfo).catch(() => {}), 250);
+    return () => clearTimeout(t);
+  }, [selected]);
+  useEffect(() => {
+    if (selected.size === 0 && onlySel) setOnlySel(null);
+  }, [selected, onlySel]);
+  const toggleOnlySel = () => {
+    const ids = onlySel ? Array.from(selected) : Array.from(selected);
+    // Keep the selection across the reload that changing the view causes.
+    pendingSelect.current = { ids, filter, version };
+    setOnlySel(onlySel ? null : ids);
+  };
+
+  // Backup check: needs content fingerprints for older entries (computed once, quickly).
+  const [checkingCopies, setCheckingCopies] = useState(false);
+  const setCopies = async (copies: FileFilter["copies"]) => {
+    if (copies) {
+      setCheckingCopies(true);
+      try {
+        await api.prepareCopies();
+      } catch {
+        /* the filter still works with what is known */
+      }
+      setCheckingCopies(false);
+    }
+    setFilter({ ...filter, copies: copies ?? null });
+  };
+
   // --- selection ---
 
   const onTileClick = (e: React.MouseEvent, id: number) => {
+    if (suppressClick.current) {
+      suppressClick.current = false;
+      return;
+    }
     const index = flatIndex.get(id) ?? 0;
     if (e.shiftKey && anchor != null) {
       const [a, b] = [Math.min(anchor, index), Math.max(anchor, index)];
@@ -518,15 +651,16 @@ export default function Library({ preset, onClearPreset, onConsumePreset }: Libr
     for (let i = start; i < end; i++) {
       const item = a?.[i];
       if (!item) {
-        cells.push(<div key={`s${i}`} className="tile skeleton" style={{ width: TILE, height: TILE }} />);
+        cells.push(<div key={`s${i}`} className="tile skeleton" style={{ width: tile, height: tile }} />);
         continue;
       }
       const cap = caption(item, loadedSort);
       cells.push(
         <div
           key={item.id}
+          data-id={item.id}
           className={`tile ${selected.has(item.id) ? "sel" : ""} ${item.online ? "" : "offline"}`}
-          style={{ width: TILE, height: TILE }}
+          style={{ width: tile, height: tile }}
           onClick={(e) => onTileClick(e, item.id)}
         >
           <img loading="lazy" src={thumbUrl(item.id)} alt="" draggable={false} onError={(e) => ((e.target as HTMLImageElement).style.visibility = "hidden")} />
@@ -540,11 +674,14 @@ export default function Library({ preset, onClearPreset, onConsumePreset }: Libr
           )}
           {groupBy === "burst" && item.burst_rank === 0 && <span className="badge-best">★ 베스트</span>}
           {kept.has(item.id) && <span className="badge-kept">남김</span>}
+          {(filter.copies || filter.volume_id != null) && item.copies > 0 && (
+            <span className="badge-copies" title="다른 드라이브에 똑같은 파일이 있습니다">사본 {item.copies}</span>
+          )}
         </div>,
       );
     }
     return (
-      <div className="tile-row" style={{ gridTemplateColumns: `repeat(${cols}, ${TILE}px)`, gap: GAP }}>
+      <div className="tile-row" style={{ gridTemplateColumns: `repeat(${cols}, ${tile}px)`, gap: GAP }}>
         {cells}
       </div>
     );
@@ -589,6 +726,17 @@ export default function Library({ preset, onClearPreset, onConsumePreset }: Libr
               {v.removable ? "⏏" : "⛁"} {v.label} <span className="muted">{fmtCount(v.file_count)}</span>
             </button>
           ))}
+          <span className="backup-check" title="다른 드라이브에 똑같은 파일(사본)이 있는지로 나눠 봅니다. 「이 드라이브에만」은 지우면 사라지는 사진입니다.">
+            <span className="muted small">백업 확인</span>
+            <span className="seg">
+              <button className={!filter.copies ? "on" : ""} onClick={() => setCopies(null)}>전체</button>
+              <button className={filter.copies === "only_here" ? "on" : ""} onClick={() => setCopies("only_here")}>
+                {filter.volume_id != null ? "이 드라이브에만" : "한 곳에만"}
+              </button>
+              <button className={filter.copies === "elsewhere" ? "on" : ""} onClick={() => setCopies("elsewhere")}>다른 곳에도 있음</button>
+            </span>
+            {checkingCopies && <span className="muted small"><span className="spinner" /> 확인 중…</span>}
+          </span>
         </div>
       )}
       <FilterBar filter={filter} onChange={setFilter} />
@@ -608,6 +756,10 @@ export default function Library({ preset, onClearPreset, onConsumePreset }: Libr
             <button className="btn small" onClick={unfoldAll} disabled={foldedCount === 0}>모두 펼치기</button>
           </>
         )}
+        <label className="tile-size small" title="사진 크기 (Ctrl + 마우스 휠로도 조절)">
+          <span className="muted">크기</span>
+          <input type="range" min={TILE_MIN} max={TILE_MAX} step={8} value={tile} onChange={(e) => changeTile(Number(e.target.value))} />
+        </label>
         {groupBy !== "burst" && (
           <label className="check-row small stack-toggle" title="연사로 찍은 사진을 가장 잘 나온 한 장으로 보여줍니다">
             <input type="checkbox" checked={stack} onChange={(e) => { setStack(e.target.checked); store.set("mo.stackBursts", e.target.checked ? "1" : "0"); }} />
@@ -631,6 +783,15 @@ export default function Library({ preset, onClearPreset, onConsumePreset }: Libr
       {selected.size > 0 && (
         <div className="selbar">
           <b>{fmtCount(selected.size)}개 선택</b>
+          {selInfo && (
+            <span className="muted small sel-info">
+              {fmtBytes(selInfo.bytes)}
+              {selInfo.first_taken != null && ` · ${fmtDate(selInfo.first_taken)}${selInfo.last_taken !== selInfo.first_taken ? ` ~ ${fmtDate(selInfo.last_taken)}` : ""}`}
+            </span>
+          )}
+          <button className={`btn small ${onlySel ? "primary" : "ghost"}`} onClick={toggleOnlySel} title="고른 사진만 모아서 보기">
+            {onlySel ? "전체 다시 보기" : "선택한 것만 보기"}
+          </button>
           <button className="btn small" onClick={() => { setBulk("label"); setBulkValue(""); }}>라벨 추가</button>
           <button className="btn small" onClick={() => { setBulk("date"); setBulkValue(""); }}>날짜 지정</button>
           <button
@@ -674,7 +835,15 @@ export default function Library({ preset, onClearPreset, onConsumePreset }: Libr
           )}
         </div>
       ) : (
-        <div className="grid-wrap">
+        <div
+          className={`grid-wrap ${selRect ? "selecting" : ""}`}
+          ref={gridRef}
+          onPointerDown={onGridPointerDown}
+          onPointerMove={onGridPointerMove}
+          onPointerUp={onGridPointerUp}
+          onPointerCancel={onGridPointerUp}
+        >
+          {selRect && <div className="sel-rect" style={{ left: selRect.l, top: selRect.t, width: selRect.w, height: selRect.h }} />}
           <Virtuoso
             ref={virtuoso}
             scrollerRef={onScrollerRef}

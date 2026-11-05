@@ -380,6 +380,20 @@ pub struct GridItem {
     pub burst_size: Option<i64>,
     pub burst_rank: Option<i64>,
     pub burst_id: Option<i64>,
+    /// Byte-identical copies of this file on other drives (backup check).
+    pub copies: i64,
+}
+
+/// SQL: file `g` has the same content as file `f` — the full hashes when both are known,
+/// otherwise the 64 KiB content fingerprint (size + first 64 KiB), which is stored at scan time.
+pub const SAME_CONTENT_SQL: &str = "g.size = f.size AND (CASE WHEN g.hash IS NOT NULL AND f.hash IS NOT NULL THEN g.hash = f.hash \
+    ELSE g.prehash IS NOT NULL AND g.prehash = f.prehash END)";
+
+/// SQL: a live copy of `f` exists on another drive.
+fn copy_elsewhere_sql() -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM files g WHERE g.id != f.id AND g.volume_id != f.volume_id AND g.missing = 0 AND g.quarantined = 0 AND {SAME_CONTENT_SQL})"
+    )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -425,6 +439,9 @@ pub struct FileFilter {
     pub burst_id: Option<i64>,
     /// Files of this automatic trip.
     pub trip_id: Option<i64>,
+    /// Backup check: "elsewhere" = a copy exists on another drive, "only_here" = no copy on any
+    /// other drive.
+    pub copies: Option<String>,
     /// Photos in which all of these people appear.
     pub person_ids: Option<Vec<i64>>,
     /// Show each burst as its best shot only.
@@ -582,6 +599,11 @@ impl FileFilter {
             w.push("EXISTS (SELECT 1 FROM faces fp WHERE fp.file_id = f.id AND fp.person_id = ?)".into());
             p.push(Value::Integer(*pid));
         }
+        match self.copies.as_deref() {
+            Some("elsewhere") => w.push(copy_elsewhere_sql()),
+            Some("only_here") => w.push(format!("NOT {}", copy_elsewhere_sql())),
+            _ => {}
+        }
         if let Some(t) = self.trip_id {
             w.push("EXISTS (SELECT 1 FROM trip_files tf WHERE tf.file_id = f.id AND tf.trip_id = ?)".into());
             p.push(Value::Integer(t));
@@ -686,10 +708,12 @@ pub fn query_grid(conn: &Connection, filter: &FileFilter, offset: i64, limit: i6
     let (w, p) = filter.to_sql(conn)?;
     let sql = format!(
         "SELECT f.id, f.kind, f.taken_at, f.width, f.height, f.duration_ms, v.online, f.size, f.mtime, f.name,
-                (SELECT COUNT(*) FROM bursts b2 WHERE b2.burst_id = bb.burst_id), bb.rank, bb.burst_id
+                (SELECT COUNT(*) FROM bursts b2 WHERE b2.burst_id = bb.burst_id), bb.rank, bb.burst_id,
+                (SELECT COUNT(*) FROM files g WHERE g.id != f.id AND g.volume_id != f.volume_id AND g.missing = 0 AND g.quarantined = 0 AND {same})
          FROM files f JOIN volumes v ON v.id = f.volume_id LEFT JOIN bursts bb ON bb.file_id = f.id WHERE {w}
          ORDER BY {} LIMIT {limit} OFFSET {offset}",
-        filter.order_sql()
+        filter.order_sql(),
+        same = SAME_CONTENT_SQL,
     );
     let mut st = conn.prepare(&sql)?;
     let rows = st
@@ -708,6 +732,7 @@ pub fn query_grid(conn: &Connection, filter: &FileFilter, offset: i64, limit: i6
                 burst_size: r.get::<_, Option<i64>>(10)?.filter(|n| *n > 0),
                 burst_rank: r.get(11)?,
                 burst_id: r.get(12)?,
+                copies: r.get(13)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;

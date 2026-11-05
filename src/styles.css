@@ -402,3 +402,24 @@ kbd { font: 11px/1 ui-monospace, Consolas, monospace; border: 1px solid var(--li
 .cmp-cell.diff { font-weight: 600; }
 .cmp-cell.link { color: var(--accent); cursor: pointer; }
 .cmp-foot { display: flex; align-items: center; gap: 10px; border-top: 1px solid var(--line); padding-top: 10px; }
+
+/* --- viewer zoom + context links --- */
+.zoom-box { position: relative; width: 100%; height: 100%; display: grid; place-items: center; overflow: hidden; cursor: zoom-in; touch-action: none; }
+.zoom-box.zoomed { cursor: grab; }
+.zoom-box.zoomed:active { cursor: grabbing; }
+.zoom-box img { transition: transform 0.06s linear; will-change: transform; }
+.zoom-badge { position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%); background: rgba(0, 0, 0, 0.65); color: #fff; font-size: 12px; padding: 3px 10px; border-radius: 10px; pointer-events: none; }
+.context-links { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 13px; }
+.context-links a { color: var(--accent); cursor: pointer; }
+
+/* --- library conveniences: drag-select, tile size, backup check --- */
+.grid-wrap.selecting { user-select: none; cursor: crosshair; }
+.sel-rect { position: absolute; z-index: 4; border: 1px solid var(--accent); background: color-mix(in srgb, var(--accent) 16%, transparent); border-radius: 3px; pointer-events: none; }
+.tile-size { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; }
+.tile-size input { width: 110px; }
+.tile-size + .stack-toggle { margin-left: 12px; }
+.badge-copies { position: absolute; right: 6px; bottom: 6px; font-size: 11px; font-weight: 600; color: #fff; background: rgba(22, 163, 74, 0.85); padding: 2px 7px; border-radius: 10px; }
+.backup-check { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; }
+.backup-check .seg button { padding: 3px 10px; }
+.sel-info { margin-right: 4px; }
+.drive-toast { top: 64px; display: flex; align-items: center; gap: 10px; cursor: default; }

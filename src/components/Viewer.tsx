@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 import { useNav } from "../App";
+import ZoomImage from "./ZoomImage";
+import Compare from "./Compare";
 import {
   api, DATE_SOURCE_NAMES, fileUrl, fmtBytes, fmtDuration, labelName, thumbUrl, toDatetimeLocal,
   type FileDetail, type GridItem, type LabelCount,
@@ -40,6 +42,8 @@ export default function Viewer({ items, index, onIndex, onClose, onChanged, revi
   const [editDate, setEditDate] = useState<string | null>(null);
   const [vlc, setVlc] = useState<string | null>(null);
   const [vlcMsg, setVlcMsg] = useState<string | null>(null);
+  const [comparing, setComparing] = useState<number[] | null>(null);
+  const [similarMsg, setSimilarMsg] = useState<string | null>(null);
 
   const load = () => {
     api.fileDetail(item.id).then(setDetail);
@@ -69,6 +73,29 @@ export default function Viewer({ items, index, onIndex, onClose, onChanged, revi
     api.vlcPath().then(setVlc).catch(() => {});
   }, []);
 
+  /** Show this photo's surroundings in the library: its folder, or everything from that day. */
+  const openContext = (what: "folder" | "day") => {
+    const f = detail?.file;
+    if (!f) return;
+    onClose();
+    if (what === "folder") {
+      const dir = f.rel_path.includes("/") ? f.rel_path.slice(0, f.rel_path.lastIndexOf("/")) : "";
+      const name = dir.split("/").pop() || "(최상위 폴더)";
+      nav.openLibrary({ title: `폴더: ${name}`, filter: { volume_id: f.volume_id, dir, sort: "taken", desc: false }, groupBy: "none" });
+    } else if (f.taken_at != null) {
+      const day = f.taken_at - (((f.taken_at % 86400) + 86400) % 86400);
+      nav.openLibrary({ title: `${detail!.taken.slice(0, 10)} 하루`, filter: { date_from: day, date_to: day + 86399, sort: "taken", desc: false }, groupBy: "none" });
+    }
+  };
+
+  /** Resized / recompressed / edited versions of this photo anywhere, side by side. */
+  const findSimilar = async () => {
+    setSimilarMsg(null);
+    const ids = await api.similarTo(item.id);
+    if (ids.length === 0) setSimilarMsg("다른 곳에서 비슷한 사진을 찾지 못했습니다 (사진 분석이 끝난 사진만 찾습니다)");
+    else setComparing([item.id, ...ids]);
+  };
+
   const playInVlc = () => {
     setVlcMsg(null);
     api.openInVlc(item.id).then(() => setVlcMsg("VLC에서 재생합니다")).catch((e) => setVlcMsg(String(e)));
@@ -79,6 +106,7 @@ export default function Viewer({ items, index, onIndex, onClose, onChanged, revi
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (comparing) return; // the compare screen on top handles its own keys
       if (e.key === "Escape") return close();
       if ((e.target as HTMLElement).tagName === "INPUT") return;
       if (e.key === "ArrowRight") next();
@@ -96,7 +124,7 @@ export default function Viewer({ items, index, onIndex, onClose, onChanged, revi
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [index, items.length, close, onIndex, review, item.id]);
+  }, [index, items.length, close, onIndex, review, item.id, comparing]);
 
   // Other shots of the same burst, for side-by-side comparison.
   const burst = item.burst_id != null ? items.filter((it) => it.burst_id === item.burst_id) : [];
@@ -175,7 +203,7 @@ export default function Viewer({ items, index, onIndex, onClose, onChanged, revi
             </div>
           )
         ) : src ? (
-          <img key={src} src={src} alt="" className="viewer-media" onError={() => setSrc(thumbUrl(item.id))} />
+          <ZoomImage key={src} src={src} resetKey={item.id} onError={() => setSrc(thumbUrl(item.id))} />
         ) : (
           <div className="viewer-placeholder">
             <img src={thumbUrl(item.id)} alt="" className="viewer-media dim" />
@@ -285,6 +313,12 @@ export default function Viewer({ items, index, onIndex, onClose, onChanged, revi
               <div><span>드라이브</span><b className={f.online ? "" : "warn-text"}>{f.online ? "연결됨" : "연결 안 됨"}</b></div>
             </section>
             <div className="info-path" title={detail!.abs_path}>{detail!.abs_path}</div>
+            <div className="context-links">
+              <a onClick={() => openContext("folder")}>📁 같은 폴더 사진</a>
+              {f.taken_at != null && <a onClick={() => openContext("day")}>📅 같은 날 사진</a>}
+              {f.kind !== "video" && <a onClick={findSimilar}>⧉ 비슷한 사진 찾기</a>}
+            </div>
+            {similarMsg && <div className="small muted">{similarMsg}</div>}
             <div className="btn-row">
               <button className="btn small" disabled={!f.online} onClick={() => api.revealFile(f.id)}>탐색기에서 보기</button>
               <button className="btn small" disabled={!f.online} onClick={() => api.openFile(f.id)}>기본 앱으로 열기</button>
@@ -299,6 +333,11 @@ export default function Viewer({ items, index, onIndex, onClose, onChanged, revi
           <div className="muted">불러오는 중…</div>
         )}
       </aside>
+      {comparing && (
+        <div onClick={(e) => e.stopPropagation()}>
+          <Compare ids={comparing} onClose={() => setComparing(null)} />
+        </div>
+      )}
     </div>
   );
 }

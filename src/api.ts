@@ -30,6 +30,8 @@ export interface FileFilter {
   burst_id?: number | null;
   trip_id?: number | null;
   person_ids?: number[] | null;
+  /** Backup check: "elsewhere" = also on another drive, "only_here" = on no other drive. */
+  copies?: "elsewhere" | "only_here" | null;
   stack_bursts?: boolean;
   sort?: SortKey | null;
   desc?: boolean | null;
@@ -72,6 +74,8 @@ export interface GridItem {
   id: number; kind: string; taken_at: number | null; width: number | null; height: number | null;
   duration_ms: number | null; online: boolean; size: number; mtime: number; name: string;
   burst_size: number | null; burst_rank: number | null; burst_id: number | null;
+  /** Byte-identical copies on other drives. */
+  copies: number;
 }
 export interface ValueCount { value: string; count: number }
 export interface FilterOptions { cameras: ValueCount[]; exts: ValueCount[]; years: number[]; max_size: number; with_gps: number }
@@ -146,6 +150,8 @@ export const api = {
   cleanupSummary: () => invoke<CleanupSummary>("cleanup_summary"),
   tripsSummary: () => invoke<TripsSummary>("trips_summary"),
   compareFiles: (ids: number[]) => invoke<CompareInfo>("compare_files", { ids }),
+  similarTo: (id: number) => invoke<number[]>("similar_to", { id }),
+  prepareCopies: () => invoke<number>("prepare_copies"),
   peopleList: (includeHidden = false) => invoke<PersonRow[]>("people_list", { includeHidden }),
   personFaces: (person: number) => invoke<FaceRow[]>("person_faces", { person }),
   peopleSuggestions: () => invoke<PairSuggestion[]>("people_suggestions"),
@@ -229,6 +235,9 @@ export function onUpdateProgress(cb: (p: UpdateProgress) => void): Promise<Unlis
 }
 export function onAnalysisStatus(cb: (s: LaneStatus) => void): Promise<UnlistenFn> {
   return listen<LaneStatus>("analysis-status", (e) => cb(e.payload));
+}
+export function onDriveConnected(cb: (d: { volume_id: number; label: string }) => void): Promise<UnlistenFn> {
+  return listen<{ volume_id: number; label: string }>("drive-connected", (e) => cb(e.payload));
 }
 export function onAnalysisDone(cb: () => void): Promise<UnlistenFn> {
   return listen("analysis-done", () => cb());

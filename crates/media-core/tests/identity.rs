@@ -135,3 +135,56 @@ fn compare_finds_identical_files() {
     let hashed: i64 = conn.query_row("SELECT COUNT(*) FROM files WHERE hash IS NOT NULL", [], |r| r.get(0)).unwrap();
     assert_eq!(hashed, 3);
 }
+
+/// Backup check: which photos of a drive also exist on another drive (and how many copies), and
+/// which exist only there; plus "similar to this photo" from the stored picture fingerprints.
+#[test]
+fn backup_check_and_similar_photos() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let a = drive(root, "diskA");
+    let b = drive(root, "diskB");
+    for i in 1..=3u32 {
+        write_jpeg(&a.join(format!("DCIM/IMG_{i}.jpg")), &picture(i, 900, 600), Some((&format!("2023:05:0{i} 10:00:00"), "Apple", "iPhone 13")));
+    }
+    fs::create_dir_all(b.join("backup")).unwrap();
+    fs::copy(a.join("DCIM/IMG_1.jpg"), b.join("backup/IMG_1.jpg")).unwrap();
+    write_jpeg(&b.join("small/IMG_3_small.jpg"), &picture(3, 450, 300), None);
+
+    let db = Db::open(root.join("appdata/library.db")).unwrap();
+    let mut conn = db.conn().unwrap();
+    volumes::add_source(&conn, &a).unwrap();
+    volumes::add_source(&conn, &b).unwrap();
+    let stop = StopFlag::new();
+    scanner::scan_all(&db, &ScanOptions::default(), &stop, &quiet).unwrap();
+    let tc = thumbs::ThumbCache::new(root.join("appdata/cache"));
+    analysis::run(&db, &tc, None, 2, &stop, &analysis::PauseFlag::default(), &quiet).unwrap();
+
+    let img1 = id_of(&conn, "DCIM/IMG_1.jpg").unwrap();
+    let img2 = id_of(&conn, "DCIM/IMG_2.jpg").unwrap();
+    let img3 = id_of(&conn, "DCIM/IMG_3.jpg").unwrap();
+    let small = id_of(&conn, "small/IMG_3_small.jpg").unwrap();
+    let vol_a = db::get_file(&conn, img1).unwrap().unwrap().volume_id;
+    let on_a = |copies: &str| {
+        let mut v = db::query_ids(&conn, &FileFilter { volume_id: Some(vol_a), copies: Some(copies.into()), ..Default::default() }).unwrap();
+        v.sort();
+        v
+    };
+    assert_eq!(on_a("elsewhere"), vec![img1], "IMG_1 is backed up on diskB");
+    let mut only = vec![img2, img3];
+    only.sort();
+    assert_eq!(on_a("only_here"), only, "a resized copy is not a backup");
+    let grid = db::query_grid(&conn, &FileFilter { volume_id: Some(vol_a), ..Default::default() }, 0, 10).unwrap();
+    assert_eq!(grid.iter().find(|g| g.id == img1).unwrap().copies, 1);
+    assert_eq!(grid.iter().find(|g| g.id == img2).unwrap().copies, 0);
+
+    // Older entries without a fingerprint get one (only where a same-size file exists).
+    conn.execute("UPDATE files SET prehash = NULL", []).unwrap();
+    assert!(on_a("elsewhere").is_empty());
+    assert_eq!(media_core::identity::backfill_prehashes(&conn).unwrap(), 2, "only the two same-size files are read");
+    assert_eq!(on_a("elsewhere"), vec![img1]);
+
+    // "Similar to this": the resized copy is found from the stored fingerprints.
+    assert_eq!(media_core::compare::similar_to(&conn, img3, 3).unwrap().first(), Some(&small));
+    let _ = &mut conn;
+}
