@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Virtuoso, type ListRange } from "react-virtuoso";
+import { Virtuoso, type ListRange, type VirtuosoHandle } from "react-virtuoso";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import {
   absPath, api, fmtBytes, fmtCount, fmtDate, fmtDuration, thumbUrl,
@@ -8,11 +8,16 @@ import {
 import { useJob, type LibraryPreset } from "../App";
 import FilterBar from "../components/FilterBar";
 import Viewer from "../components/Viewer";
+import TimelineScrubber, { type ScrubSegment } from "../components/TimelineScrubber";
 
 /** Items fetched per request inside one group. */
 const PAGE = 300;
 const TILE = 168;
 const GAP = 4;
+/** Approximate list heights (CSS .group-head / .tile-row), for the date scrubber's proportions. */
+const HEAD_PX = 48;
+const HEAD_FOLDED_PX = 41;
+const SCRUB_W = 56;
 
 type Row = { type: "header"; key: string; g: GroupRow } | { type: "tiles"; key: string; g: GroupRow; row: number };
 
@@ -212,25 +217,79 @@ export default function Library({ preset, onClearPreset, onConsumePreset }: Libr
     [qf],
   );
 
+  // Date scrubber on the right (chronological groupings only).
+  const showScrub = (groupBy === "month" || groupBy === "year") && (groups?.length ?? 0) > 1;
+  const scrubW = showScrub ? SCRUB_W : 0;
+
   // Columns follow the window width.
   useEffect(() => {
     const el = wrapRef.current;
     if (!el) return;
-    const ro = new ResizeObserver(() => setCols(Math.max(2, Math.floor((el.clientWidth - 24) / (TILE + GAP)))));
+    const ro = new ResizeObserver(() => setCols(Math.max(2, Math.floor((el.clientWidth - 24 - scrubW) / (TILE + GAP)))));
     ro.observe(el);
     return () => ro.disconnect();
-  }, []);
+  }, [scrubW]);
 
-  const rows: Row[] = useMemo(() => {
+  const { rows, segments } = useMemo(() => {
     const out: Row[] = [];
+    const segs: ScrubSegment[] = [];
     for (const g of groups ?? []) {
+      const folded = collapsed.has(g.key);
+      const n = folded ? 0 : Math.ceil(g.count / cols);
+      segs.push({
+        key: g.key,
+        year: g.year,
+        month: g.key.startsWith("m:") ? g.month : null,
+        label: groupTitle(g).title,
+        startRow: out.length,
+        px: (folded ? HEAD_FOLDED_PX : HEAD_PX) + n * (TILE + GAP),
+      });
       out.push({ type: "header", key: `h:${g.key}`, g });
-      if (collapsed.has(g.key)) continue;
-      const n = Math.ceil(g.count / cols);
       for (let r = 0; r < n; r++) out.push({ type: "tiles", key: `t:${g.key}:${r}`, g, row: r });
     }
-    return out;
+    return { rows: out, segments: segs };
   }, [groups, collapsed, cols]);
+
+  const virtuoso = useRef<VirtuosoHandle>(null);
+  const [topRow, setTopRow] = useState(0);
+  const scrollEl = useRef<HTMLElement | null>(null);
+  /** First row whose bottom is below the top of the scroller (Virtuoso renders data-index). */
+  const measureTop = useCallback(() => {
+    const s = scrollEl.current;
+    if (!s) return;
+    const top = s.getBoundingClientRect().top;
+    for (const it of Array.from(s.querySelectorAll<HTMLElement>("[data-index]"))) {
+      if (it.getBoundingClientRect().bottom > top + 1) {
+        setTopRow(Number(it.dataset.index));
+        return;
+      }
+    }
+  }, []);
+  const onScrollerRef = useCallback(
+    (el: HTMLElement | Window | null) => {
+      const prev = scrollEl.current;
+      if (prev) prev.onscroll = null;
+      scrollEl.current = el instanceof HTMLElement ? el : null;
+      if (scrollEl.current) {
+        let pending = false;
+        scrollEl.current.onscroll = () => {
+          if (pending) return;
+          pending = true;
+          requestAnimationFrame(() => {
+            pending = false;
+            measureTop();
+          });
+        };
+      }
+    },
+    [measureTop],
+  );
+  // The list changed under the same scroll position (grouping, folding, loading).
+  useEffect(() => {
+    const t = setTimeout(measureTop, 50);
+    return () => clearTimeout(t);
+  }, [rows, measureTop]);
+  const jumpTo = useCallback((row: number) => virtuoso.current?.scrollToIndex({ index: row, align: "start" }), []);
 
   /** Load whatever pages the visible rows (plus a margin) need. */
   const loadRange = useCallback(
@@ -601,14 +660,20 @@ export default function Library({ preset, onClearPreset, onConsumePreset }: Libr
           )}
         </div>
       ) : (
-        <Virtuoso
-          className="grid-scroller"
-          data={rows}
-          increaseViewportBy={800}
-          computeItemKey={(_, r) => r.key}
-          rangeChanged={loadRange}
-          itemContent={(_, r) => (r.type === "header" ? header(r.g) : tiles(r.g, r.row))}
-        />
+        <div className="grid-wrap">
+          <Virtuoso
+            ref={virtuoso}
+            scrollerRef={onScrollerRef}
+            className="grid-scroller"
+            style={{ height: "100%", marginRight: scrubW }}
+            data={rows}
+            increaseViewportBy={800}
+            computeItemKey={(_, r) => r.key}
+            rangeChanged={loadRange}
+            itemContent={(_, r) => (r.type === "header" ? header(r.g) : tiles(r.g, r.row))}
+          />
+          {showScrub && <TimelineScrubber segments={segments} topRow={topRow} onJump={jumpTo} />}
+        </div>
       )}
 
       {viewIndex != null && (
