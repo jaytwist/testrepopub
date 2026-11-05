@@ -188,3 +188,50 @@ fn backup_check_and_similar_photos() {
     assert_eq!(media_core::compare::similar_to(&conn, img3, 3).unwrap().first(), Some(&small));
     let _ = &mut conn;
 }
+
+/// Duplicate keep rules by folder: "keep" folders win, "drop" folders lose, and a group whose
+/// copies are all in drop folders still keeps one.
+#[test]
+fn duplicate_keep_rules() {
+    use media_core::dedupe::{self, DupKind, DupRules, Similarity};
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let a = drive(root, "diskA");
+    let b = drive(root, "diskB");
+    write_jpeg(&a.join("Photos/IMG_1.jpg"), &picture(1, 900, 600), Some(("2023:05:01 10:00:00", "Apple", "iPhone 13")));
+    fs::create_dir_all(b.join("Downloads")).unwrap();
+    fs::copy(a.join("Photos/IMG_1.jpg"), b.join("Downloads/IMG_1.jpg")).unwrap();
+
+    let db = Db::open(root.join("appdata/library.db")).unwrap();
+    let mut conn = db.conn().unwrap();
+    volumes::add_source(&conn, &a).unwrap();
+    volumes::add_source(&conn, &b).unwrap();
+    let stop = StopFlag::new();
+    scanner::scan_all(&db, &ScanOptions::default(), &stop, &quiet).unwrap();
+    dedupe::run(&db, DupKind::Exact, Similarity::High, &stop, &quiet).unwrap();
+    let orig = id_of(&conn, "Photos/IMG_1.jpg").unwrap();
+    let dl = id_of(&conn, "Downloads/IMG_1.jpg").unwrap();
+    let keeper = |conn: &rusqlite::Connection| -> Vec<i64> {
+        let g = &dedupe::list_groups(conn, "exact", 0, 10).unwrap()[0];
+        g.members.iter().filter(|m| m.keep).map(|m| m.file.id).collect()
+    };
+    let downloads = b.join("Downloads").to_string_lossy().into_owned();
+    let photos = a.join("Photos").to_string_lossy().into_owned();
+
+    // "Delete from Downloads first" → the original is kept (path case and separators don't matter).
+    DupRules { keep: vec![], drop: vec![downloads.to_uppercase().replace('/', "\\")] }.save(&conn).unwrap();
+    dedupe::apply_rules(&mut conn).unwrap();
+    assert_eq!(keeper(&conn), vec![orig]);
+    // "Always keep Downloads" → that copy wins instead.
+    DupRules { keep: vec![downloads.clone()], drop: vec![] }.save(&conn).unwrap();
+    assert_eq!(dedupe::apply_rules(&mut conn).unwrap(), 1, "one group changed keeper");
+    assert_eq!(keeper(&conn), vec![dl]);
+    // Every copy in a drop folder → still exactly one kept.
+    DupRules { keep: vec![], drop: vec![downloads, photos] }.save(&conn).unwrap();
+    dedupe::apply_rules(&mut conn).unwrap();
+    assert_eq!(keeper(&conn).len(), 1);
+    // New searches use the rules too.
+    DupRules { keep: vec![], drop: vec![b.join("Downloads").to_string_lossy().into_owned()] }.save(&conn).unwrap();
+    dedupe::run(&db, DupKind::Exact, Similarity::High, &stop, &quiet).unwrap();
+    assert_eq!(keeper(&conn), vec![orig]);
+}

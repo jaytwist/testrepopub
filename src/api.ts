@@ -43,6 +43,7 @@ export interface GroupRow {
   volume_id: number | null; dir: string | null; mount: string | null; volume_label: string | null;
   burst_id: number | null; first_taken: number | null;
 }
+export interface DupRules { keep: string[]; drop: string[] }
 export interface CompareInfo { files: FileDetail[]; identical: number[][]; recommended: number | null }
 export interface PersonRow { id: number; name: string | null; cover_face_id: number | null; photos: number; hidden: boolean }
 export interface FaceRow { id: number; file_id: number; locked: boolean }
@@ -76,6 +77,7 @@ export interface GridItem {
   burst_size: number | null; burst_rank: number | null; burst_id: number | null;
   /** Byte-identical copies on other drives. */
   copies: number;
+  favorite: boolean;
 }
 export interface ValueCount { value: string; count: number }
 export interface FilterOptions { cameras: ValueCount[]; exts: ValueCount[]; years: number[]; max_size: number; with_gps: number }
@@ -150,6 +152,10 @@ export const api = {
   cleanupSummary: () => invoke<CleanupSummary>("cleanup_summary"),
   tripsSummary: () => invoke<TripsSummary>("trips_summary"),
   compareFiles: (ids: number[]) => invoke<CompareInfo>("compare_files", { ids }),
+  getDupRules: () => invoke<DupRules>("get_dup_rules"),
+  /** Save and re-pick keepers; returns how many groups changed. */
+  setDupRules: (rules: DupRules) => invoke<number>("set_dup_rules", { rules }),
+  dupRuleSuggestions: () => invoke<[string, number][]>("dup_rule_suggestions"),
   similarTo: (id: number) => invoke<number[]>("similar_to", { id }),
   prepareCopies: () => invoke<number>("prepare_copies"),
   peopleList: (includeHidden = false) => invoke<PersonRow[]>("people_list", { includeHidden }),
@@ -321,7 +327,11 @@ export function fmtDuration(ms: number | null): string {
   return h ? `${h}:${p(m % 60)}:${p(s % 60)}` : `${m}:${p(s % 60)}`;
 }
 
+/** The user label behind ♥ favorites. */
+export const FAVORITE = "favorite";
+
 const LABEL_NAMES: Record<string, string> = {
+  favorite: "♥ 즐겨찾기",
   screenshot: "스크린샷",
   "src:kakaotalk": "카카오톡",
   "src:whatsapp": "WhatsApp",

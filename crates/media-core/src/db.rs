@@ -382,6 +382,8 @@ pub struct GridItem {
     pub burst_id: Option<i64>,
     /// Byte-identical copies of this file on other drives (backup check).
     pub copies: i64,
+    /// Marked ♥ (the user label "favorite").
+    pub favorite: bool,
 }
 
 /// SQL: file `g` has the same content as file `f` — the full hashes when both are known,
@@ -709,7 +711,8 @@ pub fn query_grid(conn: &Connection, filter: &FileFilter, offset: i64, limit: i6
     let sql = format!(
         "SELECT f.id, f.kind, f.taken_at, f.width, f.height, f.duration_ms, v.online, f.size, f.mtime, f.name,
                 (SELECT COUNT(*) FROM bursts b2 WHERE b2.burst_id = bb.burst_id), bb.rank, bb.burst_id,
-                (SELECT COUNT(*) FROM files g WHERE g.id != f.id AND g.volume_id != f.volume_id AND g.missing = 0 AND g.quarantined = 0 AND {same})
+                (SELECT COUNT(*) FROM files g WHERE g.id != f.id AND g.volume_id != f.volume_id AND g.missing = 0 AND g.quarantined = 0 AND {same}),
+                EXISTS (SELECT 1 FROM labels lf WHERE lf.file_id = f.id AND lf.label = 'favorite')
          FROM files f JOIN volumes v ON v.id = f.volume_id LEFT JOIN bursts bb ON bb.file_id = f.id WHERE {w}
          ORDER BY {} LIMIT {limit} OFFSET {offset}",
         filter.order_sql(),
@@ -733,6 +736,7 @@ pub fn query_grid(conn: &Connection, filter: &FileFilter, offset: i64, limit: i6
                 burst_rank: r.get(11)?,
                 burst_id: r.get(12)?,
                 copies: r.get(13)?,
+                favorite: r.get::<_, i64>(14)? != 0,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;

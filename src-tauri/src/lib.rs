@@ -487,6 +487,46 @@ struct CompareInfo {
     comparison: media_core::compare::Comparison,
 }
 
+#[tauri::command]
+fn get_dup_rules(state: State<AppState>) -> CmdResult<dedupe::DupRules> {
+    let conn = state.db.conn().map_err(err)?;
+    dedupe::DupRules::load(&conn).map_err(err)
+}
+
+/// Save the duplicate keep rules and re-pick keepers; returns how many groups changed.
+#[tauri::command]
+fn set_dup_rules(state: State<AppState>, rules: dedupe::DupRules) -> CmdResult<usize> {
+    let mut conn = state.db.conn().map_err(err)?;
+    rules.save(&conn).map_err(err)?;
+    dedupe::apply_rules(&mut conn).map_err(err)
+}
+
+/// Folders worth a "delete from here first" rule: messenger / download folders that hold
+/// duplicate copies, most copies first.
+#[tauri::command]
+fn dup_rule_suggestions(state: State<AppState>) -> CmdResult<Vec<(String, i64)>> {
+    let conn = state.db.conn().map_err(err)?;
+    let sql = format!(
+        "SELECT v.mount, {} d, COUNT(*) n FROM dup_members m JOIN dup_groups g ON g.id = m.group_id AND g.resolved = 0
+           JOIN files f ON f.id = m.file_id JOIN volumes v ON v.id = f.volume_id
+         WHERE f.missing = 0 AND f.quarantined = 0
+           AND EXISTS (SELECT 1 FROM labels l WHERE l.file_id = f.id AND l.label LIKE 'src:%')
+         GROUP BY f.volume_id, d ORDER BY n DESC LIMIT 5",
+        db::DIR_SQL
+    );
+    let mut st = conn.prepare(&sql).map_err(err)?;
+    let rows = st
+        .query_map([], |r| {
+            let mount: String = r.get(0)?;
+            let dir: String = r.get(1)?;
+            Ok((volumes::join_rel(Path::new(&mount), &dir).to_string_lossy().into_owned(), r.get::<_, i64>(2)?))
+        })
+        .map_err(err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(err)?;
+    Ok(rows)
+}
+
 /// Photos that look like this one (resized / recompressed / edited copies), most similar first.
 #[tauri::command]
 fn similar_to(state: State<AppState>, id: i64) -> CmdResult<Vec<i64>> {
@@ -1013,6 +1053,9 @@ pub fn run() {
             cleanup_summary,
             trips_summary,
             compare_files,
+            get_dup_rules,
+            set_dup_rules,
+            dup_rule_suggestions,
             similar_to,
             prepare_copies,
             people_list,

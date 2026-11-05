@@ -30,8 +30,10 @@ export interface LibraryPreset {
 interface NavCtx {
   go: (p: Page) => void;
   openLibrary: (p: Omit<LibraryPreset, "key">) => void;
+  /** Open 「한 곳으로 정리」 for these files only (e.g. the library selection). */
+  openOrganize: (filter: FileFilter) => void;
 }
-export const NavContext = createContext<NavCtx>({ go: () => {}, openLibrary: () => {} });
+export const NavContext = createContext<NavCtx>({ go: () => {}, openLibrary: () => {}, openOrganize: () => {} });
 export const useNav = () => useContext(NavContext);
 
 interface JobCtx {
@@ -125,11 +127,16 @@ export default function App() {
   const [lane, setLane] = useState<LaneStatus | null>(null);
   const [preset, setPreset] = useState<LibraryPreset | null>(null);
 
+  const [organizePreset, setOrganizePreset] = useState<{ key: number; filter: FileFilter } | null>(null);
   const nav: NavCtx = {
     go: (p) => setPage(p),
     openLibrary: (p) => {
       setPreset({ ...p, key: Date.now() });
       setPage("library");
+    },
+    openOrganize: (filter) => {
+      setOrganizePreset({ key: Date.now(), filter });
+      setPage("organize");
     },
   };
 
@@ -299,13 +306,22 @@ export default function App() {
         </aside>
 
         <main className="content">
-          {page === "library" && <Library preset={preset} onClearPreset={() => setPreset(null)} onConsumePreset={() => setPreset((p) => p && { ...p, select: undefined, review: undefined })} />}
+          {/* The library stays mounted (hidden) so scroll position, filters and selection survive
+              visits to other screens. */}
+          <div style={{ display: page === "library" ? "contents" : "none" }}>
+            <Library
+              active={page === "library"}
+              preset={preset}
+              onClearPreset={() => setPreset(null)}
+              onConsumePreset={() => setPreset((p) => p && { ...p, select: undefined, review: undefined })}
+            />
+          </div>
           {page === "cleanup" && <Cleanup />}
           {page === "trips" && <Trips />}
           {page === "people" && <People />}
           {page === "sources" && <Sources />}
           {page === "duplicates" && <Duplicates />}
-          {page === "organize" && <Organize />}
+          {page === "organize" && <Organize preset={organizePreset} />}
           {page === "history" && <History />}
           {page === "settings" && <Settings />}
         </main>

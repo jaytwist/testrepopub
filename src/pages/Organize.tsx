@@ -17,14 +17,14 @@ const ACTION_NAMES: Record<string, string> = {
   move: "이동", copy: "복사", in_place: "이미 정리됨", skip_duplicate: "중복이라 건너뜀", skip_offline: "드라이브 연결 안 됨",
 };
 
-export default function Organize() {
+export default function Organize({ preset }: { preset?: { key: number; filter: FileFilter } | null }) {
   const { running, setRunning, lastDone } = useJob();
   const [opts, setOpts] = useState<OrganizeOptions>({
     target_dir: "",
     template: PRESETS[0].tpl,
     rename: "keep",
     mode: "move",
-    filter: {},
+    filter: preset?.filter ?? {},
     uncertain_folder: "_날짜확인필요",
     remove_empty_dirs: true,
   });
@@ -38,6 +38,10 @@ export default function Organize() {
   useEffect(() => {
     api.filteredStats(opts.filter).then(setTarget).catch(() => setTarget(null));
   }, [opts.filter]);
+  // Opened for a set of files (e.g. the library selection).
+  useEffect(() => {
+    if (preset) setOpts((o) => ({ ...o, filter: preset.filter }));
+  }, [preset?.key]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Pick up results of our jobs.
   useEffect(() => {
@@ -173,7 +177,14 @@ export default function Organize() {
 
         <label>대상 파일</label>
         <div>
-          <FilterBar filter={opts.filter} onChange={(f: FileFilter) => set({ filter: f })} showSort={false} />
+          {opts.filter.ids ? (
+            <div className="alert ok selection-only">
+              라이브러리에서 고른 <b>{opts.filter.ids.length}장</b>만 정리합니다.
+              <button className="btn small ghost" onClick={() => set({ filter: {} })}>해제하고 필터로 고르기</button>
+            </div>
+          ) : (
+            <FilterBar filter={opts.filter} onChange={(f: FileFilter) => set({ filter: f })} showSort={false} />
+          )}
           <div className="muted small">
             {target && <><b className="text">대상 {fmtCount(target.count)}개 · {fmtBytes(target.bytes)}</b> · </>}
             필터를 비워두면 연결된 모든 드라이브의 모든 사진·동영상이 대상입니다.

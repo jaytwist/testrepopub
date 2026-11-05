@@ -3,6 +3,7 @@ import { useNav } from "../App";
 import ZoomImage from "./ZoomImage";
 import Compare from "./Compare";
 import {
+  FAVORITE,
   api, DATE_SOURCE_NAMES, fileUrl, fmtBytes, fmtDuration, labelName, thumbUrl, toDatetimeLocal,
   type FileDetail, type GridItem, type LabelCount,
 } from "../api";
@@ -96,6 +97,14 @@ export default function Viewer({ items, index, onIndex, onClose, onChanged, revi
     else setComparing([item.id, ...ids]);
   };
 
+  const toggleFav = async () => {
+    if (!detail) return;
+    if (detail.labels.some((l) => l.label === FAVORITE)) await api.removeLabel([item.id], FAVORITE);
+    else await api.addLabel([item.id], FAVORITE);
+    load();
+    onChanged?.();
+  };
+
   const playInVlc = () => {
     setVlcMsg(null);
     api.openInVlc(item.id).then(() => setVlcMsg("VLC에서 재생합니다")).catch((e) => setVlcMsg(String(e)));
@@ -111,6 +120,7 @@ export default function Viewer({ items, index, onIndex, onClose, onChanged, revi
       if ((e.target as HTMLElement).tagName === "INPUT") return;
       if (e.key === "ArrowRight") next();
       if (e.key === "ArrowLeft" && index > 0) onIndex(index - 1);
+      if ((e.key === "f" || e.key === "F" || e.key === "ㄹ") && !review) toggleFav();
       if (!review) return;
       if (e.key === "k" || e.key === "K" || e.key === "ㅏ") {
         review.onKeep(item.id);
@@ -124,7 +134,7 @@ export default function Viewer({ items, index, onIndex, onClose, onChanged, revi
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [index, items.length, close, onIndex, review, item.id, comparing]);
+  }, [index, items.length, close, onIndex, review, item.id, comparing, detail]);
 
   // Other shots of the same burst, for side-by-side comparison.
   const burst = item.burst_id != null ? items.filter((it) => it.burst_id === item.burst_id) : [];
@@ -167,9 +177,10 @@ export default function Viewer({ items, index, onIndex, onClose, onChanged, revi
   };
 
   const f = detail?.file;
-  const userLabels = detail?.labels.filter((l) => l.source === "user") ?? [];
+  const userLabels = detail?.labels.filter((l) => l.source === "user" && l.label !== FAVORITE) ?? [];
+  const isFav = !!detail?.labels.some((l) => l.label === FAVORITE);
   const ruleLabels = detail?.labels.filter((l) => l.source !== "user") ?? [];
-  const suggestions = allLabels.filter((l) => l.user && !userLabels.some((u) => u.label === l.label)).slice(0, 8);
+  const suggestions = allLabels.filter((l) => l.user && l.label !== FAVORITE && !userLabels.some((u) => u.label === l.label)).slice(0, 8);
 
   return (
     <div className={`viewer ${review ? "reviewing" : ""}`} onClick={close}>
@@ -239,7 +250,10 @@ export default function Viewer({ items, index, onIndex, onClose, onChanged, revi
       <aside className="viewer-info" onClick={(e) => e.stopPropagation()}>
         {f ? (
           <>
-            <div className="info-name" title={f.name}>{f.name}</div>
+            <div className="info-name-row">
+              <div className="info-name" title={f.name}>{f.name}</div>
+              <button className={`fav-btn ${isFav ? "on" : ""}`} onClick={toggleFav} title="즐겨찾기 (F)">{isFav ? "♥" : "♡"}</button>
+            </div>
             {detail!.reasons.length > 0 && (
               <section className="reasons">
                 <h4>정리 제안</h4>

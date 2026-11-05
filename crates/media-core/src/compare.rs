@@ -64,7 +64,7 @@ pub fn compare(conn: &Connection, ids: &[i64]) -> Result<Comparison> {
         }
     }
     let mut ranked = files.clone();
-    dedupe::rank_members(&mut ranked, &labels);
+    dedupe::rank_members(&mut ranked, &labels, &dedupe::DupRules::load(conn)?);
     Ok(Comparison { identical, recommended: ranked.first().map(|f| f.id) })
 }
 

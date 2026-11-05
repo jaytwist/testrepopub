@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import {
+import { FAVORITE,
   api, dateInputToTs, fmtBytes, fmtCount, fmtDate, labelName, tsToDateInput,
   type FileFilter, type FilterOptions, type LabelCount, type SortKey, type VolumeRow,
 } from "../api";
@@ -168,6 +168,13 @@ export default function FilterBar({ filter, onChange, showSort = true }: Props) 
           {kinds.map(([k, name]) => (
             <button key={name} className={(filter.kind ?? null) === k ? "on" : ""} onClick={() => set({ kind: k })}>{name}</button>
           ))}
+          <button
+            className={`fav-tab ${filter.label === FAVORITE ? "on" : ""}`}
+            title="즐겨찾기(♥)만 보기"
+            onClick={() => set({ label: filter.label === FAVORITE ? null : FAVORITE })}
+          >
+            ♥
+          </button>
         </div>
         <select
           value={periodKey}

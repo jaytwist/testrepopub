@@ -2,10 +2,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Virtuoso, type ListRange, type VirtuosoHandle } from "react-virtuoso";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import {
-  absPath, api, fmtBytes, fmtCount, fmtDate, fmtDuration, thumbUrl,
+  absPath, api, FAVORITE, fmtBytes, fmtCount, fmtDate, fmtDuration, thumbUrl,
   type FileFilter, type FilteredStats, type GridItem, type GroupBy, type GroupRow, type SortKey, type VolumeRow,
 } from "../api";
-import { useJob, type LibraryPreset } from "../App";
+import { useJob, useNav, type LibraryPreset } from "../App";
 import FilterBar from "../components/FilterBar";
 import Viewer from "../components/Viewer";
 import TimelineScrubber, { type ScrubSegment } from "../components/TimelineScrubber";
@@ -83,13 +83,16 @@ function caption(item: GridItem, sort: SortKey): string | null {
 // --- page ------------------------------------------------------------------------------------
 
 interface LibraryProps {
+  /** False while another screen is shown (the library stays mounted to keep its place). */
+  active?: boolean;
   preset?: LibraryPreset | null;
   onClearPreset?: () => void;
   /** The preset's one-shot parts (pre-selection, review) were used: don't repeat them on return. */
   onConsumePreset?: () => void;
 }
 
-export default function Library({ preset, onClearPreset, onConsumePreset }: LibraryProps) {
+export default function Library({ active = true, preset, onClearPreset, onConsumePreset }: LibraryProps) {
+  const nav = useNav();
   const { version, running, setRunning, lastDone } = useJob();
   // A preset (from cleanup suggestions, people, places) decides the first view, so the first load
   // already uses its filter and pre-selection.
@@ -112,7 +115,7 @@ export default function Library({ preset, onClearPreset, onConsumePreset }: Libr
   const [anchor, setAnchor] = useState<number | null>(null);
   const [viewId, setViewId] = useState<number | null>(null);
   const [comparing, setComparing] = useState<number[] | null>(null);
-  const [bulk, setBulk] = useState<"label" | "date" | null>(null);
+  const [bulk, setBulk] = useState<"label" | "date" | "shift" | null>(null);
   const [bulkValue, setBulkValue] = useState("");
   const [busyGroup, setBusyGroup] = useState<string | null>(null);
   /** Show each burst as its best shot with a "+N" badge. */
@@ -146,10 +149,17 @@ export default function Library({ preset, onClearPreset, onConsumePreset }: Libr
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // A new preset while the library is open replaces the current view.
+  /** The view a preset replaced (filter, grouping, scroll row), for 「← 이전 보기로」. */
+  const prevView = useRef<{ filter: FileFilter; groupBy: GroupBy; row: number } | null>(null);
+  const [hasPrev, setHasPrev] = useState(false);
+  const pendingScroll = useRef<number | null>(null);
+
+  // A new preset while the library is open replaces the current view (remembering it).
   useEffect(() => {
     if (!preset || preset.key === appliedPreset.current) return;
     appliedPreset.current = preset.key;
+    prevView.current = { filter, groupBy, row: Math.floor(topRow) };
+    setHasPrev(true);
     if (preset.select || preset.review) onConsumePreset?.();
     pendingSelect.current = preset.select ? { ids: preset.select, filter: preset.filter, version } : null;
     setFilter(preset.filter);
@@ -309,6 +319,25 @@ export default function Library({ preset, onClearPreset, onConsumePreset }: Libr
     const t = setTimeout(measureTop, 50);
     return () => clearTimeout(t);
   }, [rows, measureTop]);
+  /** Back to the view a preset replaced, at the same scroll position. */
+  const goBack = () => {
+    const p = prevView.current;
+    if (!p) return;
+    prevView.current = null;
+    setHasPrev(false);
+    onClearPreset?.();
+    setReview(null);
+    pendingScroll.current = p.row;
+    setFilter(p.filter);
+    setGroupBy(p.groupBy);
+  };
+  useEffect(() => {
+    const row = pendingScroll.current;
+    if (row == null || rows.length === 0) return;
+    pendingScroll.current = null;
+    setTimeout(() => virtuoso.current?.scrollToIndex({ index: Math.min(row, rows.length - 1), align: "start" }), 50);
+  }, [rows]);
+
   const wheelBy = useCallback((dy: number) => scrollEl.current?.scrollBy({ top: dy }), []);
   const jumpTo = useCallback((row: number) => virtuoso.current?.scrollToIndex({ index: row, align: "start" }), []);
 
@@ -485,6 +514,7 @@ export default function Library({ preset, onClearPreset, onConsumePreset }: Libr
       suppressClick.current = false;
       return;
     }
+    setCursor(id);
     const index = flatIndex.get(id) ?? 0;
     if (e.shiftKey && anchor != null) {
       const [a, b] = [Math.min(anchor, index), Math.max(anchor, index)];
@@ -571,17 +601,101 @@ export default function Library({ preset, onClearPreset, onConsumePreset }: Libr
     }
   }, [selected, running, setRunning]);
 
-  // Delete key = delete the selection (not while typing in a field or viewing a photo).
+  // --- keyboard: a cursor that moves over the grid like in a file manager ---
+  const [cursor, setCursor] = useState<number | null>(null);
+  /** Where each loaded photo sits: list row + column, and the photos of each row. */
+  const layout = useMemo(() => {
+    const at = new Map<number, { row: number; col: number }>();
+    const byRow = new Map<number, number[]>();
+    for (const seg of segments) {
+      const a = cache.current.get(seg.key);
+      if (!a || collapsed.has(seg.key)) continue;
+      a.forEach((it, pos) => {
+        if (!it) return;
+        const row = seg.startRow + 1 + Math.floor(pos / cols);
+        at.set(it.id, { row, col: pos % cols });
+        const r = byRow.get(row) ?? [];
+        r[pos % cols] = it.id;
+        byRow.set(row, r);
+      });
+    }
+    return { at, byRow };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [segments, collapsed, cols, cacheTick]);
+
+  const moveCursor = (dir: "left" | "right" | "up" | "down", extend: boolean) => {
+    if (flat.length === 0) return;
+    let next: number | undefined;
+    const cur = cursor != null ? flatIndex.get(cursor) : undefined;
+    if (cur == null) next = flat[0].id;
+    else if (dir === "left") next = flat[Math.max(0, cur - 1)].id;
+    else if (dir === "right") next = flat[Math.min(flat.length - 1, cur + 1)].id;
+    else {
+      const p = layout.at.get(cursor!);
+      if (!p) return;
+      const rowsWithItems = [...layout.byRow.keys()].sort((x, y) => x - y);
+      const i = rowsWithItems.indexOf(p.row) + (dir === "down" ? 1 : -1);
+      const ids = rowsWithItems[i] != null ? layout.byRow.get(rowsWithItems[i])!.filter((x) => x != null) : null;
+      if (!ids || ids.length === 0) return;
+      next = ids[Math.min(p.col, ids.length - 1)];
+    }
+    if (next == null) return;
+    setCursor(next);
+    const ni = flatIndex.get(next) ?? 0;
+    if (extend) {
+      const from = anchor ?? cur ?? ni;
+      const [a, b] = [Math.min(from, ni), Math.max(from, ni)];
+      const sel = new Set(selected);
+      for (let k = a; k <= b; k++) sel.add(flat[k].id);
+      setSelected(sel);
+      if (anchor == null) setAnchor(from);
+    } else {
+      setAnchor(ni);
+    }
+    const row = layout.at.get(next)?.row;
+    if (row != null) virtuoso.current?.scrollIntoView({ index: row });
+    if (ni > flat.length - cols * 3) loadNext();
+  };
+
+  // Keys (not while typing, viewing a photo or comparing, nor while another screen is shown).
   useEffect(() => {
+    if (!active) return;
     const onKey = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement).tagName;
-      if (e.key !== "Delete" || viewId != null || tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
-      e.preventDefault();
-      deleteSelected();
+      if (viewId != null || comparing || tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      const arrows: Record<string, "left" | "right" | "up" | "down"> = { ArrowLeft: "left", ArrowRight: "right", ArrowUp: "up", ArrowDown: "down" };
+      if (arrows[e.key]) {
+        e.preventDefault();
+        moveCursor(arrows[e.key], e.shiftKey);
+      } else if (e.key === " " && cursor != null) {
+        e.preventDefault();
+        const sel = new Set(selected);
+        sel.has(cursor) ? sel.delete(cursor) : sel.add(cursor);
+        setSelected(sel);
+        setAnchor(flatIndex.get(cursor) ?? null);
+      } else if (e.key === "Enter" && cursor != null) {
+        e.preventDefault();
+        setViewId(cursor);
+      } else if ((e.ctrlKey || e.metaKey) && (e.key === "a" || e.key === "A")) {
+        e.preventDefault();
+        selectAll();
+      } else if (e.key === "Escape") {
+        if (selected.size > 0) setSelected(new Set());
+        else setCursor(null);
+      } else if (e.key === "f" || e.key === "F" || e.key === "ㄹ") {
+        if (selected.size > 0) toggleFavSelected();
+        else if (cursor != null) {
+          const it = flat.find((x) => x.id === cursor);
+          (it?.favorite ? api.removeLabel([cursor], FAVORITE) : api.addLabel([cursor], FAVORITE)).then(reload);
+        }
+      } else if (e.key === "Delete") {
+        e.preventDefault();
+        deleteSelected();
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [deleteSelected, viewId]);
+  });
 
   useEffect(() => {
     if (lastDone?.job === "delete" && lastDone.ok) setDeleted(lastDone.result);
@@ -596,6 +710,29 @@ export default function Library({ preset, onClearPreset, onConsumePreset }: Libr
     } catch (e) {
       setLoadError(String(e));
     }
+  };
+
+  /** ♥ the selection, or un-♥ it when every selected (loaded) photo already is one. */
+  const toggleFavSelected = async () => {
+    const ids = Array.from(selected);
+    const loaded = flat.filter((it) => selected.has(it.id));
+    if (loaded.length > 0 && loaded.every((it) => it.favorite)) await api.removeLabel(ids, FAVORITE);
+    else await api.addLabel(ids, FAVORITE);
+    reload();
+  };
+
+  /** Move the capture time of the selection (camera clock / time zone wrong). */
+  const shiftSelected = async (secs: number) => {
+    if (!secs) return;
+    await api.shiftDate(Array.from(selected), secs);
+    setBulk(null);
+    setBulkValue("");
+    reload();
+  };
+  const shiftPreview = (secs: number) => {
+    const first = flat.find((it) => selected.has(it.id) && it.taken_at != null);
+    if (!first || first.taken_at == null || !secs) return null;
+    return `${fmtDate(first.taken_at, true)} → ${fmtDate(first.taken_at + secs, true)}`;
   };
 
   const applyBulk = async () => {
@@ -659,14 +796,15 @@ export default function Library({ preset, onClearPreset, onConsumePreset }: Libr
         <div
           key={item.id}
           data-id={item.id}
-          className={`tile ${selected.has(item.id) ? "sel" : ""} ${item.online ? "" : "offline"}`}
+          className={`tile ${selected.has(item.id) ? "sel" : ""} ${item.online ? "" : "offline"} ${cursor === item.id ? "cursor" : ""}`}
           style={{ width: tile, height: tile }}
           onClick={(e) => onTileClick(e, item.id)}
         >
           <img loading="lazy" src={thumbUrl(item.id)} alt="" draggable={false} onError={(e) => ((e.target as HTMLImageElement).style.visibility = "hidden")} />
           <button className="check" onClick={(e) => toggleOne(e, item.id)}>{selected.has(item.id) ? "✓" : ""}</button>
           {item.kind === "video" && <span className="badge-video">▶ {fmtDuration(item.duration_ms)}</span>}
-          {item.kind === "raw" && <span className="badge-raw">RAW</span>}
+          {item.kind === "raw" && <span className="badge-raw" style={item.favorite ? { right: 30 } : undefined}>RAW</span>}
+          {item.favorite && <span className="badge-fav" title="즐겨찾기">♥</span>}
           {!item.online && <span className="badge-offline" title="드라이브 연결 안 됨">⏏</span>}
           {cap && <span className="tile-caption">{cap}</span>}
           {stack && groupBy !== "burst" && item.burst_rank === 0 && (item.burst_size ?? 0) > 1 && (
@@ -701,14 +839,17 @@ export default function Library({ preset, onClearPreset, onConsumePreset }: Libr
               </>
             ) : "불러오는 중…"}
           </div>
-          <div className="muted small">클릭하면 크게 보기 · Ctrl/Shift+클릭으로 여러 개 선택 · 묶음 제목 왼쪽 동그라미로 묶음 전체 선택</div>
+          <div className="muted small">클릭하면 크게 보기 · 끌거나 Ctrl/Shift+클릭으로 여러 장 선택 · 키보드: 방향키 이동, Space 선택, Enter 보기, F 즐겨찾기, Ctrl+A 전체, Esc 해제</div>
         </div>
       </header>
       {preset && (
         <div className="alert ok preset-banner">
           <span><b>{preset.title}</b>{selected.size > 0 && ` · ${fmtCount(selected.size)}개 선택됨`}{kept.size > 0 && ` · ${fmtCount(kept.size)}개 남김`}</span>
           {review && flat.length > 0 && <button className="btn small primary" onClick={() => setViewId(flat[0].id)}>한 장씩 검토</button>}
-          <button className="btn small ghost" onClick={() => { onClearPreset?.(); setFilter({}); }}>닫고 전체 보기</button>
+          {hasPrev && (
+            <button className="btn small" onClick={goBack} title="이 보기를 열기 전의 필터·묶기·위치로 돌아갑니다">← 이전 보기로</button>
+          )}
+          <button className="btn small ghost" onClick={() => { onClearPreset?.(); setFilter({}); prevView.current = null; setHasPrev(false); }}>닫고 전체 보기</button>
         </div>
       )}
       {volumes.filter((v) => v.file_count > 0).length > 1 && (
@@ -794,6 +935,9 @@ export default function Library({ preset, onClearPreset, onConsumePreset }: Libr
           </button>
           <button className="btn small" onClick={() => { setBulk("label"); setBulkValue(""); }}>라벨 추가</button>
           <button className="btn small" onClick={() => { setBulk("date"); setBulkValue(""); }}>날짜 지정</button>
+          <button className="btn small" onClick={() => { setBulk("shift"); setBulkValue(""); }} title="카메라 시계·시간대가 틀린 사진을 한 번에 앞뒤로">시간 옮기기</button>
+          <button className="btn small" onClick={toggleFavSelected} title="즐겨찾기 (F)">♥ 즐겨찾기</button>
+          <button className="btn small" onClick={() => nav.openOrganize({ ids: Array.from(selected) })} title="고른 사진만 다른 폴더로 복사·이동">⇲ 한 곳으로 정리</button>
           <button
             className="btn small"
             disabled={selected.size < 2 || selected.size > 4}
@@ -809,10 +953,25 @@ export default function Library({ preset, onClearPreset, onConsumePreset }: Libr
             <span className="inline-form">
               {bulk === "label" ? (
                 <input autoFocus placeholder="예: 가족여행, 졸업식" value={bulkValue} onChange={(e) => setBulkValue(e.target.value)} onKeyDown={(e) => e.key === "Enter" && applyBulk()} />
-              ) : (
+              ) : bulk === "date" ? (
                 <input autoFocus type="datetime-local" value={bulkValue} onChange={(e) => setBulkValue(e.target.value)} />
+              ) : (
+                <>
+                  {([["−9시간", -9 * 3600], ["−1시간", -3600], ["+1시간", 3600], ["+9시간", 9 * 3600], ["+1일", 86400]] as [string, number][]).map(([name, secs]) => (
+                    <button key={name} className="chip ghost" onClick={() => setBulkValue(String(secs / 3600))}>{name}</button>
+                  ))}
+                  <input autoFocus type="number" step="0.5" className="hours-input" placeholder="시간 (예: -9)" value={bulkValue} onChange={(e) => setBulkValue(e.target.value)} />
+                  <span className="muted small">시간</span>
+                  {shiftPreview(Math.round(Number(bulkValue) * 3600)) && <span className="small">{shiftPreview(Math.round(Number(bulkValue) * 3600))}</span>}
+                </>
               )}
-              <button className="btn small primary" onClick={applyBulk}>적용</button>
+              <button
+                className="btn small primary"
+                disabled={bulk === "shift" && !Number(bulkValue)}
+                onClick={() => (bulk === "shift" ? shiftSelected(Math.round(Number(bulkValue) * 3600)) : applyBulk())}
+              >
+                적용
+              </button>
             </span>
           )}
         </div>

@@ -22,7 +22,7 @@ use czkawka_core::tools::similar_images::{
 };
 use czkawka_core::tools::similar_videos::{self as sv, SimilarVideos, SimilarVideosParameters};
 use rayon::prelude::*;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::db::{FileRow, FILE_COLS};
@@ -366,9 +366,56 @@ fn map_paths_to_rows(conn: &Connection, groups: Vec<Vec<PathBuf>>) -> Result<Vec
     Ok(drop_identical_only(out))
 }
 
+/// The user's "which copy to keep" rules for duplicates, by folder:
+/// copies inside a `keep` folder win; copies inside a `drop` folder lose (one is still kept when
+/// every copy is in a drop folder). Stored in `settings` as `dup_rules`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct DupRules {
+    pub keep: Vec<String>,
+    pub drop: Vec<String>,
+}
+
+fn norm_path(p: &str) -> String {
+    p.replace('\\', "/").trim_end_matches('/').to_lowercase()
+}
+
+impl DupRules {
+    pub fn load(conn: &Connection) -> Result<Self> {
+        let v: Option<String> = conn
+            .query_row("SELECT value FROM settings WHERE key = 'dup_rules'", [], |r| r.get(0))
+            .optional()?;
+        Ok(v.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default())
+    }
+
+    pub fn save(&self, conn: &Connection) -> Result<()> {
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES ('dup_rules', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [serde_json::to_string(self)?],
+        )?;
+        Ok(())
+    }
+
+    /// 0 = in a keep folder, 1 = no rule, 2 = in a drop folder.
+    fn class(&self, f: &FileRow) -> u8 {
+        let p = norm_path(&f.abs_path().to_string_lossy());
+        let inside = |dirs: &[String]| {
+            dirs.iter().map(|d| norm_path(d)).any(|d| !d.is_empty() && (p == d || p.starts_with(&format!("{d}/"))))
+        };
+        if inside(&self.keep) {
+            0
+        } else if inside(&self.drop) {
+            2
+        } else {
+            1
+        }
+    }
+}
+
 /// Rank group members: the first one is the suggested keeper.
-/// Highest resolution, then trustworthy date, then not-from-messenger, then oldest, then shortest path.
-pub fn rank_members(members: &mut [FileRow], labels: &HashMap<i64, Vec<String>>) {
+/// The user's folder rules first; then highest resolution, trustworthy date, not-from-messenger,
+/// oldest, shortest path.
+pub fn rank_members(members: &mut [FileRow], labels: &HashMap<i64, Vec<String>>, rules: &DupRules) {
     let score = |f: &FileRow| {
         let pixels = f.width.unwrap_or(0) * f.height.unwrap_or(0);
         let date_rank = match crate::meta::confidence(&f.date_source) {
@@ -379,9 +426,54 @@ pub fn rank_members(members: &mut [FileRow], labels: &HashMap<i64, Vec<String>>)
         let ls = labels.get(&f.id);
         let messenger = ls.map(|l| l.iter().any(|x| x.starts_with("src:"))).unwrap_or(false) as i32;
         let has_camera = f.camera.is_some() as i32;
-        (std::cmp::Reverse(pixels), std::cmp::Reverse(f.size), date_rank, messenger, std::cmp::Reverse(has_camera), f.mtime, f.rel_path.len())
+        (rules.class(f), std::cmp::Reverse(pixels), std::cmp::Reverse(f.size), date_rank, messenger, std::cmp::Reverse(has_camera), f.mtime, f.rel_path.len())
     };
     members.sort_by_key(score);
+}
+
+/// Re-pick the keeper of every unresolved group with the current rules (after the user changed
+/// them). Returns how many groups got a different keeper.
+pub fn apply_rules(conn: &mut Connection) -> Result<usize> {
+    let rules = DupRules::load(conn)?;
+    let groups: Vec<i64> = {
+        let mut st = conn.prepare("SELECT id FROM dup_groups WHERE resolved = 0")?;
+        let rows = st.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<i64>>>()?;
+        rows
+    };
+    let sql = format!(
+        "SELECT {FILE_COLS}, m.keep FROM dup_members m JOIN files f ON f.id = m.file_id JOIN volumes v ON v.id = f.volume_id
+         WHERE m.group_id = ? AND f.quarantined = 0 AND f.missing = 0"
+    );
+    let tx = conn.transaction()?;
+    let mut changed = 0;
+    {
+        let mut st = tx.prepare(&sql)?;
+        let mut lab = tx.prepare("SELECT label FROM labels WHERE file_id = ?")?;
+        let mut set = tx.prepare("UPDATE dup_members SET keep = ? WHERE group_id = ? AND file_id = ?")?;
+        for gid in groups {
+            let rows: Vec<(FileRow, bool)> = st
+                .query_map([gid], |r| Ok((FileRow::from_row(r)?, r.get::<_, i64>(crate::db::FILE_COLS_LEN)? != 0)))?
+                .collect::<rusqlite::Result<_>>()?;
+            if rows.len() < 2 {
+                continue;
+            }
+            let before: Vec<i64> = rows.iter().filter(|(_, k)| *k).map(|(f, _)| f.id).collect();
+            let mut files: Vec<FileRow> = rows.into_iter().map(|(f, _)| f).collect();
+            let mut labels = HashMap::new();
+            for f in &files {
+                labels.insert(f.id, lab.query_map([f.id], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?);
+            }
+            rank_members(&mut files, &labels, &rules);
+            if before != vec![files[0].id] {
+                changed += 1;
+            }
+            for (i, f) in files.iter().enumerate() {
+                set.execute(params![(i == 0) as i64, gid, f.id])?;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(changed)
 }
 
 fn save_groups(conn: &mut Connection, kind: DupKind, groups: Vec<Vec<FileRow>>) -> Result<DedupeStats> {
@@ -393,13 +485,14 @@ fn save_groups(conn: &mut Connection, kind: DupKind, groups: Vec<Vec<FileRow>>) 
         let mut ins_g = tx.prepare("INSERT INTO dup_groups(kind, created_at) VALUES (?, ?)")?;
         let mut ins_m = tx.prepare("INSERT OR IGNORE INTO dup_members(group_id, file_id, keep) VALUES (?, ?, ?)")?;
         let mut lab = tx.prepare("SELECT label FROM labels WHERE file_id = ?")?;
+        let rules = DupRules::load(&tx)?;
         for mut g in groups {
             let mut labels = HashMap::new();
             for f in &g {
                 let ls: Vec<String> = lab.query_map([f.id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
                 labels.insert(f.id, ls);
             }
-            rank_members(&mut g, &labels);
+            rank_members(&mut g, &labels, &rules);
             ins_g.execute(params![kind.as_str(), now])?;
             let gid = tx.last_insert_rowid();
             for (i, f) in g.iter().enumerate() {

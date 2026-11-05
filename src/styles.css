@@ -423,3 +423,25 @@ kbd { font: 11px/1 ui-monospace, Consolas, monospace; border: 1px solid var(--li
 .backup-check .seg button { padding: 3px 10px; }
 .sel-info { margin-right: 4px; }
 .drive-toast { top: 64px; display: flex; align-items: center; gap: 10px; cursor: default; }
+
+/* --- duplicate keep rules --- */
+.dup-rules { margin: 10px 0; gap: 8px; }
+.rules-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.rules-col { display: flex; flex-direction: column; gap: 6px; }
+.chip.rule-drop { background: var(--bad-soft); color: var(--bad); }
+.chip.rule-drop button { border: 0; background: none; color: inherit; cursor: pointer; margin-left: 4px; padding: 0; }
+
+/* --- favorites --- */
+.badge-fav { position: absolute; right: 6px; top: 4px; color: #ff4d6d; font-size: 18px; text-shadow: 0 0 3px rgba(0, 0, 0, 0.6); pointer-events: none; }
+.fav-tab { color: #e11d48; font-size: 15px; }
+.fav-tab.on { color: #e11d48 !important; }
+.info-name-row { display: flex; align-items: center; gap: 8px; }
+.info-name-row .info-name { flex: 1; min-width: 0; }
+.fav-btn { border: 0; background: none; font-size: 22px; line-height: 1; color: var(--muted); cursor: pointer; padding: 0 2px; }
+.fav-btn.on { color: #e11d48; }
+
+/* --- keyboard cursor --- */
+.tile.cursor { outline: 2px dashed var(--accent); outline-offset: 2px; }
+.tile.sel.cursor { outline: 3px solid var(--accent); outline-offset: -3px; box-shadow: 0 0 0 2px var(--panel), 0 0 0 4px var(--accent); }
+.hours-input { width: 90px; }
+.selection-only { display: flex; align-items: center; gap: 10px; margin: 0; }

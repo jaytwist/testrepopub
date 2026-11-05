@@ -3,6 +3,7 @@ import { confirm } from "@tauri-apps/plugin-dialog";
 import { absPath, api, fmtBytes, fmtCount, fmtDate, thumbUrl, type DupGroup, type DupSummary } from "../api";
 import { useJob } from "../App";
 import Compare from "../components/Compare";
+import DupRulesCard from "../components/DupRules";
 
 const KINDS = [
   { id: "exact", title: "완전히 같은 파일", desc: "바이트 단위로 동일한 파일 (여러 드라이브에 복사된 사본)", safe: true },
@@ -96,6 +97,8 @@ export default function Duplicates() {
           );
         })}
       </div>
+
+      <DupRulesCard onChanged={reload} />
 
       {cur && cur.groups > 0 && (
         <div className="row-between sticky-actions">
