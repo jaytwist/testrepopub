@@ -31,6 +31,8 @@ pub struct LaneStatus {
     pub pending_offline: i64,
     pub analyzed: i64,
     pub faces_available: bool,
+    /// Faces found so far (diagnostics on the People screen).
+    pub faces_found: i64,
     pub last_error: Option<String>,
 }
 
@@ -44,6 +46,12 @@ pub struct Lane {
     pub stop: StopFlag,
     status: Mutex<LaneStatus>,
     engine: Mutex<Option<Arc<Mutex<FaceEngine>>>>,
+}
+
+/// How often people / bursts / blur are regrouped during a long analysis pass (env
+/// `MO_REGROUP_SECS` overrides, for testing).
+fn regroup_every() -> Duration {
+    Duration::from_secs(std::env::var("MO_REGROUP_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(120))
 }
 
 /// Where the ONNX Runtime library and models are: `MO_AI_DIR` (dev), the installer's resources,
@@ -122,6 +130,9 @@ impl Lane {
         }
         s.running = self.running.load(Ordering::Relaxed);
         s.faces_available = face_runtime(app).available();
+        if let Ok(conn) = st.db.conn() {
+            s.faces_found = conn.query_row("SELECT COUNT(*) FROM faces", [], |r| r.get(0)).unwrap_or(0);
+        }
         s
     }
 
@@ -167,12 +178,36 @@ impl Lane {
             loop {
                 let opts = Self::options(&app);
                 let engine = match lane.engine(&app, &opts) {
-                    Ok(e) => e,
+                    Ok(e) => {
+                        lane.status.lock().unwrap().last_error = None;
+                        e
+                    }
                     Err(msg) => {
-                        lane.status.lock().unwrap().last_error = Some(msg);
+                        lane.status.lock().unwrap().last_error = Some(format!("인물(얼굴) 분석을 시작하지 못했습니다: {msg}"));
                         None
                     }
                 };
+                // People, bursts and blur are regrouped every couple of minutes while a long pass
+                // runs, so the People screen fills in progressively instead of after hours.
+                let ticking = Arc::new(AtomicBool::new(true));
+                {
+                    let ticking = ticking.clone();
+                    let app = app.clone();
+                    std::thread::spawn(move || {
+                        let mut waited = Duration::ZERO;
+                        while ticking.load(Ordering::Relaxed) {
+                            std::thread::sleep(Duration::from_secs(1));
+                            waited += Duration::from_secs(1);
+                            if waited >= regroup_every() {
+                                waited = Duration::ZERO;
+                                let st = app.state::<AppState>();
+                                if crate::post_analysis(&st).is_ok() {
+                                    let _ = app.emit("analysis-done", ());
+                                }
+                            }
+                        }
+                    });
+                }
                 let emit_app = app.clone();
                 let status_lane = lane.clone();
                 let last = Mutex::new(Instant::now() - Duration::from_secs(1));
@@ -196,6 +231,7 @@ impl Lane {
                     s.provider = engine.as_ref().and_then(|e| e.lock().ok().map(|e| e.provider.clone())).unwrap_or_else(|| "-".into());
                 }
                 let res = analysis::run(&st.db, &st.thumbs, engine.as_deref(), threads, &lane.stop, &lane.pause, &progress);
+                ticking.store(false, Ordering::Relaxed);
                 if let Err(e) = &res {
                     lane.status.lock().unwrap().last_error = Some(format!("{e:#}"));
                 }

@@ -78,6 +78,8 @@ export interface GridItem {
   /** Byte-identical copies on other drives. */
   copies: number;
   favorite: boolean;
+  /** "original" / "copy" when byte-identical copies exist. */
+  dup_role: "original" | "copy" | null;
 }
 export interface ValueCount { value: string; count: number }
 export interface FilterOptions { cameras: ValueCount[]; exts: ValueCount[]; years: number[]; max_size: number; with_gps: number }
@@ -108,6 +110,7 @@ export interface LabelCount { label: string; count: number; user: boolean }
 export interface FileDetail {
   file: FileRow; reasons: [string, string][]; labels: LabelRow[]; abs_path: string; taken: string; confidence: string; thumb_cached: boolean; place: string | null;
   people: [number, string][];
+  dup_role: "original" | "copy" | null; dup_group_size: number;
 }
 export interface DupMember { file: FileRow; keep: boolean }
 export interface DupGroup { id: number; kind: string; members: DupMember[]; reclaimable_bytes: number }
@@ -136,7 +139,7 @@ export interface UpdateProgress { downloaded: number; total: number | null }
 export interface LaneStatus {
   running: boolean; paused: boolean; reason: "user" | "job" | "battery" | null; done: number; total: number;
   eta_secs: number; current: string; provider: string; pending_online: number; pending_offline: number;
-  analyzed: number; faces_available: boolean; last_error: string | null;
+  analyzed: number; faces_available: boolean; faces_found: number; last_error: string | null;
 }
 export interface AnalysisOptions { auto: boolean; people: boolean; gpu: boolean; pause_on_battery: boolean }
 export interface AppInfo { version: string; data_dir: string; cache_dir: string; ffmpeg: boolean; job: string | null }
@@ -157,6 +160,7 @@ export const api = {
   setDupRules: (rules: DupRules) => invoke<number>("set_dup_rules", { rules }),
   dupRuleSuggestions: () => invoke<[string, number][]>("dup_rule_suggestions"),
   similarTo: (id: number) => invoke<number[]>("similar_to", { id }),
+  setOriginal: (id: number) => invoke<void>("set_original", { id }),
   prepareCopies: () => invoke<number>("prepare_copies"),
   peopleList: (includeHidden = false) => invoke<PersonRow[]>("people_list", { includeHidden }),
   personFaces: (person: number) => invoke<FaceRow[]>("person_faces", { person }),
@@ -329,9 +333,14 @@ export function fmtDuration(ms: number | null): string {
 
 /** The user label behind ♥ favorites. */
 export const FAVORITE = "favorite";
+/** The user label that marks "this copy is the original". */
+export const ORIGINAL = "original";
+/** Labels with their own controls (♥, original), kept out of the free-form label chips. */
+export const SYSTEM_LABELS = [FAVORITE, ORIGINAL];
 
 const LABEL_NAMES: Record<string, string> = {
   favorite: "♥ 즐겨찾기",
+  original: "원본으로 지정",
   screenshot: "스크린샷",
   "src:kakaotalk": "카카오톡",
   "src:whatsapp": "WhatsApp",

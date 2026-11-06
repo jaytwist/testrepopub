@@ -108,6 +108,12 @@ export default function People() {
     load();
   };
 
+  /** Photos of any of the selected people, into person folders ({person}/{year}). */
+  const organizeSelected = async () => {
+    const lists = await Promise.all([...selected].map((id) => api.queryIds({ person_ids: [id] })));
+    nav.openOrganize({ ids: [...new Set(lists.flat())] }, "{person}/{year}");
+  };
+
   const hideSelected = async (hidden: boolean) => {
     await api.hidePeople([...selected], hidden);
     setSelected(new Set());
@@ -165,10 +171,20 @@ export default function People() {
       {!off && lane && !lane.faces_available && (
         <div className="alert">인물 기능에 필요한 파일(AI 모델)이 이 설치에 없습니다. 정식 설치 파일이나 최신 휴대용 버전을 사용하세요.</div>
       )}
-      {!off && lane?.faces_available && pending > 0 && (
-        <div className="alert ok">
-          사진 분석 중 · 남은 사진 {fmtCount(pending)}장 — 인물은 찾는 대로 여기에 나타납니다.
-          {lane.paused && " (지금은 쉬는 중)"}
+      {!off && lane && (
+        <div className={`people-diag ${lane.last_error ? "bad" : ""}`}>
+          <span>
+            얼굴 분석: {pending > 0 ? <>남은 사진 <b>{fmtCount(pending)}</b>장{lane.running ? (lane.paused ? " (쉬는 중)" : " · 진행 중") : " · 대기"}</> : "모두 끝남"}
+          </span>
+          <span>찾은 얼굴 <b>{fmtCount(lane.faces_found)}</b>개</span>
+          <span>엔진: {lane.provider === "DirectML" ? "그래픽카드(DirectML)" : lane.provider === "CPU" ? "CPU" : lane.faces_available ? "아직 시작 전" : "AI 파일 없음"}</span>
+          {pending > 0 && <span className="muted">인물은 분석 중에도 몇 분마다 나타납니다</span>}
+          {lane.last_error && (
+            <>
+              <span className="warn-text">{lane.last_error}</span>
+              <button className="btn small" onClick={() => api.analysisStart()}>다시 시도</button>
+            </>
+          )}
         </div>
       )}
 
@@ -193,6 +209,7 @@ export default function People() {
         <div className="selbar">
           <b>{selected.size}명 선택</b>
           <button className="btn small" disabled={selected.size < 2} onClick={mergeSelected}>같은 사람으로 합치기</button>
+          <button className="btn small" onClick={organizeSelected} title="고른 사람들이 나온 사진을 사람별 폴더로 정리">⇲ 사람별 폴더로 정리</button>
           {showHidden && [...selected].every((id) => people?.find((p) => p.id === id)?.hidden) ? (
             <button className="btn small" onClick={() => hideSelected(false)}>다시 보이기</button>
           ) : (
@@ -206,7 +223,10 @@ export default function People() {
         <div className="empty">
           <div className="empty-icon">☺</div>
           <h2>아직 찾은 인물이 없습니다</h2>
-          <p>같은 사람이 나온 사진이 3장 이상 모이면 인물로 묶어 여기에 보여 드립니다.</p>
+          <p>
+            같은 사람이 나온 사진이 3장 이상 모이면 인물로 묶어 여기에 보여 드립니다.
+            {lane && ` 지금까지 찾은 얼굴 ${fmtCount(lane.faces_found)}개.`}
+          </p>
         </div>
       )}
 
@@ -232,6 +252,7 @@ export default function People() {
 
 /** One person: their faces, "not this person", cover choice, and the way to their photos. */
 function PersonDetail({ person, onBack, onOpen }: { person: PersonRow; onBack: () => void; onOpen: (p: PersonRow) => void }) {
+  const nav = useNav();
   const [faces, setFaces] = useState<FaceRow[] | null>(null);
   const [picked, setPicked] = useState<Set<number>>(new Set());
   const [p, setP] = useState(person);
@@ -276,6 +297,9 @@ function PersonDetail({ person, onBack, onOpen }: { person: PersonRow; onBack: (
           )}
           <div className="muted">사진 {fmtCount(p.photos)}장 · 잘못 들어간 얼굴을 골라 「이 사람 아님」을 누르세요</div>
         </div>
+        <button className="btn" onClick={() => nav.openOrganize({ person_ids: [p.id] }, "{person}/{year}")} title="이 사람이 나온 사진을 사람별 폴더로 복사·이동">
+          ⇲ 이 사람 사진 한 곳으로 정리
+        </button>
         <button className="btn primary" onClick={() => onOpen(p)}>사진 보기</button>
       </header>
 

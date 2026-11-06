@@ -235,3 +235,46 @@ fn duplicate_keep_rules() {
     dedupe::run(&db, DupKind::Exact, Similarity::High, &stop, &quiet).unwrap();
     assert_eq!(keeper(&conn), vec![orig]);
 }
+
+/// Original vs copy among byte-identical files: by the duplicates ranking (and keep rules), and
+/// a copy the user marks as the original wins — one pick per group.
+#[test]
+fn original_and_copy_roles() {
+    use media_core::identity;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let a = drive(root, "diskA");
+    let b = drive(root, "diskB");
+    write_jpeg(&a.join("Photos/IMG_1.jpg"), &picture(1, 900, 600), Some(("2023:05:01 10:00:00", "Apple", "iPhone 13")));
+    write_jpeg(&a.join("Photos/IMG_2.jpg"), &picture(2, 900, 600), Some(("2023:05:02 10:00:00", "Apple", "iPhone 13")));
+    fs::create_dir_all(b.join("backup/deeper/path")).unwrap();
+    fs::copy(a.join("Photos/IMG_1.jpg"), b.join("backup/deeper/path/IMG_1.jpg")).unwrap();
+    fs::copy(a.join("Photos/IMG_1.jpg"), a.join("Photos/IMG_1 (2).jpg")).unwrap();
+
+    let db = Db::open(root.join("appdata/library.db")).unwrap();
+    let mut conn = db.conn().unwrap();
+    volumes::add_source(&conn, &a).unwrap();
+    volumes::add_source(&conn, &b).unwrap();
+    scanner::scan_all(&db, &ScanOptions::default(), &StopFlag::new(), &quiet).unwrap();
+    assert_eq!(identity::refresh_roles(&mut conn).unwrap(), 3, "three identical files; the unique one has no role");
+    let role = |conn: &rusqlite::Connection, rel: &str| -> Option<String> {
+        let id = id_of(conn, rel).unwrap();
+        db::query_grid(conn, &FileFilter { ids: Some(vec![id]), ..Default::default() }, 0, 1).unwrap()[0].dup_role.clone()
+    };
+    let originals = ["Photos/IMG_1.jpg", "Photos/IMG_1 (2).jpg", "backup/deeper/path/IMG_1.jpg"]
+        .iter()
+        .filter(|r| role(&conn, r).as_deref() == Some("original"))
+        .count();
+    assert_eq!(originals, 1);
+    assert_eq!(role(&conn, "Photos/IMG_2.jpg"), None);
+
+    // The user picks the backup copy, then another one: exactly one original, the last pick.
+    let pick = id_of(&conn, "backup/deeper/path/IMG_1.jpg").unwrap();
+    identity::set_original(&mut conn, pick).unwrap();
+    assert_eq!(role(&conn, "backup/deeper/path/IMG_1.jpg").as_deref(), Some("original"));
+    let pick = id_of(&conn, "Photos/IMG_1 (2).jpg").unwrap();
+    identity::set_original(&mut conn, pick).unwrap();
+    assert_eq!(role(&conn, "Photos/IMG_1 (2).jpg").as_deref(), Some("original"));
+    assert_eq!(role(&conn, "backup/deeper/path/IMG_1.jpg").as_deref(), Some("copy"));
+    assert_eq!(role(&conn, "Photos/IMG_1.jpg").as_deref(), Some("copy"));
+}

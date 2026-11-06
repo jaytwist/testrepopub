@@ -115,6 +115,9 @@ export default function Library({ active = true, preset, onClearPreset, onConsum
   const [anchor, setAnchor] = useState<number | null>(null);
   const [viewId, setViewId] = useState<number | null>(null);
   const [comparing, setComparing] = useState<number[] | null>(null);
+  const viewerChanged = useRef(false);
+  /** Mark identical files as 원본 / 사본 on the tiles. */
+  const [showRoles, setShowRoles] = useState<boolean>(() => store.get("mo.showRoles") === "1");
   const [bulk, setBulk] = useState<"label" | "date" | "shift" | null>(null);
   const [bulkValue, setBulkValue] = useState("");
   const [busyGroup, setBusyGroup] = useState<string | null>(null);
@@ -805,6 +808,11 @@ export default function Library({ active = true, preset, onClearPreset, onConsum
           {item.kind === "video" && <span className="badge-video">▶ {fmtDuration(item.duration_ms)}</span>}
           {item.kind === "raw" && <span className="badge-raw" style={item.favorite ? { right: 30 } : undefined}>RAW</span>}
           {item.favorite && <span className="badge-fav" title="즐겨찾기">♥</span>}
+          {showRoles && item.dup_role && (
+            <span className={`badge-role ${item.dup_role}`} style={!item.online ? { left: 30 } : undefined} title="똑같은 파일이 여러 개 있습니다">
+              {item.dup_role === "original" ? "원본" : "사본"}
+            </span>
+          )}
           {!item.online && <span className="badge-offline" title="드라이브 연결 안 됨">⏏</span>}
           {cap && <span className="tile-caption">{cap}</span>}
           {stack && groupBy !== "burst" && item.burst_rank === 0 && (item.burst_size ?? 0) > 1 && (
@@ -897,6 +905,10 @@ export default function Library({ active = true, preset, onClearPreset, onConsum
             <button className="btn small" onClick={unfoldAll} disabled={foldedCount === 0}>모두 펼치기</button>
           </>
         )}
+        <label className="check-row small roles-toggle" title="똑같은 파일이 여러 개인 사진에 원본/사본 표시 (사진 보기에서 원본을 직접 지정할 수 있음)">
+          <input type="checkbox" checked={showRoles} onChange={(e) => { setShowRoles(e.target.checked); store.set("mo.showRoles", e.target.checked ? "1" : "0"); }} />
+          원본 표시
+        </label>
         <label className="tile-size small" title="사진 크기 (Ctrl + 마우스 휠로도 조절)">
           <span className="muted">크기</span>
           <input type="range" min={TILE_MIN} max={TILE_MAX} step={8} value={tile} onChange={(e) => changeTile(Number(e.target.value))} />
@@ -1028,8 +1040,18 @@ export default function Library({ active = true, preset, onClearPreset, onConsum
             setViewId(flat[i].id);
             if (i > flat.length - 30) loadNext();
           }}
-          onClose={() => setViewId(null)}
-          onChanged={() => api.filteredStats(qf).then(setStats)}
+          onClose={() => {
+            setViewId(null);
+            // ♥ / original changes made in the viewer show on the tiles once it closes.
+            if (viewerChanged.current) {
+              viewerChanged.current = false;
+              reload();
+            }
+          }}
+          onChanged={() => {
+            viewerChanged.current = true;
+            api.filteredStats(qf).then(setStats);
+          }}
           review={review ? {
             title: review.title,
             marked: selected,

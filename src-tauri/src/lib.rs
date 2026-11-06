@@ -56,7 +56,10 @@ pub(crate) fn post_analysis(st: &AppState) -> anyhow::Result<()> {
 
 pub(crate) fn refresh_places(st: &AppState) -> anyhow::Result<()> {
     let mut conn = st.db.conn()?;
-    media_core::places::refresh(&mut conn)
+    media_core::places::refresh(&mut conn)?;
+    // Which copy of identical files is the original (cheap; nothing is read from disk).
+    media_core::identity::refresh_roles(&mut conn)?;
+    Ok(())
 }
 
 #[derive(Clone, Serialize)]
@@ -378,6 +381,8 @@ fn analysis_pause(app: AppHandle, state: State<AppState>, paused: bool) {
 #[tauri::command]
 fn analysis_start(app: AppHandle, state: State<AppState>) {
     state.lane.set_user_paused(&app, false);
+    // A failed face engine is loaded again (e.g. after the AI files were put in place).
+    state.lane.reset_engine();
     state.lane.kick(&app, true);
 }
 
@@ -472,6 +477,9 @@ struct FileDetail {
     place: Option<String>,
     /// Named people in the photo.
     people: Vec<(i64, String)>,
+    /// "original" / "copy" and how many identical files there are, when there are copies.
+    dup_role: Option<String>,
+    dup_group_size: i64,
 }
 
 #[tauri::command]
@@ -487,6 +495,13 @@ struct CompareInfo {
     comparison: media_core::compare::Comparison,
 }
 
+/// "This copy is the original" (one per group of identical files).
+#[tauri::command]
+fn set_original(state: State<AppState>, id: i64) -> CmdResult<()> {
+    let mut conn = state.db.conn().map_err(err)?;
+    media_core::identity::set_original(&mut conn, id).map_err(err)
+}
+
 #[tauri::command]
 fn get_dup_rules(state: State<AppState>) -> CmdResult<dedupe::DupRules> {
     let conn = state.db.conn().map_err(err)?;
@@ -498,7 +513,9 @@ fn get_dup_rules(state: State<AppState>) -> CmdResult<dedupe::DupRules> {
 fn set_dup_rules(state: State<AppState>, rules: dedupe::DupRules) -> CmdResult<usize> {
     let mut conn = state.db.conn().map_err(err)?;
     rules.save(&conn).map_err(err)?;
-    dedupe::apply_rules(&mut conn).map_err(err)
+    let changed = dedupe::apply_rules(&mut conn).map_err(err)?;
+    media_core::identity::refresh_roles(&mut conn).map_err(err)?;
+    Ok(changed)
 }
 
 /// Folders worth a "delete from here first" rule: messenger / download folders that hold
@@ -611,6 +628,8 @@ fn detail_of(state: &AppState, conn: &media_core::rusqlite::Connection, id: i64)
         thumb_cached: state.thumbs.has_thumb(&f),
         place: media_core::places::place_of(&conn, id).map_err(err)?,
         people: media_core::people::names_in(&conn, id).map_err(err)?,
+        dup_role: conn.query_row("SELECT role FROM dup_roles WHERE file_id = ?", [id], |r| r.get(0)).ok(),
+        dup_group_size: conn.query_row("SELECT group_size FROM dup_roles WHERE file_id = ?", [id], |r| r.get(0)).unwrap_or(0),
         file: f,
     })
 }
@@ -1054,6 +1073,7 @@ pub fn run() {
             trips_summary,
             compare_files,
             get_dup_rules,
+            set_original,
             set_dup_rules,
             dup_rule_suggestions,
             similar_to,

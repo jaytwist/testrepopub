@@ -30,8 +30,9 @@ export interface LibraryPreset {
 interface NavCtx {
   go: (p: Page) => void;
   openLibrary: (p: Omit<LibraryPreset, "key">) => void;
-  /** Open 「한 곳으로 정리」 for these files only (e.g. the library selection). */
-  openOrganize: (filter: FileFilter) => void;
+  /** Open 「한 곳으로 정리」 for these files only (e.g. the library selection), optionally with a
+   *  folder structure preselected. */
+  openOrganize: (filter: FileFilter, template?: string) => void;
 }
 export const NavContext = createContext<NavCtx>({ go: () => {}, openLibrary: () => {}, openOrganize: () => {} });
 export const useNav = () => useContext(NavContext);
@@ -127,15 +128,15 @@ export default function App() {
   const [lane, setLane] = useState<LaneStatus | null>(null);
   const [preset, setPreset] = useState<LibraryPreset | null>(null);
 
-  const [organizePreset, setOrganizePreset] = useState<{ key: number; filter: FileFilter } | null>(null);
+  const [organizePreset, setOrganizePreset] = useState<{ key: number; filter: FileFilter; template?: string } | null>(null);
   const nav: NavCtx = {
     go: (p) => setPage(p),
     openLibrary: (p) => {
       setPreset({ ...p, key: Date.now() });
       setPage("library");
     },
-    openOrganize: (filter) => {
-      setOrganizePreset({ key: Date.now(), filter });
+    openOrganize: (filter, template) => {
+      setOrganizePreset({ key: Date.now(), filter, template });
       setPage("organize");
     },
   };

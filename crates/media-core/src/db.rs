@@ -208,6 +208,14 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY(a, b)
     );
     "#,
+    // 4: which copy of a byte-identical file is the original (derived; rebuilt any time).
+    r#"
+    CREATE TABLE IF NOT EXISTS dup_roles (
+        file_id    INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+        role       TEXT NOT NULL,
+        group_size INTEGER NOT NULL
+    );
+    "#,
 ];
 
 pub fn schema_version(conn: &Connection) -> Result<i64> {
@@ -384,6 +392,8 @@ pub struct GridItem {
     pub copies: i64,
     /// Marked ♥ (the user label "favorite").
     pub favorite: bool,
+    /// "original" / "copy" when byte-identical copies of this file exist (see `identity::refresh_roles`).
+    pub dup_role: Option<String>,
 }
 
 /// SQL: file `g` has the same content as file `f` — the full hashes when both are known,
@@ -712,7 +722,8 @@ pub fn query_grid(conn: &Connection, filter: &FileFilter, offset: i64, limit: i6
         "SELECT f.id, f.kind, f.taken_at, f.width, f.height, f.duration_ms, v.online, f.size, f.mtime, f.name,
                 (SELECT COUNT(*) FROM bursts b2 WHERE b2.burst_id = bb.burst_id), bb.rank, bb.burst_id,
                 (SELECT COUNT(*) FROM files g WHERE g.id != f.id AND g.volume_id != f.volume_id AND g.missing = 0 AND g.quarantined = 0 AND {same}),
-                EXISTS (SELECT 1 FROM labels lf WHERE lf.file_id = f.id AND lf.label = 'favorite')
+                EXISTS (SELECT 1 FROM labels lf WHERE lf.file_id = f.id AND lf.label = 'favorite'),
+                (SELECT dr.role FROM dup_roles dr WHERE dr.file_id = f.id)
          FROM files f JOIN volumes v ON v.id = f.volume_id LEFT JOIN bursts bb ON bb.file_id = f.id WHERE {w}
          ORDER BY {} LIMIT {limit} OFFSET {offset}",
         filter.order_sql(),
@@ -737,6 +748,7 @@ pub fn query_grid(conn: &Connection, filter: &FileFilter, offset: i64, limit: i6
                 burst_id: r.get(12)?,
                 copies: r.get(13)?,
                 favorite: r.get::<_, i64>(14)? != 0,
+                dup_role: r.get(15)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;

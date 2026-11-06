@@ -6,7 +6,7 @@
 //!   face  -> 5-point similarity alignment to the ArcFace 112x112 template -> RGB -> SFace -> L2-normalized 128-d
 
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 
 use anyhow::{anyhow, Context, Result};
 use image::RgbImage;
@@ -37,15 +37,49 @@ pub struct Face {
     pub kps: [[f32; 2]; 5],
 }
 
-static ENV: OnceLock<std::result::Result<ort::environment::Environment, String>> = OnceLock::new();
+/// The ONNX Runtime environment, created once it loads successfully (a failure is retried on the
+/// next attempt instead of being remembered until the app restarts).
+static ENV: Mutex<Option<&'static ort::environment::Environment>> = Mutex::new(None);
+
+/// Make Windows find the DLLs that onnxruntime.dll depends on (DirectML.dll) in the same `ai`
+/// folder: by default it only looks next to the .exe and in the system folders, where an older
+/// DirectML.dll may be found instead — or none at all.
+pub fn prepare_dll_dir(dir: &Path) {
+    #[cfg(windows)]
+    {
+        use windows::core::HSTRING;
+        use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
+        // SAFETY: plain Win32 call with a valid, NUL-terminated path.
+        let _ = unsafe { SetDllDirectoryW(&HSTRING::from(dir.as_os_str())) };
+        if let Some(cur) = std::env::var_os("PATH") {
+            let mut paths = vec![dir.to_path_buf()];
+            paths.extend(std::env::split_paths(&cur).filter(|p| p != dir));
+            if let Ok(joined) = std::env::join_paths(paths) {
+                // SAFETY: only called right before the face engine loads, from the analysis thread.
+                unsafe { std::env::set_var("PATH", joined) };
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = dir;
+}
 
 fn environment(lib: &Path) -> Result<&'static ort::environment::Environment> {
-    let env = ENV.get_or_init(|| {
-        ort::init_from(lib)
-            .map_err(|e| format!("ONNX Runtime을 불러오지 못했습니다 ({}): {e}", lib.display()))
-            .and_then(|b| b.with_name("media-organizer").build().map_err(|e| e.to_string()))
-    });
-    env.as_ref().map_err(|e| anyhow!("{e}"))
+    let mut slot = ENV.lock().map_err(|_| anyhow!("ONNX Runtime lock poisoned"))?;
+    if let Some(env) = *slot {
+        return Ok(env);
+    }
+    if let Some(dir) = lib.parent() {
+        prepare_dll_dir(dir);
+    }
+    let env = ort::init_from(lib)
+        .map_err(|e| anyhow!("ONNX Runtime을 불러오지 못했습니다 ({}): {e}", lib.display()))?
+        .with_name("media-organizer")
+        .build()
+        .map_err(|e| anyhow!("ONNX Runtime 초기화 실패: {e}"))?;
+    let env: &'static ort::environment::Environment = Box::leak(Box::new(env));
+    *slot = Some(env);
+    Ok(env)
 }
 
 pub struct FaceEngine {

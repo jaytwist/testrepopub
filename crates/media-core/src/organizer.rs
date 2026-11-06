@@ -35,7 +35,7 @@ pub enum Rename {
 #[serde(default)]
 pub struct OrganizeOptions {
     pub target_dir: String,
-    /// Tokens: {year} {month} {day} {date} {kind} {camera} {source} {label} {trip}
+    /// Tokens: {year} {month} {day} {date} {kind} {camera} {source} {label} {trip} {person}
     pub template: String,
     pub rename: Rename,
     pub mode: Mode,
@@ -138,6 +138,8 @@ pub struct TemplateCtx<'a> {
     pub labels: &'a [String],
     /// Title of the automatic trip this file belongs to (`{trip}`; empty outside trips).
     pub trip: Option<&'a str>,
+    /// Named people in the photo as one folder name (`{person}`; empty when nobody is named).
+    pub person: Option<&'a str>,
 }
 
 fn primary_kind(ctx: &TemplateCtx) -> &'static str {
@@ -183,7 +185,8 @@ pub fn render_template(tpl: &str, ctx: &TemplateCtx) -> String {
         .replace("{camera}", &camera)
         .replace("{source}", source)
         .replace("{label}", user_label)
-        .replace("{trip}", ctx.trip.unwrap_or(""));
+        .replace("{trip}", ctx.trip.unwrap_or(""))
+        .replace("{person}", ctx.person.unwrap_or(""));
     rendered
         .split(['/', '\\'])
         .map(str::trim)
@@ -250,6 +253,7 @@ pub fn plan(db: &Db, opts: &OrganizeOptions, stop: &StopFlag, progress: Progress
     }
 
     let trips = crate::places::trip_titles(&conn)?;
+    let persons = crate::people::folder_names(&conn)?;
     let mut items = Vec::with_capacity(ids.len());
     let mut summary = PlanSummary::default();
     // dst key -> (size, src path, known hash) of the file that claimed it first in this plan.
@@ -272,7 +276,7 @@ pub fn plan(db: &Db, opts: &OrganizeOptions, stop: &StopFlag, progress: Progress
         if uncertain {
             summary.uncertain_dates += 1;
         }
-        let ctx = TemplateCtx { file: &f, labels, trip: trips.get(id).map(String::as_str) };
+        let ctx = TemplateCtx { file: &f, labels, trip: trips.get(id).map(String::as_str), person: persons.get(id).map(String::as_str) };
         let rel_dir = match (&opts.uncertain_folder, uncertain) {
             (Some(u), true) if !u.trim().is_empty() => format!("{}/{}", sanitize(u.trim()), render_template(&opts.template, &ctx)),
             _ => render_template(&opts.template, &ctx),
@@ -491,17 +495,21 @@ mod tests {
     fn templates() {
         let f = row("IMG_1.jpg", "2019-05-12 14:30:12", "photo", Some("Apple iPhone 13"));
         let l = vec![];
-        let ctx = TemplateCtx { file: &f, labels: &l, trip: None };
+        let ctx = TemplateCtx { file: &f, labels: &l, trip: None, person: None };
         assert_eq!(render_template("{year}/{year}-{month}", &ctx), "2019/2019-05");
         assert_eq!(render_template("{kind}/{year}/{camera}", &ctx), "사진/2019/Apple iPhone 13");
         assert_eq!(render_template("{source}/{date}", &ctx), "카메라/2019-05-12");
         let l = vec!["screenshot".to_string(), "src:kakaotalk".to_string()];
-        let ctx = TemplateCtx { file: &f, labels: &l, trip: None };
+        let ctx = TemplateCtx { file: &f, labels: &l, trip: None, person: None };
         assert_eq!(render_template("{kind}/{source}", &ctx), "스크린샷/카카오톡");
         // {trip}: trip folder for trip photos, nothing (= parent folder) for the rest.
         assert_eq!(render_template("{year}/{trip}", &ctx), "2019");
-        let ctx = TemplateCtx { file: &f, labels: &l, trip: Some("2019년 5월 Honolulu 여행") };
+        let ctx = TemplateCtx { file: &f, labels: &l, trip: Some("2019년 5월 Honolulu 여행"), person: None };
         assert_eq!(render_template("{year}/{trip}", &ctx), "2019/2019년 5월 Honolulu 여행");
+        let ctx = TemplateCtx { file: &f, labels: &l, trip: None, person: Some("아빠, 엄마") };
+        assert_eq!(render_template("{person}/{year}", &ctx), "아빠, 엄마/2019");
+        let ctx = TemplateCtx { file: &f, labels: &l, trip: None, person: None };
+        assert_eq!(render_template("{person}/{year}", &ctx), "2019", "nobody named: stays at the year level");
         assert_eq!(target_name(&f, Rename::DatePrefix), "2019-05-12_143012_IMG_1.jpg");
     }
 

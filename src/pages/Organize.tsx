@@ -10,6 +10,7 @@ const PRESETS = [
   { tpl: "{kind}/{year}/{year}-{month}", name: "종류 / 연도 / 연-월", example: "사진/2019/2019-05/…, 동영상/…, 스크린샷/…" },
   { tpl: "{year}/{year}-{month} {label}", name: "연-월 + 라벨", example: "2019/2019-05 가족여행/…" },
   { tpl: "{source}/{year}", name: "출처 / 연도", example: "카메라/2019, 카카오톡/2021, 다운로드/…" },
+  { tpl: "{person}/{year}", name: "인물 / 연도", example: "엄마/2024/…, 아빠, 엄마/2023/… (여러 명은 함께 폴더), 이름 없는 사진은 2024/" },
   { tpl: "{year}/{trip}", name: "연도 / 여행", example: "2024/2024년 6월 Honolulu 여행/…, 여행 아닌 사진은 2024/" },
 ];
 
@@ -17,11 +18,11 @@ const ACTION_NAMES: Record<string, string> = {
   move: "이동", copy: "복사", in_place: "이미 정리됨", skip_duplicate: "중복이라 건너뜀", skip_offline: "드라이브 연결 안 됨",
 };
 
-export default function Organize({ preset }: { preset?: { key: number; filter: FileFilter } | null }) {
+export default function Organize({ preset }: { preset?: { key: number; filter: FileFilter; template?: string } | null }) {
   const { running, setRunning, lastDone } = useJob();
   const [opts, setOpts] = useState<OrganizeOptions>({
     target_dir: "",
-    template: PRESETS[0].tpl,
+    template: preset?.template ?? PRESETS[0].tpl,
     rename: "keep",
     mode: "move",
     filter: preset?.filter ?? {},
@@ -40,7 +41,7 @@ export default function Organize({ preset }: { preset?: { key: number; filter: F
   }, [opts.filter]);
   // Opened for a set of files (e.g. the library selection).
   useEffect(() => {
-    if (preset) setOpts((o) => ({ ...o, filter: preset.filter }));
+    if (preset) setOpts((o) => ({ ...o, filter: preset.filter, template: preset.template ?? o.template }));
   }, [preset?.key]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Pick up results of our jobs.
@@ -148,7 +149,7 @@ export default function Organize({ preset }: { preset?: { key: number; filter: F
           <div className="inline-form">
             <input className="grow mono" value={opts.template} onChange={(e) => set({ template: e.target.value })} />
           </div>
-          <div className="muted small">사용 가능: {"{year} {month} {day} {date} {kind} {camera} {source} {label} {trip}"}</div>
+          <div className="muted small">사용 가능: {"{year} {month} {day} {date} {kind} {camera} {source} {label} {trip} {person}"}{opts.template.includes("{person}") && <span> · 인물은 「인물」 화면에서 이름을 붙인 사람만 폴더가 됩니다</span>}</div>
         </div>
 
         <label>파일 이름</label>
@@ -177,9 +178,9 @@ export default function Organize({ preset }: { preset?: { key: number; filter: F
 
         <label>대상 파일</label>
         <div>
-          {opts.filter.ids ? (
+          {opts.filter.ids || opts.filter.person_ids ? (
             <div className="alert ok selection-only">
-              라이브러리에서 고른 <b>{opts.filter.ids.length}장</b>만 정리합니다.
+              {opts.filter.ids ? <>라이브러리에서 고른 <b>{opts.filter.ids.length}장</b>만 정리합니다.</> : <>고른 인물이 나온 사진만 정리합니다.</>}
               <button className="btn small ghost" onClick={() => set({ filter: {} })}>해제하고 필터로 고르기</button>
             </div>
           ) : (

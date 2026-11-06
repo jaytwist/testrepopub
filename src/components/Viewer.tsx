@@ -3,7 +3,7 @@ import { useNav } from "../App";
 import ZoomImage from "./ZoomImage";
 import Compare from "./Compare";
 import {
-  FAVORITE,
+  FAVORITE, SYSTEM_LABELS,
   api, DATE_SOURCE_NAMES, fileUrl, fmtBytes, fmtDuration, labelName, thumbUrl, toDatetimeLocal,
   type FileDetail, type GridItem, type LabelCount,
 } from "../api";
@@ -177,10 +177,10 @@ export default function Viewer({ items, index, onIndex, onClose, onChanged, revi
   };
 
   const f = detail?.file;
-  const userLabels = detail?.labels.filter((l) => l.source === "user" && l.label !== FAVORITE) ?? [];
+  const userLabels = detail?.labels.filter((l) => l.source === "user" && !SYSTEM_LABELS.includes(l.label)) ?? [];
   const isFav = !!detail?.labels.some((l) => l.label === FAVORITE);
   const ruleLabels = detail?.labels.filter((l) => l.source !== "user") ?? [];
-  const suggestions = allLabels.filter((l) => l.user && l.label !== FAVORITE && !userLabels.some((u) => u.label === l.label)).slice(0, 8);
+  const suggestions = allLabels.filter((l) => l.user && !SYSTEM_LABELS.includes(l.label) && !userLabels.some((u) => u.label === l.label)).slice(0, 8);
 
   return (
     <div className={`viewer ${review ? "reviewing" : ""}`} onClick={close}>
@@ -307,6 +307,18 @@ export default function Viewer({ items, index, onIndex, onClose, onChanged, revi
               {f.width && <div><span>해상도</span><b>{f.width} × {f.height}</b></div>}
               {f.duration_ms && <div><span>길이</span><b>{fmtDuration(f.duration_ms)}</b></div>}
               <div><span>크기</span><b>{fmtBytes(f.size)}</b></div>
+              {detail!.dup_role && (
+                <div>
+                  <span>중복</span>
+                  <b className="dup-role-line">
+                    같은 파일 {detail!.dup_group_size}개 중{" "}
+                    <span className={`role-tag ${detail!.dup_role}`}>{detail!.dup_role === "original" ? "원본" : "사본"}</span>
+                    {detail!.dup_role === "copy" && (
+                      <button className="btn small ghost" onClick={async () => { await api.setOriginal(item.id); load(); onChanged?.(); }}>이 파일을 원본으로</button>
+                    )}
+                  </b>
+                </div>
+              )}
               {f.camera && <div><span>카메라</span><b>{f.camera}</b></div>}
               {detail!.people.length > 0 && (
                 <div>

@@ -191,3 +191,72 @@ pub fn backfill_prehashes(conn: &Connection) -> Result<usize> {
     }
     Ok(done.len())
 }
+
+/// The user label that marks "this copy is the original".
+pub const ORIGINAL_LABEL: &str = "original";
+
+/// Rebuild which copy of each byte-identical file is the original and which are copies:
+/// a copy the user marked as original wins, otherwise the duplicates screen's ranking (with the
+/// user's keep rules). Reads nothing from disk; returns how many files have a role.
+pub fn refresh_roles(conn: &mut Connection) -> Result<usize> {
+    use std::collections::HashMap;
+    let rules = crate::dedupe::DupRules::load(conn)?;
+    let sql = format!(
+        "SELECT {}, COALESCE(f.prehash, f.hash) k FROM files f JOIN volumes v ON v.id = f.volume_id
+         WHERE f.missing = 0 AND f.quarantined = 0 AND COALESCE(f.prehash, f.hash) IN (
+             SELECT COALESCE(prehash, hash) FROM files WHERE missing = 0 AND quarantined = 0 AND COALESCE(prehash, hash) IS NOT NULL
+             GROUP BY COALESCE(prehash, hash) HAVING COUNT(*) > 1)",
+        db::FILE_COLS
+    );
+    let mut groups: HashMap<String, Vec<db::FileRow>> = HashMap::new();
+    {
+        let mut st = conn.prepare(&sql)?;
+        for r in st.query_map([], |r| Ok((db::FileRow::from_row(r)?, r.get::<_, String>(db::FILE_COLS_LEN)?)))? {
+            let (f, k) = r?;
+            groups.entry(k).or_default().push(f);
+        }
+    }
+    let tx = conn.transaction()?;
+    tx.execute("DELETE FROM dup_roles", [])?;
+    let mut n = 0;
+    {
+        let mut lab = tx.prepare("SELECT label FROM labels WHERE file_id = ?")?;
+        let mut ins = tx.prepare("INSERT INTO dup_roles(file_id, role, group_size) VALUES (?, ?, ?)")?;
+        for (_, mut g) in groups {
+            let mut labels = HashMap::new();
+            for f in &g {
+                labels.insert(f.id, lab.query_map([f.id], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?);
+            }
+            crate::dedupe::rank_members(&mut g, &labels, &rules);
+            // The user's own pick goes first (stable: ranking order among the rest).
+            if let Some(i) = g.iter().position(|f| labels[&f.id].iter().any(|l| l == ORIGINAL_LABEL)) {
+                let picked = g.remove(i);
+                g.insert(0, picked);
+            }
+            for (i, f) in g.iter().enumerate() {
+                ins.execute(params![f.id, if i == 0 { "original" } else { "copy" }, g.len() as i64])?;
+                n += 1;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(n)
+}
+
+/// "This copy is the original": the pick is remembered (one per group of identical files).
+pub fn set_original(conn: &mut Connection, file_id: i64) -> Result<()> {
+    let key: Option<String> = conn.query_row("SELECT COALESCE(prehash, hash) FROM files WHERE id = ?", [file_id], |r| r.get(0))?;
+    {
+        let tx = conn.transaction()?;
+        if let Some(k) = key {
+            tx.execute(
+                "DELETE FROM labels WHERE label = ?1 AND file_id IN (SELECT id FROM files WHERE COALESCE(prehash, hash) = ?2)",
+                params![ORIGINAL_LABEL, k],
+            )?;
+        }
+        tx.execute("INSERT OR REPLACE INTO labels(file_id, label, source) VALUES (?, ?, 'user')", params![file_id, ORIGINAL_LABEL])?;
+        tx.commit()?;
+    }
+    refresh_roles(conn)?;
+    Ok(())
+}

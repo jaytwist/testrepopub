@@ -148,6 +148,7 @@ export default function Compare({ ids, onClose }: { ids: number[]; onClose: () =
               </div>
               <div className="cmp-tags">
                 {info?.recommended === id && <span className="badge-best">★ 추천</span>}
+                {d?.dup_role && <span className={`role-tag ${d.dup_role}`}>{d.dup_role === "original" ? "원본" : "사본"}</span>}
                 {g >= 0 && <span className="cmp-same">내용 같음 {String.fromCharCode(65 + g)}</span>}
               </div>
               <div className="seg cmp-keep">

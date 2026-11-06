@@ -403,6 +403,34 @@ pub fn names_in(conn: &Connection, file_id: i64) -> Result<Vec<(i64, String)>> {
     Ok(rows)
 }
 
+/// Folder name for a photo's named people (the `{person}` organize token): one person → "Mom";
+/// two or three → "Dad, Mom" (sorted, so a group always lands in the same folder); more →
+/// "Dad, Mom 외 2명". None when nobody in it is named.
+pub fn folder_name(names: &[String]) -> Option<String> {
+    let mut v: Vec<String> = names.iter().map(|n| n.trim().replace(['/', '\\'], "-")).filter(|n| !n.is_empty()).collect();
+    v.sort();
+    v.dedup();
+    match v.len() {
+        0 => None,
+        1..=3 => Some(v.join(", ")),
+        n => Some(format!("{} 외 {}명", v[..2].join(", "), n - 2)),
+    }
+}
+
+/// `{person}` folder per file, for every file with at least one named, visible person.
+pub fn folder_names(conn: &Connection) -> Result<HashMap<i64, String>> {
+    let mut st = conn.prepare(
+        "SELECT DISTINCT fc.file_id, p.name FROM faces fc JOIN persons p ON p.id = fc.person_id
+         WHERE p.name IS NOT NULL AND p.hidden = 0 AND fc.hidden = 0",
+    )?;
+    let mut by_file: HashMap<i64, Vec<String>> = HashMap::new();
+    for r in st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+        let (f, n) = r?;
+        by_file.entry(f).or_default().push(n);
+    }
+    Ok(by_file.into_iter().filter_map(|(f, names)| folder_name(&names).map(|n| (f, n))).collect())
+}
+
 /// The original face a copied face came from (its crop can be reused).
 pub fn src_face(conn: &Connection, face_id: i64) -> Result<Option<i64>> {
     Ok(conn.query_row("SELECT src_face FROM faces WHERE id = ?", [face_id], |r| r.get(0)).optional()?.flatten())
@@ -467,6 +495,17 @@ mod tests {
         fn person_of(&self, face: i64) -> Option<i64> {
             self.conn.query_row("SELECT person_id FROM faces WHERE id = ?", [face], |r| r.get(0)).unwrap()
         }
+    }
+
+    #[test]
+    fn person_folder_names() {
+        let n = |v: &[&str]| folder_name(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(n(&[]), None);
+        assert_eq!(n(&["엄마"]).as_deref(), Some("엄마"));
+        assert_eq!(n(&["엄마", "아빠"]).as_deref(), Some("아빠, 엄마"), "sorted: same group, same folder");
+        assert_eq!(n(&["엄마", "아빠", "엄마"]).as_deref(), Some("아빠, 엄마"));
+        assert_eq!(n(&["D", "C", "B", "A"]).as_deref(), Some("A, B 외 2명"));
+        assert_eq!(n(&["AC/DC"]).as_deref(), Some("AC-DC"), "no accidental subfolders");
     }
 
     #[test]

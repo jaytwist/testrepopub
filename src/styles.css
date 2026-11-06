@@ -138,6 +138,7 @@ input:focus, select:focus { outline: 2px solid var(--accent-soft); border-color:
 .kv { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
 .kv div { display: flex; justify-content: space-between; gap: 10px; }
 .kv span { color: var(--muted); }
+.kv > div > span { flex-shrink: 0; }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .chip { background: var(--panel-2); border-radius: 999px; padding: 3px 10px; font-size: 12px; border: 1px solid transparent; }
 .chip.user { background: var(--accent-soft); color: var(--accent); }
@@ -445,3 +446,18 @@ kbd { font: 11px/1 ui-monospace, Consolas, monospace; border: 1px solid var(--li
 .tile.sel.cursor { outline: 3px solid var(--accent); outline-offset: -3px; box-shadow: 0 0 0 2px var(--panel), 0 0 0 4px var(--accent); }
 .hours-input { width: 90px; }
 .selection-only { display: flex; align-items: center; gap: 10px; margin: 0; }
+
+/* --- people diagnostics --- */
+.people-diag { display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center; font-size: 13px; padding: 8px 12px; border-radius: 8px; background: var(--panel-2); margin-bottom: 12px; }
+.people-diag.bad { background: var(--bad-soft); }
+
+/* --- original / copy --- */
+.badge-role { position: absolute; left: 6px; bottom: 6px; font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: 10px; pointer-events: none; }
+.badge-role.original { background: rgba(22, 163, 74, 0.9); color: #fff; }
+.badge-role.copy { background: rgba(60, 64, 72, 0.8); color: #fff; }
+.role-tag { font-size: 11px; font-weight: 700; padding: 1px 8px; border-radius: 10px; }
+.role-tag.original { background: var(--ok-soft); color: var(--ok); }
+.role-tag.copy { background: var(--panel-2); color: var(--muted); }
+.dup-role-line { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.roles-toggle { margin-left: auto; }
+.roles-toggle + .tile-size { margin-left: 12px; }
