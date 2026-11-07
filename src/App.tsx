@@ -67,6 +67,19 @@ function stageName(p: Progress): string {
   return p.stage;
 }
 
+/** What a finished job did, in one line. Deletions say how much went and what was protected. */
+function doneText(d: JobDone): string {
+  const r = (d.result ?? {}) as Record<string, number>;
+  if (d.job === "delete" || d.job === "dedupe:apply") {
+    const n = r.deleted ?? r.quarantined ?? 0;
+    const parts = [`${fmtCount(n)}개를 격리했습니다 (${fmtBytes(r.bytes ?? 0)})`];
+    if (r.protected) parts.push(`보호된 ${fmtCount(r.protected)}개는 남겼습니다`);
+    if (r.skipped_offline) parts.push(`연결 안 된 드라이브 ${fmtCount(r.skipped_offline)}개는 건너뜀`);
+    return parts.join(" · ") + " — 「작업 기록」에서 되돌릴 수 있습니다";
+  }
+  return "작업이 완료되었습니다";
+}
+
 const NAV: { section: string; items: { id: Page; label: string; icon: string }[] }[] = [
   {
     section: "보기",
@@ -200,7 +213,7 @@ export default function App() {
       setLastDone(d);
       setVersion((v) => v + 1);
       if (!d.ok && d.error !== "cancelled") setToast({ ok: false, text: d.error ?? "작업 실패" });
-      else if (d.ok) setToast({ ok: true, text: "작업이 완료되었습니다" });
+      else if (d.ok) setToast({ ok: true, text: doneText(d) });
     });
     return () => {
       p.then((u) => u());

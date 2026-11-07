@@ -20,6 +20,7 @@ pub mod organizer;
 pub mod people;
 pub mod places;
 pub mod power;
+pub mod protect;
 pub mod scanner;
 pub mod thumbs;
 pub mod userfiles;

@@ -965,11 +965,19 @@ fn start_undo(app: AppHandle, state: State<AppState>, batch_id: String) -> CmdRe
 
 /// Delete (quarantine) the selected files as one undoable batch.
 #[tauri::command]
-fn start_delete(app: AppHandle, state: State<AppState>, ids: Vec<i64>) -> CmdResult<()> {
+fn start_delete(app: AppHandle, state: State<AppState>, ids: Vec<i64>, force: Option<bool>) -> CmdResult<()> {
     if ids.is_empty() {
         return Err("선택한 파일이 없습니다".into());
     }
-    spawn_job(&app, &state, "delete", move |st, progress| journal::delete_files(&st.db, &ids, &st.stop, progress))
+    let force = force.unwrap_or(false);
+    spawn_job(&app, &state, "delete", move |st, progress| journal::delete_files(&st.db, &ids, force, &st.stop, progress))
+}
+
+/// Which of these files are protected from deletion, and why.
+#[tauri::command]
+fn protect_check(state: State<AppState>, ids: Vec<i64>) -> CmdResult<Vec<media_core::protect::Blocked>> {
+    let conn = state.db.conn().map_err(err)?;
+    media_core::protect::check(&conn, &ids).map_err(err)
 }
 
 #[tauri::command]
@@ -1100,6 +1108,7 @@ pub fn run() {
             rename_person,
             merge_people,
             reject_faces,
+            protect_check,
             move_faces,
             hide_people,
             set_person_cover,

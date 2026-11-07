@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Virtuoso, type ListRange, type VirtuosoHandle } from "react-virtuoso";
-import { confirm } from "@tauri-apps/plugin-dialog";
+import { confirmDelete } from "../deleteFlow";
 import {
   absPath, api, FAVORITE, fmtBytes, fmtCount, fmtDate, fmtDuration, thumbUrl,
   type FileFilter, type FilteredStats, type GridItem, type GroupBy, type GroupRow, type SortKey, type VolumeRow,
@@ -584,21 +584,12 @@ export default function Library({ active = true, preset, onClearPreset, onConsum
   const deleteSelected = useCallback(async () => {
     if (selected.size === 0 || running) return;
     const ids = Array.from(selected);
-    let size = "";
+    let bytes: number | undefined;
     try {
-      const st = await api.filteredStats({ ids });
-      size = ` (${fmtBytes(st.bytes)})`;
+      bytes = (await api.filteredStats({ ids })).bytes;
     } catch { /* size is informational only */ }
-    const ok = await confirm(
-      `선택한 ${fmtCount(ids.length)}개${size}를 삭제할까요?\n\n` +
-        "파일은 같은 드라이브의 격리 폴더로 옮겨집니다. 바로 아래 「되돌리기」나 「작업 기록」에서 복원할 수 있고, " +
-        "「격리함 비우기」를 해야 완전히 지워집니다.",
-      { title: "선택한 파일 삭제", kind: "warning", okLabel: "삭제", cancelLabel: "취소" },
-    );
-    if (!ok) return;
     try {
-      await api.startDelete(ids);
-      setRunning("delete");
+      if (await confirmDelete(ids, "선택한 파일 삭제", bytes)) setRunning("delete");
     } catch (e) {
       setLoadError(String(e));
     }

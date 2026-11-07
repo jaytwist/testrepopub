@@ -47,6 +47,9 @@ export interface DupRules { keep: string[]; drop: string[] }
 export interface CompareInfo { files: FileDetail[]; identical: number[][]; recommended: number | null }
 export interface PersonRow { id: number; name: string | null; cover_face_id: number | null; photos: number; hidden: boolean }
 export interface FaceRow { id: number; file_id: number; locked: boolean }
+/** A file that is not deleted unless forced, and why. */
+export interface Blocked { id: number; reason: "last_copy" | "keep_folder" | "original" | "favorite" }
+
 export interface PairSuggestion { a: PersonRow; b: PersonRow; similarity: number; shared_events: number }
 export interface TripRow { id: number; title: string; start_ts: number; end_ts: number; count: number; cover_file_id: number | null; place: string }
 export interface TripsSummary { trips: TripRow[]; home: string; located: number; total: number }
@@ -224,7 +227,9 @@ export const api = {
 
   batches: () => invoke<BatchRow[]>("batches"),
   startUndo: (batchId: string) => invoke<void>("start_undo", { batchId }),
-  startDelete: (ids: number[]) => invoke<void>("start_delete", { ids }),
+  /** Quarantine files. Protected ones (see protectCheck) are left in place unless `force`. */
+  startDelete: (ids: number[], force = false) => invoke<void>("start_delete", { ids, force }),
+  protectCheck: (ids: number[]) => invoke<Blocked[]>("protect_check", { ids }),
   startPurge: (batchId: string) => invoke<void>("start_purge", { batchId }),
 };
 

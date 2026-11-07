@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { confirmDelete } from "../deleteFlow";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import {
   api, DATE_SOURCE_NAMES, fileUrl, fmtBytes, fmtCount, fmtDate, fmtDuration, labelName, thumbUrl,
@@ -82,13 +83,8 @@ export default function Compare({ ids, onClose }: { ids: number[]; onClose: () =
   const remove = async () => {
     if (toDelete.length === 0 || running) return;
     if (keep.size === 0 && !(await confirm("모든 파일을 지우기로 골랐습니다. 하나도 남기지 않을까요?", { title: "모두 삭제", kind: "warning" }))) return;
-    const ok = await confirm(
-      `${fmtCount(toDelete.length)}개(${fmtBytes(bytes)})를 삭제할까요?\n\n같은 드라이브의 격리 폴더로 옮겨지며, 「되돌리기」나 「작업 기록」에서 복원할 수 있습니다.`,
-      { title: "비교한 파일 삭제", kind: "warning", okLabel: "삭제", cancelLabel: "취소" },
-    );
-    if (!ok) return;
     try {
-      await api.startDelete(toDelete.map((d) => d.file.id));
+      if (!(await confirmDelete(toDelete.map((d) => d.file.id), "비교한 파일 삭제", bytes))) return;
       setRunning("delete");
       onClose();
     } catch (e) {

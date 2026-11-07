@@ -429,15 +429,21 @@ pub struct DeleteReport {
     pub bytes: i64,
     /// On a drive that is not connected right now.
     pub skipped_offline: u64,
+    /// Protected (see `protect`) and not forced: left in place.
+    pub protected: u64,
     pub failed: u64,
     pub errors: Vec<String>,
     pub cancelled: bool,
 }
 
 /// Move the given files into their drives' quarantine folders as one undoable batch.
-pub fn delete_files(db: &Db, ids: &[i64], stop: &StopFlag, progress: ProgressFn) -> Result<DeleteReport> {
+/// Protected files (originals, ♥, keep folders, the last copy of some content) are left in place
+/// unless `force`.
+pub fn delete_files(db: &Db, ids: &[i64], force: bool, stop: &StopFlag, progress: ProgressFn) -> Result<DeleteReport> {
     let conn = db.conn()?;
     volumes::refresh(&conn)?;
+    let protected: std::collections::HashSet<i64> =
+        if force { Default::default() } else { crate::protect::check(&conn, ids)?.into_iter().map(|b| b.id).collect() };
     let batch = new_batch(&conn, "delete", &format!("선택한 {}개 삭제", ids.len()))?;
     let mut rep = DeleteReport { batch_id: batch.clone(), ..Default::default() };
     let total = ids.len() as u64;
@@ -448,6 +454,10 @@ pub fn delete_files(db: &Db, ids: &[i64], stop: &StopFlag, progress: ProgressFn)
         }
         if i % 20 == 0 {
             progress(Progress::new("delete", "quarantine", i as u64, total, ""));
+        }
+        if protected.contains(id) {
+            rep.protected += 1;
+            continue;
         }
         let Some(f) = db::get_file(&conn, *id)? else { continue };
         if f.quarantined || f.missing {

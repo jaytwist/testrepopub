@@ -396,6 +396,11 @@ impl DupRules {
         Ok(())
     }
 
+    /// Inside a folder the user marked "always keep".
+    pub fn is_kept(&self, f: &FileRow) -> bool {
+        self.class(f) == 0
+    }
+
     /// 0 = in a keep folder, 1 = no rule, 2 = in a drop folder.
     fn class(&self, f: &FileRow) -> u8 {
         let p = norm_path(&f.abs_path().to_string_lossy());
@@ -586,6 +591,8 @@ pub struct ApplyReport {
     pub quarantined: u64,
     pub bytes: i64,
     pub skipped_groups: u64,
+    /// Not kept by the group, but protected (♥, original, keep folder): left in place.
+    pub protected: u64,
     pub errors: Vec<String>,
 }
 
@@ -631,8 +638,14 @@ pub fn apply(db: &Db, kind: &str, group_ids: Option<Vec<i64>>, stop: &StopFlag, 
             rep.errors.push(format!("그룹 {gid}: 보존할 파일이 없거나 연결되지 않아 건너뜀"));
             continue;
         }
+        let drop: Vec<i64> = members.iter().filter(|(_, k)| !*k).map(|(f, _)| f.id).collect();
+        let protected: std::collections::HashSet<i64> = crate::protect::check(&conn, &drop)?.into_iter().map(|b| b.id).collect();
         for (f, keep) in &members {
             if *keep {
+                continue;
+            }
+            if protected.contains(&f.id) {
+                rep.protected += 1;
                 continue;
             }
             match journal::quarantine(&conn, &batch, f) {
