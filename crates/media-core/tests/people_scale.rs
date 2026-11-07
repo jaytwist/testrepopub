@@ -42,13 +42,14 @@ fn group_a_large_library() {
         let tx = conn.transaction().unwrap();
         tx.execute("INSERT INTO volumes(uid, label, mount, online) VALUES ('v', 'v', '/', 1)", []).unwrap();
         let mut file = tx
-            .prepare("INSERT INTO files(volume_id, rel_path, name, ext, kind, size, mtime, width, height) VALUES (1, ?1, ?1, 'jpg', 'photo', 1, 0, 4000, 3000)")
+            .prepare("INSERT INTO files(volume_id, rel_path, name, ext, kind, size, mtime, taken_at, date_source, width, height)
+                      VALUES (1, ?1, ?1, 'jpg', 'photo', 1, 0, ?2, 'exif', 4000, 3000)")
             .unwrap();
         let mut face = tx
             .prepare("INSERT INTO faces(file_id, x, y, w, h, score, model, embedding) VALUES (?1, 0.4, 0.4, 0.1, 0.1, 0.95, 'sface-2021dec', ?2)")
             .unwrap();
         for i in 0..total {
-            file.execute([format!("{i}.jpg")]).unwrap();
+            file.execute(rusqlite::params![format!("f{}/{i}.jpg", i / 200), 1_600_000_000 + (i / 200) as i64 * 86_400]).unwrap();
             let id = tx.last_insert_rowid();
             let v = if i < known {
                 let c = &centers[i % people];

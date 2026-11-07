@@ -313,6 +313,12 @@ fn merge_people(state: State<AppState>, into: i64, others: Vec<i64>) -> CmdResul
 }
 
 #[tauri::command]
+fn move_faces(state: State<AppState>, faces: Vec<i64>, from: i64, to: Option<i64>) -> CmdResult<i64> {
+    let mut conn = state.db.conn().map_err(err)?;
+    media_core::people::move_faces(&mut conn, &faces, from, to).map_err(err)
+}
+
+#[tauri::command]
 fn reject_faces(state: State<AppState>, faces: Vec<i64>, person: i64) -> CmdResult<()> {
     let mut conn = state.db.conn().map_err(err)?;
     media_core::people::reject(&mut conn, &faces, person).map_err(err)
@@ -1094,6 +1100,7 @@ pub fn run() {
             rename_person,
             merge_people,
             reject_faces,
+            move_faces,
             hide_people,
             set_person_cover,
             answer_people_pair,

@@ -47,7 +47,7 @@ export interface DupRules { keep: string[]; drop: string[] }
 export interface CompareInfo { files: FileDetail[]; identical: number[][]; recommended: number | null }
 export interface PersonRow { id: number; name: string | null; cover_face_id: number | null; photos: number; hidden: boolean }
 export interface FaceRow { id: number; file_id: number; locked: boolean }
-export interface PairSuggestion { a: PersonRow; b: PersonRow; similarity: number }
+export interface PairSuggestion { a: PersonRow; b: PersonRow; similarity: number; shared_events: number }
 export interface TripRow { id: number; title: string; start_ts: number; end_ts: number; count: number; cover_file_id: number | null; place: string }
 export interface TripsSummary { trips: TripRow[]; home: string; located: number; total: number }
 export interface Bucket { count: number; bytes: number }
@@ -169,6 +169,8 @@ export const api = {
   renamePerson: (person: number, name: string) => invoke<number | null>("rename_person", { person, name }),
   mergePeople: (into: number, others: number[]) => invoke<void>("merge_people", { into, others }),
   rejectFaces: (faces: number[], person: number) => invoke<void>("reject_faces", { faces, person }),
+  /** Send faces to another person (`to`), or to a new person (null). Returns where they went. */
+  moveFaces: (faces: number[], from: number, to: number | null) => invoke<number>("move_faces", { faces, from, to }),
   hidePeople: (people: number[], hidden: boolean) => invoke<void>("hide_people", { people, hidden }),
   setPersonCover: (person: number, face: number) => invoke<void>("set_person_cover", { person, face }),
   answerPeoplePair: (a: number, b: number, same: boolean) => invoke<void>("answer_people_pair", { a, b, same }),

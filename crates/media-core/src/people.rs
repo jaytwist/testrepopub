@@ -33,12 +33,51 @@ const MIN_SCORE: f32 = 0.8;
 const MIN_SIDE_PX: f64 = 40.0;
 /// Faces are detected on an image of at most this many pixels per side (see `analysis`).
 const ANALYSIS_SIDE: f64 = 1280.0;
+/// Faces from the same folder within this many days are the "same event": someone seen there is
+/// likely to be seen again, so grouping among leftovers is a little more lenient (`EVENT_BONUS`).
+/// Folder alone is not enough — "Camera Roll" holds years of unrelated people.
+const EVENT_DAYS: i32 = 3;
+const EVENT_BONUS: f32 = 0.04;
 
 struct FaceVec {
     id: i64,
     person: Option<i64>,
     locked: bool,
     v: Vec<f32>,
+    /// The photo: two faces in one photo are never the same person.
+    file: i64,
+    /// Folder (volume + parent directory) and day taken, for "same event". No day when the date
+    /// is only a file time: copied or downloaded photos share the copy day, not an event.
+    folder: u64,
+    day: Option<i32>,
+}
+
+fn folder_key(volume: i64, rel_path: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let dir = rel_path.rfind(['/', '\\']).map(|i| &rel_path[..i]).unwrap_or("");
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (volume, dir).hash(&mut h);
+    h.finish()
+}
+
+/// Folder + day buckets a set of faces was seen in.
+#[derive(Default)]
+struct Events(HashSet<(u64, i32)>);
+
+impl Events {
+    fn add(&mut self, f: &FaceVec) {
+        if let Some(day) = f.day {
+            self.0.insert((f.folder, day));
+        }
+    }
+    /// Seen in this folder within `EVENT_DAYS` of this day.
+    fn near(&self, folder: u64, day: Option<i32>) -> bool {
+        day.is_some_and(|day| (day - EVENT_DAYS..=day + EVENT_DAYS).any(|d| self.0.contains(&(folder, d))))
+    }
+    /// Distinct events of `self` that `other` also attended.
+    fn shared(&self, other: &Events) -> usize {
+        self.0.iter().filter(|(folder, day)| other.near(*folder, Some(*day))).count()
+    }
 }
 
 fn mean(vs: &[&[f32]]) -> Vec<f32> {
@@ -54,7 +93,8 @@ fn mean(vs: &[&[f32]]) -> Vec<f32> {
 /// Faces good enough to group (live files, not hidden).
 fn load_faces(conn: &Connection) -> Result<Vec<FaceVec>> {
     let mut st = conn.prepare(
-        "SELECT fc.id, fc.person_id, fc.locked, fc.embedding, fc.score, fc.w, fc.h, f.width, f.height
+        "SELECT fc.id, fc.person_id, fc.locked, fc.embedding, fc.score, fc.w, fc.h, f.width, f.height,
+                fc.file_id, f.volume_id, f.rel_path, f.taken_at, f.date_source
          FROM faces fc JOIN files f ON f.id = fc.file_id
          WHERE fc.hidden = 0 AND f.missing = 0 AND f.quarantined = 0
          ORDER BY fc.id",
@@ -72,7 +112,20 @@ fn load_faces(conn: &Connection) -> Result<Vec<FaceVec>> {
                 _ => true,
             };
             let blob: Vec<u8> = r.get(3)?;
-            Ok((score >= MIN_SCORE as f64 && side_ok, FaceVec { id: r.get(0)?, person: r.get(1)?, locked: r.get::<_, i64>(2)? != 0, v: blob_to_embedding(&blob) }))
+            let rel: String = r.get(11)?;
+            let face = FaceVec {
+                id: r.get(0)?,
+                person: r.get(1)?,
+                locked: r.get::<_, i64>(2)? != 0,
+                v: blob_to_embedding(&blob),
+                file: r.get(9)?,
+                folder: folder_key(r.get(10)?, &rel),
+                day: match crate::meta::confidence(&r.get::<_, String>(13)?) {
+                    "high" | "medium" => r.get::<_, Option<i64>>(12)?.map(|t| t.div_euclid(86_400) as i32),
+                    _ => None,
+                },
+            };
+            Ok((score >= MIN_SCORE as f64 && side_ok, face))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows.into_iter().filter(|(ok, f)| (*ok || f.person.is_some()) && f.v.len() == EMBED_DIM).map(|(_, f)| f).collect())
@@ -121,22 +174,31 @@ pub fn refresh(conn: &mut Connection) -> Result<PeopleStats> {
     let ref_list: Vec<(i64, &Vec<f32>)> = refs.iter().map(|(p, v)| (*p, v)).collect();
     let unassigned: Vec<&FaceVec> = faces.iter().filter(|f| f.person.is_none()).collect();
     let mut stats = PeopleStats::default();
+    // Photos each person already appears in (a second face in the same photo is someone else).
+    let mut person_files: HashSet<(i64, i64)> = faces.iter().filter_map(|f| f.person.map(|p| (p, f.file))).collect();
 
-    // 1. Join existing people.
-    let joins: Vec<(i64, Option<i64>)> = unassigned
+    // 1. Join existing people (by looks only: a wrong join into a named person costs the user).
+    let joins: Vec<(&FaceVec, i64, f32)> = unassigned
         .par_iter()
-        .map(|f| {
-            let best = ref_list
+        .filter_map(|f| {
+            ref_list
                 .iter()
-                .filter(|(p, _)| !rejects.contains(&(f.id, *p)))
+                .filter(|(p, _)| !rejects.contains(&(f.id, *p)) && !person_files.contains(&(*p, f.file)))
                 .map(|(p, r)| (*p, dot(&f.v, r)))
                 .filter(|(_, s)| *s >= ASSIGN_SIM)
                 .max_by(|a, b| a.1.total_cmp(&b.1))
-                .map(|(p, _)| p);
-            (f.id, best)
+                .map(|(p, s)| (*f, p, s))
         })
         .collect();
-    let joined: HashMap<i64, i64> = joins.into_iter().filter_map(|(f, p)| p.map(|p| (f, p))).collect();
+    // Two faces of one photo wanting the same person: only the closer one joins.
+    let mut joins = joins;
+    joins.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.id.cmp(&b.0.id)));
+    let mut joined: HashMap<i64, i64> = HashMap::new();
+    for (f, p, _) in joins {
+        if person_files.insert((p, f.file)) {
+            joined.insert(f.id, p);
+        }
+    }
     stats.assigned = joined.len();
 
     // 2. Group the rest (leader-follower on running group references). Strangers make this the
@@ -179,6 +241,25 @@ pub fn refresh(conn: &mut Connection) -> Result<PeopleStats> {
 struct Group {
     sum: Vec<f32>,
     members: Vec<i64>,
+    files: HashSet<i64>,
+    events: Events,
+}
+
+impl Group {
+    fn new(f: &FaceVec) -> Self {
+        let mut g = Group { sum: f.v.clone(), members: vec![f.id], files: HashSet::from([f.file]), events: Events::default() };
+        g.events.add(f);
+        g
+    }
+    /// Effective similarity of `f` to this group (raw `s`), or None if it may not join:
+    /// never with a face from the same photo; a bonus when seen at the same event.
+    fn score(&self, f: &FaceVec, s: f32) -> Option<f32> {
+        if self.files.contains(&f.file) {
+            return None;
+        }
+        let s = if self.events.near(f.folder, f.day) { s + EVENT_BONUS } else { s };
+        (s >= LINK_SIM).then_some(s)
+    }
 }
 
 /// Groups compared per parallel task.
@@ -208,7 +289,8 @@ fn better(a: Option<(usize, f32)>, b: (usize, f32)) -> Option<(usize, f32)> {
 }
 
 /// Leader-follower grouping: each face, in order, joins the most similar group reference
-/// (≥ `LINK_SIM`, ties to the older group) or starts a new group.
+/// (≥ `LINK_SIM`, counting the same-event bonus; ties to the older group) or starts a new group.
+/// A face never joins a group that already has a face from the same photo.
 ///
 /// Same result as comparing one face at a time, but fast on large libraries: references live in
 /// one contiguous matrix that is streamed once per batch of faces (not once per face), and only
@@ -227,7 +309,7 @@ fn group_leftovers(rest: &[&FaceVec]) -> Vec<Group> {
                 for (j, r) in block.chunks_exact(d).enumerate() {
                     for (k, f) in batch.iter().enumerate() {
                         let s = dot(&f.v, r);
-                        if s >= LINK_SIM {
+                        if s >= LINK_SIM - EVENT_BONUS {
                             out.push((k, ci * BLOCK + j, s));
                         }
                     }
@@ -245,12 +327,14 @@ fn group_leftovers(rest: &[&FaceVec]) -> Vec<Group> {
             let mut best: Option<(usize, f32)> = None;
             for &(g, s) in &cands[k] {
                 if !touched.contains(&g) {
-                    best = better(best, (g, s));
+                    if let Some(s) = groups[g].score(f, s) {
+                        best = better(best, (g, s));
+                    }
                 }
             }
             for &g in &touched {
                 let s = dot(&f.v, &refs[g * d..(g + 1) * d]);
-                if s >= LINK_SIM {
+                if let Some(s) = groups[g].score(f, s) {
                     best = better(best, (g, s));
                 }
             }
@@ -262,11 +346,13 @@ fn group_leftovers(rest: &[&FaceVec]) -> Vec<Group> {
                     }
                     refs[i * d..(i + 1) * d].copy_from_slice(&l2_normalize(&g.sum));
                     g.members.push(f.id);
+                    g.files.insert(f.file);
+                    g.events.add(f);
                     i
                 }
                 None => {
                     refs.extend_from_slice(&f.v);
-                    groups.push(Group { sum: f.v.clone(), members: vec![f.id] });
+                    groups.push(Group::new(f));
                     groups.len() - 1
                 }
             };
@@ -336,6 +422,51 @@ pub fn reject(conn: &mut Connection, face_ids: &[i64], person: i64) -> Result<()
     Ok(())
 }
 
+/// Send faces from `from` to another person (`to`), or to a new person when `to` is None.
+/// Returns the person they went to. The faces count as confirmed there, and are remembered as
+/// "not `from`" so grouping never brings them back.
+pub fn move_faces(conn: &mut Connection, face_ids: &[i64], from: i64, to: Option<i64>) -> Result<i64> {
+    if to == Some(from) {
+        bail!("같은 인물입니다");
+    }
+    let tx = conn.transaction()?;
+    let to = match to {
+        Some(p) => {
+            if tx.query_row("SELECT 1 FROM persons WHERE id = ?", [p], |_| Ok(())).optional()?.is_none() {
+                bail!("보낼 인물을 찾을 수 없습니다");
+            }
+            p
+        }
+        None => {
+            tx.execute("INSERT INTO persons(name, cover_face_id, hidden, created_at) VALUES (NULL, NULL, 0, ?)", [crate::now_ts()])?;
+            tx.last_insert_rowid()
+        }
+    };
+    // Keep the target's picture as it was: its automatic cover would otherwise jump to the newly
+    // confirmed faces.
+    tx.execute(
+        "UPDATE persons SET cover_face_id = (
+             SELECT fc.id FROM faces fc JOIN files f ON f.id = fc.file_id
+              WHERE fc.person_id = ?1 AND f.missing = 0 AND f.quarantined = 0
+              ORDER BY fc.locked DESC, fc.score * fc.w * fc.h DESC LIMIT 1)
+          WHERE id = ?1 AND cover_face_id IS NULL",
+        [to],
+    )?;
+    for f in face_ids {
+        let moved = tx.execute("UPDATE faces SET person_id = ?1, locked = 1 WHERE id = ?2 AND person_id = ?3", params![to, f, from])?;
+        if moved == 0 {
+            continue;
+        }
+        tx.execute("INSERT OR IGNORE INTO face_rejects(face_id, person_id) VALUES (?, ?)", params![f, from])?;
+        tx.execute("DELETE FROM face_rejects WHERE face_id = ? AND person_id = ?", params![f, to])?;
+        tx.execute("UPDATE persons SET cover_face_id = NULL WHERE id = ? AND cover_face_id = ?", params![from, f])?;
+    }
+    // The person they came from may now be empty.
+    tx.execute("DELETE FROM persons WHERE id = ? AND name IS NULL AND NOT EXISTS (SELECT 1 FROM faces WHERE person_id = ?)", params![from, from])?;
+    tx.commit()?;
+    Ok(to)
+}
+
 pub fn set_hidden(conn: &Connection, persons: &[i64], hidden: bool) -> Result<()> {
     for p in persons {
         conn.execute("UPDATE persons SET hidden = ? WHERE id = ?", params![hidden as i64, p])?;
@@ -394,7 +525,7 @@ pub struct PersonRow {
 }
 
 /// People sorted by photo count (named people first among equals). Unnamed people with fewer
-/// than `MIN_FACES` photos (after removals) are left out.
+/// than `MIN_FACES` photos (after removals) are left out, unless the user put faces there.
 pub fn list(conn: &Connection, include_hidden: bool) -> Result<Vec<PersonRow>> {
     let mut st = conn.prepare(
         "SELECT p.id, p.name, p.cover_face_id, p.hidden, COUNT(DISTINCT fc.file_id),
@@ -404,7 +535,7 @@ pub fn list(conn: &Connection, include_hidden: bool) -> Result<Vec<PersonRow>> {
          FROM persons p JOIN faces fc ON fc.person_id = p.id JOIN files f ON f.id = fc.file_id
          WHERE f.missing = 0 AND f.quarantined = 0 AND (?1 OR p.hidden = 0)
          GROUP BY p.id
-         HAVING p.name IS NOT NULL OR COUNT(DISTINCT fc.file_id) >= ?2
+         HAVING p.name IS NOT NULL OR COUNT(DISTINCT fc.file_id) >= ?2 OR MAX(fc.locked) = 1
          ORDER BY COUNT(DISTINCT fc.file_id) DESC, p.name IS NULL, p.id",
     )?;
     let rows = st
@@ -441,6 +572,8 @@ pub struct PairSuggestion {
     pub a: PersonRow,
     pub b: PersonRow,
     pub similarity: f32,
+    /// Events (same folder, within a few days) both people were photographed at.
+    pub shared_events: usize,
 }
 
 /// "Same person?" — the most similar pairs of visible people that were not answered "different"
@@ -455,8 +588,17 @@ pub fn suggestions(conn: &Connection, limit: usize) -> Result<Vec<PairSuggestion
         let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<HashSet<_>>>()?;
         rows
     };
+    // Where each person was seen: photos (both in one photo = two people) and events.
+    let mut files: HashMap<i64, HashSet<i64>> = HashMap::new();
+    let mut events: HashMap<i64, Events> = HashMap::new();
+    for f in &faces {
+        if let Some(p) = f.person {
+            files.entry(p).or_default().insert(f.file);
+            events.entry(p).or_default().add(f);
+        }
+    }
     let list: Vec<(&i64, &Vec<f32>)> = refs.iter().collect();
-    let mut out: Vec<(i64, i64, f32)> = Vec::new();
+    let mut out: Vec<(i64, i64, f32, usize)> = Vec::new();
     for (i, (a, ra)) in list.iter().enumerate() {
         for (b, rb) in &list[i + 1..] {
             let (x, y) = ((**a).min(**b), (**a).max(**b));
@@ -469,16 +611,24 @@ pub fn suggestions(conn: &Connection, limit: usize) -> Result<Vec<PairSuggestion
                 }
             }
             let s = similarity(ra, rb);
-            if s >= SUGGEST_SIM {
-                out.push((x, y, s));
+            if s < SUGGEST_SIM {
+                continue;
             }
+            let (fa, fb) = (&files[a], &files[b]);
+            let (small, big) = if fa.len() <= fb.len() { (fa, fb) } else { (fb, fa) };
+            if small.iter().any(|f| big.contains(f)) {
+                continue; // seen together in one photo
+            }
+            out.push((x, y, s, events[a].shared(&events[b])));
         }
     }
-    out.sort_by(|p, q| q.2.total_cmp(&p.2));
+    // Rank by looks, nudged up when the two were at the same events (up to `EVENT_BONUS`).
+    let rank = |p: &(i64, i64, f32, usize)| p.2 + EVENT_BONUS * (p.3.min(3) as f32 / 3.0);
+    out.sort_by(|p, q| rank(q).total_cmp(&rank(p)));
     Ok(out
         .into_iter()
         .take(limit)
-        .map(|(a, b, s)| PairSuggestion { a: people[&a].clone(), b: people[&b].clone(), similarity: s })
+        .map(|(a, b, s, n)| PairSuggestion { a: people[&a].clone(), b: people[&b].clone(), similarity: s, shared_events: n })
         .collect())
 }
 

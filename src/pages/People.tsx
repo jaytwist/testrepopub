@@ -138,7 +138,7 @@ export default function People() {
   };
 
   if (detail) {
-    return <PersonDetail person={detail} onBack={() => { setDetail(null); load(); }} onOpen={(p) => openPhotos(p)} />;
+    return <PersonDetail key={detail.id} person={detail} onBack={() => { setDetail(null); load(); }} onOpen={(p) => openPhotos(p)} onGo={setDetail} />;
   }
 
   function openPhotos(p: PersonRow) {
@@ -196,6 +196,9 @@ export default function People() {
           </div>
           <div className="sp-ask">
             <b>같은 사람인가요?</b>
+            {pair.shared_events > 0 && (
+              <span className="muted small">같은 폴더·같은 시기 사진 {fmtCount(pair.shared_events)}곳에 둘 다 나옵니다</span>
+            )}
             <div className="btn-row">
               <button className="btn primary" onClick={() => answer(true)}>같음</button>
               <button className="btn" onClick={() => answer(false)}>다름</button>
@@ -250,13 +253,60 @@ export default function People() {
   );
 }
 
-/** One person: their faces, "not this person", cover choice, and the way to their photos. */
-function PersonDetail({ person, onBack, onOpen }: { person: PersonRow; onBack: () => void; onOpen: (p: PersonRow) => void }) {
+/** Choose where to send faces: search, then a person (named first) or a new person. */
+function SendPicker({ from, onPick, onClose }: { from: number; onPick: (to: PersonRow | null) => void; onClose: () => void }) {
+  const [all, setAll] = useState<PersonRow[] | null>(null);
+  const [q, setQ] = useState("");
+  useEffect(() => {
+    api.peopleList(true).then(setAll).catch(() => setAll([]));
+  }, []);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  const needle = q.trim().toLowerCase();
+  const list = (all ?? [])
+    .filter((x) => x.id !== from && (!needle || (x.name ?? "").toLowerCase().includes(needle)))
+    .sort((a, b) => Number(b.name != null) - Number(a.name != null) || Number(a.hidden) - Number(b.hidden) || b.photos - a.photos);
+  return (
+    <div className="send-back" onClick={onClose}>
+      <div className="send-picker card" onClick={(e) => e.stopPropagation()}>
+        <b>어느 인물로 보낼까요?</b>
+        <input autoFocus placeholder="이름으로 찾기" value={q} onChange={(e) => setQ(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter" && list.length > 0) onPick(list[0]); }} />
+        <div className="send-list">
+          <button className="send-row new" onClick={() => onPick(null)}>
+            <span className="face" style={{ width: 40, height: 40 }}>＋</span>
+            <span>새 인물로</span>
+          </button>
+          {all == null && <span className="muted small">불러오는 중…</span>}
+          {list.map((x) => (
+            <button key={x.id} className="send-row" onClick={() => onPick(x)}>
+              <Face id={x.cover_face_id} size={40} />
+              <span className={x.name ? "" : "muted"}>{label(x)}{x.hidden ? " (숨김)" : ""}</span>
+              <span className="muted small">{fmtCount(x.photos)}장</span>
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** One person: their faces, "not this person", sending faces to someone else, cover choice,
+ *  and the way to their photos. */
+function PersonDetail({ person, onBack, onOpen, onGo }: {
+  person: PersonRow; onBack: () => void; onOpen: (p: PersonRow) => void; onGo: (p: PersonRow) => void;
+}) {
   const nav = useNav();
   const [faces, setFaces] = useState<FaceRow[] | null>(null);
   const [picked, setPicked] = useState<Set<number>>(new Set());
+  const [anchor, setAnchor] = useState<number | null>(null);
   const [p, setP] = useState(person);
   const [naming, setNaming] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [sent, setSent] = useState<{ n: number; to: PersonRow } | null>(null);
 
   const load = useCallback(() => {
     api.personFaces(person.id).then(setFaces);
@@ -268,10 +318,27 @@ function PersonDetail({ person, onBack, onOpen }: { person: PersonRow; onBack: (
   }, [person.id, onBack]);
   useEffect(load, [load]);
 
-  const toggle = (id: number) => {
+  /** Click toggles; Shift+click selects the range from the last clicked face. */
+  const toggle = (id: number, range = false) => {
     const next = new Set(picked);
-    next.has(id) ? next.delete(id) : next.add(id);
+    const ids = (faces ?? []).map((f) => f.id);
+    if (range && anchor != null && ids.includes(anchor)) {
+      const [a, b] = [ids.indexOf(anchor), ids.indexOf(id)].sort((x, y) => x - y);
+      ids.slice(a, b + 1).forEach((x) => next.add(x));
+    } else {
+      next.has(id) ? next.delete(id) : next.add(id);
+    }
+    setAnchor(id);
     setPicked(next);
+  };
+  const sendTo = async (to: PersonRow | null) => {
+    setSending(false);
+    const n = picked.size;
+    const id = await api.moveFaces([...picked], p.id, to?.id ?? null);
+    setPicked(new Set());
+    const target = to ?? (await api.peopleList(true)).find((x) => x.id === id);
+    if (target) setSent({ n, to: target });
+    load();
   };
   const notThem = async () => {
     await api.rejectFaces([...picked], p.id);
@@ -295,7 +362,7 @@ function PersonDetail({ person, onBack, onOpen }: { person: PersonRow; onBack: (
           ) : (
             <h1 className="person-title" onClick={() => setNaming(true)} title="이름 바꾸기">{p.name ?? "이름 추가"}</h1>
           )}
-          <div className="muted">사진 {fmtCount(p.photos)}장 · 잘못 들어간 얼굴을 골라 「이 사람 아님」을 누르세요</div>
+          <div className="muted">사진 {fmtCount(p.photos)}장 · 다른 사람 얼굴을 골라 「→ 다른 인물로 보내기」나 「이 사람 아님」을 누르세요</div>
         </div>
         <button className="btn" onClick={() => nav.openOrganize({ person_ids: [p.id] }, "{person}/{year}")} title="이 사람이 나온 사진을 사람별 폴더로 복사·이동">
           ⇲ 이 사람 사진 한 곳으로 정리
@@ -306,15 +373,28 @@ function PersonDetail({ person, onBack, onOpen }: { person: PersonRow; onBack: (
       {picked.size > 0 && (
         <div className="selbar">
           <b>얼굴 {picked.size}개 선택</b>
+          <button className="btn small primary" onClick={() => setSending(true)}>→ 다른 인물로 보내기</button>
           <button className="btn small danger" onClick={notThem}>이 사람 아님</button>
           <button className="btn small" disabled={picked.size !== 1} onClick={makeCover}>대표 얼굴로</button>
+          {faces && picked.size < faces.length && (
+            <button className="btn small ghost" onClick={() => setPicked(new Set(faces.map((f) => f.id)))}>모두 선택</button>
+          )}
           <button className="btn small ghost" onClick={() => setPicked(new Set())}>선택 해제</button>
+          <span className="muted small">Shift+클릭: 여러 개 한 번에</span>
         </div>
       )}
+      {sent && (
+        <div className="alert ok sent-note">
+          얼굴 {fmtCount(sent.n)}개를 「{label(sent.to)}」(으)로 보냈습니다.
+          <button className="btn small" onClick={() => onGo(sent.to)}>그 인물 보기</button>
+          <button className="btn small ghost" onClick={() => setSent(null)}>닫기</button>
+        </div>
+      )}
+      {sending && <SendPicker from={p.id} onPick={sendTo} onClose={() => setSending(false)} />}
 
       <div className="face-grid">
         {(faces ?? []).map((f) => (
-          <button key={f.id} className={`face-tile ${picked.has(f.id) ? "sel" : ""}`} onClick={() => toggle(f.id)} title={f.locked ? "확인된 얼굴" : ""}>
+          <button key={f.id} className={`face-tile ${picked.has(f.id) ? "sel" : ""}`} onClick={(e) => toggle(f.id, e.shiftKey)} title={f.locked ? "확인된 얼굴" : ""}>
             <img src={faceUrl(f.id)} alt="" loading="lazy" draggable={false} />
             {picked.has(f.id) && <span className="tick">✓</span>}
           </button>

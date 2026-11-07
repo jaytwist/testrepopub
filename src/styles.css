@@ -461,3 +461,14 @@ kbd { font: 11px/1 ui-monospace, Consolas, monospace; border: 1px solid var(--li
 .dup-role-line { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
 .roles-toggle { margin-left: auto; }
 .roles-toggle + .tile-size { margin-left: 12px; }
+
+/* Send faces to another person */
+.send-back { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.35); display: grid; place-items: center; z-index: 50; }
+.send-picker { width: min(420px, calc(100vw - 32px)); max-height: 70vh; display: flex; flex-direction: column; gap: 10px; }
+.send-picker input { width: 100%; }
+.send-list { overflow: auto; display: flex; flex-direction: column; gap: 2px; min-height: 0; }
+.send-row { display: flex; align-items: center; gap: 10px; padding: 6px 8px; border: 0; border-radius: 8px; background: transparent; color: inherit; text-align: left; cursor: pointer; }
+.send-row:hover, .send-row:focus-visible { background: var(--panel-2); }
+.send-row > span:nth-child(2) { flex: 1; }
+.send-row.new .face { display: grid; place-items: center; font-size: 20px; color: var(--accent); background: var(--accent-soft); }
+.sent-note { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
