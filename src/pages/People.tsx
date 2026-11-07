@@ -2,9 +2,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import {
   api, faceUrl, fmtCount, onAnalysisDone, onAnalysisStatus,
-  type AnalysisOptions, type FaceRow, type LaneStatus, type PairSuggestion, type PersonRow,
+  type AnalysisOptions, type FaceRow, type GridItem, type LaneStatus, type PairSuggestion, type PersonRow,
 } from "../api";
 import { useJob, useNav } from "../App";
+import Compare from "../components/Compare";
+import Viewer from "../components/Viewer";
 
 const label = (p: PersonRow) => p.name ?? "이름 없음";
 
@@ -150,6 +152,7 @@ export default function People() {
 
   return (
     <div className="page people-page">
+      <div className="sticky-top">
       <header className="page-head">
         <div>
           <h1>인물</h1>
@@ -159,6 +162,20 @@ export default function People() {
           <input type="checkbox" checked={showHidden} onChange={(e) => setShowHidden(e.target.checked)} /> 숨긴 인물도 보기
         </label>
       </header>
+      {selected.size > 0 && (
+        <div className="selbar">
+          <b>{selected.size}명 선택</b>
+          <button className="btn small" disabled={selected.size < 2} onClick={mergeSelected}>같은 사람으로 합치기</button>
+          <button className="btn small" onClick={organizeSelected} title="고른 사람들이 나온 사진을 사람별 폴더로 정리">⇲ 사람별 폴더로 정리</button>
+          {showHidden && [...selected].every((id) => people?.find((p) => p.id === id)?.hidden) ? (
+            <button className="btn small" onClick={() => hideSelected(false)}>다시 보이기</button>
+          ) : (
+            <button className="btn small" onClick={() => hideSelected(true)}>숨기기</button>
+          )}
+          <button className="btn small ghost" onClick={() => setSelected(new Set())}>선택 해제</button>
+        </div>
+      )}
+      </div>
       {err && <div className="alert bad">{err}</div>}
 
       {off && (
@@ -208,19 +225,6 @@ export default function People() {
         </div>
       )}
 
-      {selected.size > 0 && (
-        <div className="selbar">
-          <b>{selected.size}명 선택</b>
-          <button className="btn small" disabled={selected.size < 2} onClick={mergeSelected}>같은 사람으로 합치기</button>
-          <button className="btn small" onClick={organizeSelected} title="고른 사람들이 나온 사진을 사람별 폴더로 정리">⇲ 사람별 폴더로 정리</button>
-          {showHidden && [...selected].every((id) => people?.find((p) => p.id === id)?.hidden) ? (
-            <button className="btn small" onClick={() => hideSelected(false)}>다시 보이기</button>
-          ) : (
-            <button className="btn small" onClick={() => hideSelected(true)}>숨기기</button>
-          )}
-          <button className="btn small ghost" onClick={() => setSelected(new Set())}>선택 해제</button>
-        </div>
-      )}
 
       {people && people.length === 0 && !off && (
         <div className="empty">
@@ -307,6 +311,8 @@ function PersonDetail({ person, onBack, onOpen, onGo }: {
   const [naming, setNaming] = useState(false);
   const [sending, setSending] = useState(false);
   const [sent, setSent] = useState<{ n: number; to: PersonRow } | null>(null);
+  const [view, setView] = useState<{ items: GridItem[]; index: number } | null>(null);
+  const [comparing, setComparing] = useState<number[] | null>(null);
 
   const load = useCallback(() => {
     api.personFaces(person.id).then(setFaces);
@@ -331,6 +337,24 @@ function PersonDetail({ person, onBack, onOpen, onGo }: {
     setAnchor(id);
     setPicked(next);
   };
+  /** Photos of the picked faces (one per photo), in face order. */
+  const pickedFiles = [...new Set((faces ?? []).filter((f) => picked.has(f.id)).map((f) => f.file_id))];
+
+  /** Open a face's photo big, with its details; ← → go through this person's photos. */
+  const openPhoto = async (face: FaceRow) => {
+    const fileIds = [...new Set((faces ?? []).map((f) => f.file_id))];
+    const rows = await api.grid({ ids: fileIds }, 0, fileIds.length);
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    const items = fileIds.map((id) => byId.get(id)).filter((x): x is GridItem => x != null);
+    const index = items.findIndex((x) => x.id === face.file_id);
+    if (index >= 0) setView({ items, index });
+  };
+  /** Library behaviour: click opens; Ctrl/Shift+click (or any click once picking) selects. */
+  const clickFace = (e: React.MouseEvent, f: FaceRow) => {
+    if (e.shiftKey || e.ctrlKey || e.metaKey || picked.size > 0) toggle(f.id, e.shiftKey);
+    else openPhoto(f);
+  };
+
   const sendTo = async (to: PersonRow | null) => {
     setSending(false);
     const n = picked.size;
@@ -353,6 +377,7 @@ function PersonDetail({ person, onBack, onOpen, onGo }: {
 
   return (
     <div className="page people-page">
+      <div className="sticky-top">
       <header className="page-head person-head">
         <button className="btn ghost" onClick={onBack}>‹ 인물</button>
         <Face id={p.cover_face_id} size={72} />
@@ -362,7 +387,7 @@ function PersonDetail({ person, onBack, onOpen, onGo }: {
           ) : (
             <h1 className="person-title" onClick={() => setNaming(true)} title="이름 바꾸기">{p.name ?? "이름 추가"}</h1>
           )}
-          <div className="muted">사진 {fmtCount(p.photos)}장 · 다른 사람 얼굴을 골라 「→ 다른 인물로 보내기」나 「이 사람 아님」을 누르세요</div>
+          <div className="muted">사진 {fmtCount(p.photos)}장 · 얼굴을 누르면 사진을 크게 봅니다 · Ctrl/Shift+클릭으로 여러 개 골라 보내기·비교</div>
         </div>
         <button className="btn" onClick={() => nav.openOrganize({ person_ids: [p.id] }, "{person}/{year}")} title="이 사람이 나온 사진을 사람별 폴더로 복사·이동">
           ⇲ 이 사람 사진 한 곳으로 정리
@@ -375,12 +400,14 @@ function PersonDetail({ person, onBack, onOpen, onGo }: {
           <b>얼굴 {picked.size}개 선택</b>
           <button className="btn small primary" onClick={() => setSending(true)}>→ 다른 인물로 보내기</button>
           <button className="btn small danger" onClick={notThem}>이 사람 아님</button>
+          <button className="btn small" disabled={pickedFiles.length < 2 || pickedFiles.length > 4} onClick={() => setComparing(pickedFiles)}
+            title="사진 2–4장을 나란히 비교">⇆ 비교</button>
           <button className="btn small" disabled={picked.size !== 1} onClick={makeCover}>대표 얼굴로</button>
           {faces && picked.size < faces.length && (
             <button className="btn small ghost" onClick={() => setPicked(new Set(faces.map((f) => f.id)))}>모두 선택</button>
           )}
           <button className="btn small ghost" onClick={() => setPicked(new Set())}>선택 해제</button>
-          <span className="muted small">Shift+클릭: 여러 개 한 번에</span>
+          <span className="muted small">Shift+클릭: 범위 선택</span>
         </div>
       )}
       {sent && (
@@ -390,14 +417,26 @@ function PersonDetail({ person, onBack, onOpen, onGo }: {
           <button className="btn small ghost" onClick={() => setSent(null)}>닫기</button>
         </div>
       )}
+      </div>
       {sending && <SendPicker from={p.id} onPick={sendTo} onClose={() => setSending(false)} />}
+      {comparing && <Compare ids={comparing} onClose={() => { setComparing(null); setPicked(new Set()); load(); }} />}
+      {view && (
+        <Viewer
+          items={view.items}
+          index={view.index}
+          onIndex={(index) => setView((v) => (v ? { ...v, index } : v))}
+          onClose={() => { setView(null); load(); }}
+        />
+      )}
 
       <div className="face-grid">
         {(faces ?? []).map((f) => (
-          <button key={f.id} className={`face-tile ${picked.has(f.id) ? "sel" : ""}`} onClick={(e) => toggle(f.id, e.shiftKey)} title={f.locked ? "확인된 얼굴" : ""}>
+          <div key={f.id} role="button" tabIndex={0} className={`face-tile ${picked.has(f.id) ? "sel" : ""}`}
+            onClick={(e) => clickFace(e, f)} onKeyDown={(e) => e.key === "Enter" && openPhoto(f)}
+            title={f.locked ? "확인된 얼굴 · 누르면 사진 보기" : "누르면 사진 보기"}>
             <img src={faceUrl(f.id)} alt="" loading="lazy" draggable={false} />
-            {picked.has(f.id) && <span className="tick">✓</span>}
-          </button>
+            <button className="check" title="선택" onClick={(e) => { e.stopPropagation(); toggle(f.id, e.shiftKey); }}>{picked.has(f.id) ? "✓" : ""}</button>
+          </div>
         ))}
       </div>
     </div>
