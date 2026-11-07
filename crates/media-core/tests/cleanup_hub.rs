@@ -94,11 +94,11 @@ fn protection_applies_to_every_delete() {
 
     // Deleting leaves protected files in place unless forced.
     let stop = StopFlag::new();
-    let rep = journal::delete_files(&l.db, &[fav, shot, kept], false, &stop, &quiet).unwrap();
+    let rep = journal::delete_files(&l.db, &[fav, shot, kept], false, Some("테스트"), &stop, &quiet).unwrap();
     assert_eq!((rep.deleted, rep.protected), (1, 2), "{rep:?}");
     assert!(l.a.join("Pictures/fav.jpg").is_file());
     assert!(!l.a.join("Screenshots/Screenshot_20230101.png").exists());
-    let rep = journal::delete_files(&l.db, &[fav], true, &stop, &quiet).unwrap();
+    let rep = journal::delete_files(&l.db, &[fav], true, None, &stop, &quiet).unwrap();
     assert_eq!((rep.deleted, rep.protected), (1, 0), "{rep:?}");
     assert!(!l.a.join("Pictures/fav.jpg").exists());
 }
@@ -153,6 +153,10 @@ fn variant_kinds_from_stored_values() {
     assert_eq!(dedupe::variant_kind(&best, &with(w, h, s - 100)), "recompressed");
     assert_eq!(dedupe::variant_kind(&best, &with(w, h * 3 / 4, s)), "edited", "cropped");
     assert_eq!(dedupe::variant_kind(&best, &with(h, w, s)), "edited", "rotated");
+    // Same look, but both taken (by the camera clock) years apart: two photos, not a copy.
+    let mut other = with(w, h, s - 100);
+    other.taken_at = best.taken_at.map(|t| t - 7 * 365 * 86_400);
+    assert_eq!(dedupe::variant_kind(&best, &other), "edited", "different moment");
 }
 
 #[test]
@@ -169,4 +173,24 @@ fn accidental_short_videos() {
     assert_eq!(cleanup::summary(&conn).unwrap().short_videos.count, 1);
     let ids = db::query_ids(&conn, &db::FileFilter { suggest: Some("short_video".into()), ..Default::default() }).unwrap();
     assert_eq!(ids.len(), 1);
+}
+
+#[test]
+fn quick_review_groups_and_decisions() {
+    let l = lib();
+    dedupe::run(&l.db, DupKind::Exact, Similarity::High, &StopFlag::new(), &quiet).unwrap();
+    let mut conn = l.db.conn().unwrap();
+    let gs = media_core::triage::groups(&conn, "exact", None, 0, 10).unwrap();
+    assert_eq!(gs.len(), 1);
+    let g = &gs[0];
+    // The best copy on the other drive is a locked backup.
+    let b = g.members.iter().find(|m| m.role.as_deref() == Some("backup")).expect("a backup");
+    assert!(b.locked && b.keep, "{b:?}");
+    assert_ne!(b.file.volume_id, g.members[0].file.volume_id);
+    assert_eq!(g.members.iter().filter(|m| !m.keep).count(), 1, "one extra copy on the same drive");
+
+    // Keeping everything settles the group: it is not asked again.
+    let all: Vec<i64> = g.members.iter().map(|m| m.file.id).collect();
+    media_core::triage::commit(&mut conn, &[media_core::triage::Decision { key: g.key.clone(), keep: all }]).unwrap();
+    assert!(media_core::triage::groups(&conn, "exact", None, 0, 10).unwrap().is_empty());
 }

@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import { absPath, api, fmtBytes, fmtCount, fmtDate, thumbUrl, VARIANT_NAMES, type DupGroup, type DupSummary } from "../api";
-import { useJob } from "../App";
+import { useJob, useNav } from "../App";
 import Compare from "../components/Compare";
 import DupRulesCard from "../components/DupRules";
 
@@ -13,6 +13,7 @@ const KINDS = [
 
 export default function Duplicates() {
   const { version, running, setRunning } = useJob();
+  const nav = useNav();
   const [summary, setSummary] = useState<DupSummary[]>([]);
   const [kind, setKind] = useState("exact");
   const [groups, setGroups] = useState<DupGroup[]>([]);
@@ -65,10 +66,14 @@ export default function Duplicates() {
 
   return (
     <div className="page">
-      <header className="page-head">
+      <header className="page-head person-head">
+        <button className="btn ghost" onClick={() => nav.go("cleanup")}>‹ 정리</button>
         <div>
-          <h1>중복 정리</h1>
-          <div className="muted">연결된 모든 드라이브를 비교합니다. 각 그룹에서 가장 좋은 파일(해상도·원본 날짜·카메라 정보 기준)을 자동으로 "보존"으로 고릅니다.</div>
+          <h1>중복 자세히</h1>
+          <div className="muted">
+            연결된 모든 드라이브를 비교합니다. 각 묶음에서 가장 좋은 파일(해상도·원본 날짜·카메라 정보 기준)을 "보존"으로 고르고,
+            다른 드라이브에 있는 사본은 백업으로 남깁니다. 비슷한 사진의 축소본·재압축본은 "격리", 편집본은 "보존"으로 시작합니다.
+          </div>
         </div>
       </header>
       {error && <div className="alert bad">{error}</div>}

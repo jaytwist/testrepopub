@@ -126,6 +126,8 @@ export default function Library({ active = true, preset, onClearPreset, onConsum
   /** One-by-one review (from cleanup suggestions): kind + files marked "keep" this session. */
   const [review, setReview] = useState<{ kind: string; title: string } | null>(() => (preset?.review ? { kind: preset.review, title: preset.title } : null));
   const [kept, setKept] = useState<Set<number>>(new Set());
+  /** Review decisions in order, for Z (undo the last one). */
+  const reviewLog = useRef<{ id: number; act: "mark" | "unmark" | "keep" }[]>([]);
   const reviewOpened = useRef(false);
   const [volumes, setVolumes] = useState<VolumeRow[]>([]);
   /** Result of the last delete, shown with an Undo button until dismissed. */
@@ -1049,10 +1051,23 @@ export default function Library({ active = true, preset, onClearPreset, onConsum
             kept,
             onMark: (id) => {
               const next = new Set(selected);
+              reviewLog.current.push({ id, act: next.has(id) ? "unmark" : "mark" });
               next.has(id) ? next.delete(id) : next.add(id);
               setSelected(next);
             },
+            onUndo: () => {
+              const last = reviewLog.current.pop();
+              if (!last) return null;
+              if (last.act === "keep") {
+                api.undismiss([last.id], review.kind).catch((e) => setLoadError(String(e)));
+                setKept((k) => { const n = new Set(k); n.delete(last.id); return n; });
+              } else {
+                setSelected((s) => { const n = new Set(s); last.act === "mark" ? n.delete(last.id) : n.add(last.id); return n; });
+              }
+              return last.id;
+            },
             onKeep: (id) => {
+              reviewLog.current.push({ id, act: "keep" });
               api.dismiss([id], review.kind).catch((e) => setLoadError(String(e)));
               setKept((k) => new Set(k).add(id));
               setSelected((s) => { const n = new Set(s); n.delete(id); return n; });

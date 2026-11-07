@@ -190,7 +190,8 @@ fn backup_check_and_similar_photos() {
 }
 
 /// Duplicate keep rules by folder: "keep" folders win, "drop" folders lose, and a group whose
-/// copies are all in drop folders still keeps one.
+/// copies are all in drop folders still keeps one. (Both copies on one drive: a copy on another
+/// drive would be a backup, which always stays.)
 #[test]
 fn duplicate_keep_rules() {
     use media_core::dedupe::{self, DupKind, DupRules, Similarity};
@@ -199,8 +200,8 @@ fn duplicate_keep_rules() {
     let a = drive(root, "diskA");
     let b = drive(root, "diskB");
     write_jpeg(&a.join("Photos/IMG_1.jpg"), &picture(1, 900, 600), Some(("2023:05:01 10:00:00", "Apple", "iPhone 13")));
-    fs::create_dir_all(b.join("Downloads")).unwrap();
-    fs::copy(a.join("Photos/IMG_1.jpg"), b.join("Downloads/IMG_1.jpg")).unwrap();
+    fs::create_dir_all(a.join("Downloads")).unwrap();
+    fs::copy(a.join("Photos/IMG_1.jpg"), a.join("Downloads/IMG_1.jpg")).unwrap();
 
     let db = Db::open(root.join("appdata/library.db")).unwrap();
     let mut conn = db.conn().unwrap();
@@ -215,7 +216,7 @@ fn duplicate_keep_rules() {
         let g = &dedupe::list_groups(conn, "exact", 0, 10).unwrap()[0];
         g.members.iter().filter(|m| m.keep).map(|m| m.file.id).collect()
     };
-    let downloads = b.join("Downloads").to_string_lossy().into_owned();
+    let downloads = a.join("Downloads").to_string_lossy().into_owned();
     let photos = a.join("Photos").to_string_lossy().into_owned();
 
     // "Delete from Downloads first" → the original is kept (path case and separators don't matter).
@@ -231,7 +232,7 @@ fn duplicate_keep_rules() {
     dedupe::apply_rules(&mut conn).unwrap();
     assert_eq!(keeper(&conn).len(), 1);
     // New searches use the rules too.
-    DupRules { keep: vec![], drop: vec![b.join("Downloads").to_string_lossy().into_owned()] }.save(&conn).unwrap();
+    DupRules { keep: vec![], drop: vec![a.join("Downloads").to_string_lossy().into_owned()] }.save(&conn).unwrap();
     dedupe::run(&db, DupKind::Exact, Similarity::High, &stop, &quiet).unwrap();
     assert_eq!(keeper(&conn), vec![orig]);
 }
@@ -275,6 +276,7 @@ fn original_and_copy_roles() {
     let pick = id_of(&conn, "Photos/IMG_1 (2).jpg").unwrap();
     identity::set_original(&mut conn, pick).unwrap();
     assert_eq!(role(&conn, "Photos/IMG_1 (2).jpg").as_deref(), Some("original"));
-    assert_eq!(role(&conn, "backup/deeper/path/IMG_1.jpg").as_deref(), Some("copy"));
+    // On the other drive it is now the backup of that original; the extra copy beside it is a copy.
+    assert_eq!(role(&conn, "backup/deeper/path/IMG_1.jpg").as_deref(), Some("backup"));
     assert_eq!(role(&conn, "Photos/IMG_1.jpg").as_deref(), Some("copy"));
 }

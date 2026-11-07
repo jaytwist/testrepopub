@@ -67,10 +67,10 @@ pub(crate) fn post_analysis(st: &AppState) -> anyhow::Result<()> {
 fn upgrade_dup_keepers(st: &AppState) -> anyhow::Result<()> {
     let mut conn = st.db.conn()?;
     let done: Option<String> =
-        media_core::rusqlite::OptionalExtension::optional(conn.query_row("SELECT value FROM settings WHERE key = 'dup_keep_v6'", [], |r| r.get(0)))?;
+        media_core::rusqlite::OptionalExtension::optional(conn.query_row("SELECT value FROM settings WHERE key = 'dup_decide_v1'", [], |r| r.get(0)))?;
     if done.is_none() {
         media_core::dedupe::apply_rules(&mut conn)?;
-        conn.execute("INSERT OR REPLACE INTO settings(key, value) VALUES ('dup_keep_v6', '1')", [])?;
+        conn.execute("INSERT OR REPLACE INTO settings(key, value) VALUES ('dup_decide_v1', '1')", [])?;
     }
     Ok(())
 }
@@ -389,6 +389,12 @@ fn burst_extra_ids(state: State<AppState>) -> CmdResult<Vec<i64>> {
 fn dismiss(state: State<AppState>, ids: Vec<i64>, kind: String) -> CmdResult<usize> {
     let mut conn = state.db.conn().map_err(err)?;
     media_core::cleanup::dismiss(&mut conn, &ids, &kind).map_err(err)
+}
+
+#[tauri::command]
+fn undismiss(state: State<AppState>, ids: Vec<i64>, kind: String) -> CmdResult<usize> {
+    let conn = state.db.conn().map_err(err)?;
+    media_core::cleanup::undismiss(&conn, &ids, &kind).map_err(err)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -976,12 +982,27 @@ fn start_undo(app: AppHandle, state: State<AppState>, batch_id: String) -> CmdRe
 
 /// Delete (quarantine) the selected files as one undoable batch.
 #[tauri::command]
-fn start_delete(app: AppHandle, state: State<AppState>, ids: Vec<i64>, force: Option<bool>) -> CmdResult<()> {
+fn start_delete(app: AppHandle, state: State<AppState>, ids: Vec<i64>, force: Option<bool>, label: Option<String>) -> CmdResult<()> {
     if ids.is_empty() {
         return Err("선택한 파일이 없습니다".into());
     }
     let force = force.unwrap_or(false);
-    spawn_job(&app, &state, "delete", move |st, progress| journal::delete_files(&st.db, &ids, force, &st.stop, progress))
+    spawn_job(&app, &state, "delete", move |st, progress| journal::delete_files(&st.db, &ids, force, label.as_deref(), &st.stop, progress))
+}
+
+/// Groups to review quickly (bursts, copies, versions), with the suggested keepers.
+#[tauri::command]
+fn triage_groups(state: State<AppState>, kind: String, variant: Option<String>, offset: i64, limit: i64) -> CmdResult<Vec<media_core::triage::TriageGroup>> {
+    let conn = state.db.conn().map_err(err)?;
+    media_core::triage::groups(&conn, &kind, variant.as_deref(), offset, limit).map_err(err)
+}
+
+/// Remember review decisions (kept files); removing the rest is a normal delete.
+#[tauri::command]
+fn triage_commit(state: State<AppState>, decisions: Vec<media_core::triage::Decision>) -> CmdResult<()> {
+    let mut conn = state.db.conn().map_err(err)?;
+    media_core::triage::commit(&mut conn, &decisions).map_err(err)?;
+    refresh_places(&state).map_err(err)
 }
 
 /// Which of these files are protected from deletion, and why.
@@ -1125,6 +1146,8 @@ pub fn run() {
             merge_people,
             reject_faces,
             protect_check,
+            triage_groups,
+            triage_commit,
             move_faces,
             hide_people,
             set_person_cover,
@@ -1132,6 +1155,7 @@ pub fn run() {
             clear_face_data,
             burst_extra_ids,
             dismiss,
+            undismiss,
             analysis_status,
             analysis_pause,
             analysis_start,

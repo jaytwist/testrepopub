@@ -439,12 +439,17 @@ pub struct DeleteReport {
 /// Move the given files into their drives' quarantine folders as one undoable batch.
 /// Protected files (originals, ♥, keep folders, the last copy of some content) are left in place
 /// unless `force`.
-pub fn delete_files(db: &Db, ids: &[i64], force: bool, stop: &StopFlag, progress: ProgressFn) -> Result<DeleteReport> {
+/// `label` names the batch in the history (e.g. "연사 정리").
+pub fn delete_files(db: &Db, ids: &[i64], force: bool, label: Option<&str>, stop: &StopFlag, progress: ProgressFn) -> Result<DeleteReport> {
     let conn = db.conn()?;
     volumes::refresh(&conn)?;
     let protected: std::collections::HashSet<i64> =
         if force { Default::default() } else { crate::protect::check(&conn, ids)?.into_iter().map(|b| b.id).collect() };
-    let batch = new_batch(&conn, "delete", &format!("선택한 {}개 삭제", ids.len()))?;
+    let what = match label {
+        Some(l) => format!("{l} {}개 정리", ids.len()),
+        None => format!("선택한 {}개 삭제", ids.len()),
+    };
+    let batch = new_batch(&conn, "delete", &what)?;
     let mut rep = DeleteReport { batch_id: batch.clone(), ..Default::default() };
     let total = ids.len() as u64;
     for (i, id) in ids.iter().enumerate() {

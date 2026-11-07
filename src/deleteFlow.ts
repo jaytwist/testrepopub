@@ -13,7 +13,7 @@ const REASONS: Record<Blocked["reason"], string> = {
  * (original, ♥, a keep folder, or the last copy of a photo) offers to leave those out.
  * Starts the delete job and returns true, or returns false if the user cancelled.
  */
-export async function confirmDelete(ids: number[], title = "삭제", bytes?: number): Promise<boolean> {
+export async function confirmDelete(ids: number[], title = "삭제", bytes?: number, label?: string): Promise<boolean> {
   if (ids.length === 0) return false;
   const size = bytes != null ? ` (${fmtBytes(bytes)})` : "";
   const blocked = await api.protectCheck(ids).catch(() => [] as Blocked[]);
@@ -23,7 +23,7 @@ export async function confirmDelete(ids: number[], title = "삭제", bytes?: num
       title, kind: "warning", okLabel: "삭제", cancelLabel: "취소",
     });
     if (!ok) return false;
-    await api.startDelete(ids);
+    await api.startDelete(ids, false, label);
     return true;
   }
   const counts = new Map<string, number>();
@@ -37,11 +37,11 @@ export async function confirmDelete(ids: number[], title = "삭제", bytes?: num
   );
   if (answer === leaveOut || answer === "Yes") {
     if (rest === 0) return false;
-    await api.startDelete(ids); // the backend leaves the protected ones in place
+    await api.startDelete(ids, false, label); // the backend leaves the protected ones in place
     return true;
   }
   if (answer === "보호된 것까지 모두 삭제" || answer === "No") {
-    await api.startDelete(ids, true);
+    await api.startDelete(ids, true, label);
     return true;
   }
   return false;

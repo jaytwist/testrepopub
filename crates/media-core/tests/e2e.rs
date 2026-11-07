@@ -218,7 +218,7 @@ fn full_workflow() {
 
     // --- Delete selected files (quarantine) + undo ------------------------------------------
     let victims = vec![kakao.id, shot.id];
-    let rep = journal::delete_files(&db, &victims, false, &stop, &quiet).unwrap();
+    let rep = journal::delete_files(&db, &victims, false, None, &stop, &quiet).unwrap();
     assert_eq!((rep.deleted, rep.failed, rep.skipped_offline), (2, 0, 0), "{rep:?}");
     assert!(!disk_b.join("KakaoTalk/KakaoTalk_20210304_101112345.jpg").exists(), "moved out of the folder");
     assert_eq!(db::query_files(&conn, &FileFilter::default(), 0, 100).unwrap().len(), 6);

@@ -23,6 +23,7 @@ pub mod power;
 pub mod protect;
 pub mod scanner;
 pub mod thumbs;
+pub mod triage;
 pub mod userfiles;
 pub mod volumes;
 

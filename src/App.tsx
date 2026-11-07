@@ -92,8 +92,7 @@ const NAV: { section: string; items: { id: Page; label: string; icon: string }[]
   {
     section: "정리하기",
     items: [
-      { id: "cleanup", label: "정리 제안", icon: "✦" },
-      { id: "duplicates", label: "중복 정리", icon: "⧉" },
+      { id: "cleanup", label: "정리", icon: "✦" },
       { id: "organize", label: "한 곳으로 정리", icon: "⇲" },
     ],
   },
@@ -250,7 +249,7 @@ export default function App() {
               <div key={sec.section} className="nav-section">
                 <div className="nav-section-title">{sec.section}</div>
                 {sec.items.map((n) => (
-                  <button key={n.id} className={`nav-item ${page === n.id ? "active" : ""}`} onClick={() => setPage(n.id)}>
+                  <button key={n.id} className={`nav-item ${page === n.id || (n.id === "cleanup" && page === "duplicates") ? "active" : ""}`} onClick={() => setPage(n.id)}>
                     <span className="nav-icon">{n.icon}</span>
                     {n.label}
                   </button>

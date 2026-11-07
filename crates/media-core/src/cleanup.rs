@@ -293,6 +293,15 @@ pub fn dismiss(conn: &mut Connection, ids: &[i64], kind: &str) -> Result<usize> 
     Ok(n)
 }
 
+/// Take back "keep" (the suggestion shows again).
+pub fn undismiss(conn: &Connection, ids: &[i64], kind: &str) -> Result<usize> {
+    let mut n = 0;
+    for id in ids {
+        n += conn.execute("DELETE FROM dismissals WHERE file_id = ? AND kind = ?", params![id, kind])?;
+    }
+    Ok(n)
+}
+
 /// Detail text for a file's suggestions (shown in the viewer: why was this suggested?).
 pub fn reasons(conn: &Connection, file_id: i64) -> Result<Vec<(String, String)>> {
     let mut st = conn.prepare(

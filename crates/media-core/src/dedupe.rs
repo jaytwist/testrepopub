@@ -438,8 +438,16 @@ pub fn rank_members(members: &mut [FileRow], labels: &HashMap<i64, Vec<String>>,
 
 /// What a lower-ranked similar photo is, next to the group's best one (DB values only):
 /// "smaller" (same framing, fewer pixels: a resized or messenger copy), "recompressed" (same
-/// pixels, smaller file) or "edited" (cropped / rotated / otherwise changed — check before deleting).
+/// pixels, smaller file) or "edited" (cropped / rotated / otherwise changed, or taken at another
+/// time — check before deleting).
 pub fn variant_kind(best: &FileRow, f: &FileRow) -> &'static str {
+    // Both taken at a known, different moment: look-alike photos, not copies of one — check them.
+    let trusted = |x: &FileRow| crate::meta::confidence(&x.date_source) == "high";
+    if let (true, true, Some(a), Some(b)) = (trusted(best), trusted(f), best.taken_at, f.taken_at) {
+        if (a - b).abs() > 120 {
+            return "edited";
+        }
+    }
     let (Some(bw), Some(bh), Some(w), Some(h)) = (best.width, best.height, f.width, f.height) else { return "edited" };
     if bw <= 0 || bh <= 0 || w <= 0 || h <= 0 {
         return "edited";

@@ -24,6 +24,8 @@ export interface ReviewProps {
   kept: Set<number>;
   onMark: (id: number) => void;
   onKeep: (id: number) => void;
+  /** Z: take back the last keep / mark; returns the file to go back to. */
+  onUndo?: () => number | null;
   /** Close the review; the marked files are deleted together (after one confirmation). */
   onFinish: () => void;
 }
@@ -130,11 +132,15 @@ export default function Viewer({ items, index, onIndex, onClose, onChanged, revi
         const wasMarked = review.marked.has(item.id);
         review.onMark(item.id);
         if (!wasMarked) next();
+      } else if (e.key === "z" || e.key === "Z" || e.key === "ㅋ") {
+        const back = review.onUndo?.();
+        const i = back != null ? items.findIndex((x) => x.id === back) : -1;
+        if (i >= 0) onIndex(i);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [index, items.length, close, onIndex, review, item.id, comparing, detail]);
+  }, [index, items, close, onIndex, review, item.id, comparing, detail]);
 
   // Other shots of the same burst, for side-by-side comparison.
   const burst = item.burst_id != null ? items.filter((it) => it.burst_id === item.burst_id) : [];
@@ -196,6 +202,13 @@ export default function Viewer({ items, index, onIndex, onClose, onChanged, revi
             <button className={`btn small ${review.marked.has(item.id) ? "" : "danger"}`} onClick={() => { const was = review.marked.has(item.id); review.onMark(item.id); if (!was) next(); }} title="Delete">
               {review.marked.has(item.id) ? "삭제 취소" : "삭제 목록에 담기"} <kbd>Del</kbd>
             </button>
+            {review.onUndo && (
+              <button className="btn small ghost" title="Z" onClick={() => {
+                const back = review.onUndo!();
+                const i = back != null ? items.findIndex((x) => x.id === back) : -1;
+                if (i >= 0) onIndex(i);
+              }}>되돌리기 <kbd>Z</kbd></button>
+            )}
             <button className="btn small primary" onClick={review.onFinish}>
               {review.marked.size > 0 ? `끝내고 ${review.marked.size}개 삭제` : "검토 끝내기"}
             </button>

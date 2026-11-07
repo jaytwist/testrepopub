@@ -70,6 +70,13 @@ export const ROLE_HINTS: Record<DupRole, string> = {
   variant: "크기를 줄이거나 다시 저장하거나 편집한 다른 버전",
 };
 export type VariantKind = "smaller" | "recompressed" | "edited";
+
+/** Quick review: one group (burst, copies, versions) with the suggested keepers. */
+export interface TriageMember {
+  file: FileRow; keep: boolean; role: "backup" | null; variant: VariantKind | null; sharpness: number | null; locked: boolean;
+}
+export interface TriageGroup { key: string; members: TriageMember[] }
+export type TriageKind = "burst" | "exact" | "similar_image" | "similar_video";
 export const VARIANT_NAMES: Record<VariantKind, string> = { smaller: "축소본", recompressed: "재압축본", edited: "편집본" };
 export type SortKey = "taken" | "mtime" | "size" | "name" | "resolution" | "duration";
 
@@ -193,6 +200,7 @@ export const api = {
   clearFaceData: () => invoke<void>("clear_face_data"),
   burstExtraIds: () => invoke<number[]>("burst_extra_ids"),
   dismiss: (ids: number[], kind: string) => invoke<number>("dismiss", { ids, kind }),
+  undismiss: (ids: number[], kind: string) => invoke<number>("undismiss", { ids, kind }),
   analysisStatus: () => invoke<LaneStatus>("analysis_status"),
   analysisPause: (paused: boolean) => invoke<void>("analysis_pause", { paused }),
   analysisStart: () => invoke<void>("analysis_start"),
@@ -241,8 +249,11 @@ export const api = {
   batches: () => invoke<BatchRow[]>("batches"),
   startUndo: (batchId: string) => invoke<void>("start_undo", { batchId }),
   /** Quarantine files. Protected ones (see protectCheck) are left in place unless `force`. */
-  startDelete: (ids: number[], force = false) => invoke<void>("start_delete", { ids, force }),
+  startDelete: (ids: number[], force = false, label?: string) => invoke<void>("start_delete", { ids, force, label: label ?? null }),
   protectCheck: (ids: number[]) => invoke<Blocked[]>("protect_check", { ids }),
+  triageGroups: (kind: TriageKind, variant: "safe" | "edited" | null, offset: number, limit: number) =>
+    invoke<TriageGroup[]>("triage_groups", { kind, variant, offset, limit }),
+  triageCommit: (decisions: { key: string; keep: number[] }[]) => invoke<void>("triage_commit", { decisions }),
   startPurge: (batchId: string) => invoke<void>("start_purge", { batchId }),
 };
 
