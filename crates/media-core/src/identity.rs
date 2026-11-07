@@ -233,11 +233,30 @@ pub fn refresh_roles(conn: &mut Connection) -> Result<usize> {
                 let picked = g.remove(i);
                 g.insert(0, picked);
             }
+            // Other drives: the best copy there is a backup; further copies anywhere are copies.
+            let mut drives = std::collections::HashSet::new();
             for (i, f) in g.iter().enumerate() {
-                ins.execute(params![f.id, if i == 0 { "original" } else { "copy" }, g.len() as i64])?;
+                let role = if i == 0 {
+                    drives.insert(f.volume_id);
+                    "original"
+                } else if drives.insert(f.volume_id) {
+                    "backup"
+                } else {
+                    "copy"
+                };
+                ins.execute(params![f.id, role, g.len() as i64])?;
                 n += 1;
             }
         }
+        // Resized / recompressed / edited versions of a similar photo, and the photo they are of.
+        n += tx.execute(
+            "INSERT OR IGNORE INTO dup_roles(file_id, role, group_size)
+             SELECT m.file_id, CASE WHEN m.variant IS NULL THEN 'original' ELSE 'variant' END,
+                    (SELECT COUNT(*) FROM dup_members m2 WHERE m2.group_id = m.group_id)
+             FROM dup_members m JOIN dup_groups g ON g.id = m.group_id JOIN files f ON f.id = m.file_id
+             WHERE g.kind = 'similar_image' AND g.resolved = 0 AND f.missing = 0 AND f.quarantined = 0",
+            [],
+        )?;
     }
     tx.commit()?;
     Ok(n)

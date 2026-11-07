@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Virtuoso, type ListRange, type VirtuosoHandle } from "react-virtuoso";
 import { confirmDelete } from "../deleteFlow";
 import {
-  absPath, api, FAVORITE, fmtBytes, fmtCount, fmtDate, fmtDuration, thumbUrl,
+  absPath, api, FAVORITE, ROLE_HINTS, ROLE_NAMES, fmtBytes, fmtCount, fmtDate, fmtDuration, thumbUrl,
   type FileFilter, type FilteredStats, type GridItem, type GroupBy, type GroupRow, type SortKey, type VolumeRow,
 } from "../api";
 import { useJob, useNav, type LibraryPreset } from "../App";
@@ -800,8 +800,8 @@ export default function Library({ active = true, preset, onClearPreset, onConsum
           {item.kind === "raw" && <span className="badge-raw" style={item.favorite ? { right: 30 } : undefined}>RAW</span>}
           {item.favorite && <span className="badge-fav" title="즐겨찾기">♥</span>}
           {showRoles && item.dup_role && (
-            <span className={`badge-role ${item.dup_role}`} style={!item.online ? { left: 30 } : undefined} title="똑같은 파일이 여러 개 있습니다">
-              {item.dup_role === "original" ? "원본" : "사본"}
+            <span className={`badge-role ${item.dup_role}`} style={!item.online ? { left: 30 } : undefined} title={ROLE_HINTS[item.dup_role]}>
+              {ROLE_NAMES[item.dup_role]}
             </span>
           )}
           {!item.online && <span className="badge-offline" title="드라이브 연결 안 됨">⏏</span>}

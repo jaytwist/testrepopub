@@ -4,7 +4,7 @@ import ZoomImage from "./ZoomImage";
 import Compare from "./Compare";
 import {
   FAVORITE, SYSTEM_LABELS,
-  api, DATE_SOURCE_NAMES, fileUrl, fmtBytes, fmtDuration, labelName, thumbUrl, toDatetimeLocal,
+  api, DATE_SOURCE_NAMES, ROLE_HINTS, ROLE_NAMES, fileUrl, fmtBytes, fmtDuration, labelName, thumbUrl, toDatetimeLocal,
   type FileDetail, type GridItem, type LabelCount,
 } from "../api";
 
@@ -311,9 +311,9 @@ export default function Viewer({ items, index, onIndex, onClose, onChanged, revi
                 <div>
                   <span>중복</span>
                   <b className="dup-role-line">
-                    같은 파일 {detail!.dup_group_size}개 중{" "}
-                    <span className={`role-tag ${detail!.dup_role}`}>{detail!.dup_role === "original" ? "원본" : "사본"}</span>
-                    {detail!.dup_role === "copy" && (
+                    {detail!.dup_role === "variant" ? "비슷한 사진" : "같은 파일"} {detail!.dup_group_size}개 중{" "}
+                    <span className={`role-tag ${detail!.dup_role}`} title={ROLE_HINTS[detail!.dup_role]}>{ROLE_NAMES[detail!.dup_role]}</span>
+                    {(detail!.dup_role === "copy" || detail!.dup_role === "backup") && (
                       <button className="btn small ghost" onClick={async () => { await api.setOriginal(item.id); load(); onChanged?.(); }}>이 파일을 원본으로</button>
                     )}
                   </b>

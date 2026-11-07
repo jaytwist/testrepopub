@@ -436,13 +436,57 @@ pub fn rank_members(members: &mut [FileRow], labels: &HashMap<i64, Vec<String>>,
     members.sort_by_key(score);
 }
 
+/// What a lower-ranked similar photo is, next to the group's best one (DB values only):
+/// "smaller" (same framing, fewer pixels: a resized or messenger copy), "recompressed" (same
+/// pixels, smaller file) or "edited" (cropped / rotated / otherwise changed — check before deleting).
+pub fn variant_kind(best: &FileRow, f: &FileRow) -> &'static str {
+    let (Some(bw), Some(bh), Some(w), Some(h)) = (best.width, best.height, f.width, f.height) else { return "edited" };
+    if bw <= 0 || bh <= 0 || w <= 0 || h <= 0 {
+        return "edited";
+    }
+    let (ba, a) = (bw as f64 / bh as f64, w as f64 / h as f64);
+    if (ba - a).abs() / ba > 0.02 {
+        return "edited";
+    }
+    let (bp, p) = (bw.saturating_mul(bh), w.saturating_mul(h));
+    if p < bp {
+        "smaller"
+    } else if p == bp && f.size < best.size {
+        "recompressed"
+    } else {
+        "edited"
+    }
+}
+
+/// For ranked members of a group: keep it?, and its variant kind.
+/// * exact copies: the best copy on *each drive* is kept — copies on another drive are backups;
+///   only extra copies on the same drive are removed.
+/// * similar photos: the best is kept, resized / recompressed versions are removed, edited
+///   versions are kept until the user decides.
+/// * similar videos: the best is kept.
+fn decide(kind: &str, ranked: &[FileRow]) -> Vec<(bool, Option<&'static str>)> {
+    let mut drives = std::collections::HashSet::new();
+    ranked
+        .iter()
+        .enumerate()
+        .map(|(i, f)| match kind {
+            "exact" => (drives.insert(f.volume_id), None),
+            "similar_image" if i > 0 => {
+                let v = variant_kind(&ranked[0], f);
+                (v == "edited", Some(v))
+            }
+            _ => (i == 0, None),
+        })
+        .collect()
+}
+
 /// Re-pick the keeper of every unresolved group with the current rules (after the user changed
 /// them). Returns how many groups got a different keeper.
 pub fn apply_rules(conn: &mut Connection) -> Result<usize> {
     let rules = DupRules::load(conn)?;
-    let groups: Vec<i64> = {
-        let mut st = conn.prepare("SELECT id FROM dup_groups WHERE resolved = 0")?;
-        let rows = st.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<i64>>>()?;
+    let groups: Vec<(i64, String)> = {
+        let mut st = conn.prepare("SELECT id, kind FROM dup_groups WHERE resolved = 0")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     };
     let sql = format!(
@@ -454,8 +498,8 @@ pub fn apply_rules(conn: &mut Connection) -> Result<usize> {
     {
         let mut st = tx.prepare(&sql)?;
         let mut lab = tx.prepare("SELECT label FROM labels WHERE file_id = ?")?;
-        let mut set = tx.prepare("UPDATE dup_members SET keep = ? WHERE group_id = ? AND file_id = ?")?;
-        for gid in groups {
+        let mut set = tx.prepare("UPDATE dup_members SET keep = ?, rank = ?, variant = ? WHERE group_id = ? AND file_id = ?")?;
+        for (gid, kind) in groups {
             let rows: Vec<(FileRow, bool)> = st
                 .query_map([gid], |r| Ok((FileRow::from_row(r)?, r.get::<_, i64>(crate::db::FILE_COLS_LEN)? != 0)))?
                 .collect::<rusqlite::Result<_>>()?;
@@ -469,11 +513,16 @@ pub fn apply_rules(conn: &mut Connection) -> Result<usize> {
                 labels.insert(f.id, lab.query_map([f.id], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?);
             }
             rank_members(&mut files, &labels, &rules);
-            if before != vec![files[0].id] {
+            let decided = decide(&kind, &files);
+            let after: Vec<i64> = files.iter().zip(&decided).filter(|(_, (k, _))| *k).map(|(f, _)| f.id).collect();
+            let (mut b, mut a) = (before.clone(), after);
+            b.sort();
+            a.sort();
+            if b != a {
                 changed += 1;
             }
-            for (i, f) in files.iter().enumerate() {
-                set.execute(params![(i == 0) as i64, gid, f.id])?;
+            for (i, (f, (keep, variant))) in files.iter().zip(decided).enumerate() {
+                set.execute(params![keep as i64, i as i64, variant, gid, f.id])?;
             }
         }
     }
@@ -488,7 +537,7 @@ fn save_groups(conn: &mut Connection, kind: DupKind, groups: Vec<Vec<FileRow>>) 
     let now = crate::now_ts();
     {
         let mut ins_g = tx.prepare("INSERT INTO dup_groups(kind, created_at) VALUES (?, ?)")?;
-        let mut ins_m = tx.prepare("INSERT OR IGNORE INTO dup_members(group_id, file_id, keep) VALUES (?, ?, ?)")?;
+        let mut ins_m = tx.prepare("INSERT OR IGNORE INTO dup_members(group_id, file_id, keep, rank, variant) VALUES (?, ?, ?, ?, ?)")?;
         let mut lab = tx.prepare("SELECT label FROM labels WHERE file_id = ?")?;
         let rules = DupRules::load(&tx)?;
         for mut g in groups {
@@ -500,9 +549,9 @@ fn save_groups(conn: &mut Connection, kind: DupKind, groups: Vec<Vec<FileRow>>) 
             rank_members(&mut g, &labels, &rules);
             ins_g.execute(params![kind.as_str(), now])?;
             let gid = tx.last_insert_rowid();
-            for (i, f) in g.iter().enumerate() {
-                ins_m.execute(params![gid, f.id, (i == 0) as i64])?;
-                if i > 0 {
+            for (i, (f, (keep, variant))) in g.iter().zip(decide(kind.as_str(), &g)).enumerate() {
+                ins_m.execute(params![gid, f.id, keep as i64, i as i64, variant])?;
+                if !keep {
                     stats.reclaimable_bytes += f.size;
                 }
             }
@@ -522,6 +571,8 @@ fn save_groups(conn: &mut Connection, kind: DupKind, groups: Vec<Vec<FileRow>>) 
 pub struct DupMember {
     pub file: FileRow,
     pub keep: bool,
+    /// Similar photos: "smaller" | "recompressed" | "edited" (None for the best one).
+    pub variant: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -537,17 +588,20 @@ pub struct DupSummary {
     pub kind: String,
     pub groups: i64,
     pub files: i64,
+    /// Members that would be removed (not kept).
+    pub drop_files: i64,
     pub reclaimable_bytes: i64,
 }
 
 pub fn summary(conn: &Connection) -> Result<Vec<DupSummary>> {
     let mut st = conn.prepare(
-        "SELECT g.kind, COUNT(DISTINCT g.id), COUNT(*), COALESCE(SUM(CASE WHEN m.keep = 0 THEN f.size END), 0)
+        "SELECT g.kind, COUNT(DISTINCT g.id), COUNT(*), COALESCE(SUM(CASE WHEN m.keep = 0 THEN f.size END), 0),
+                COALESCE(SUM(m.keep = 0), 0)
          FROM dup_groups g JOIN dup_members m ON m.group_id = g.id JOIN files f ON f.id = m.file_id
          WHERE g.resolved = 0 AND f.quarantined = 0 AND f.missing = 0 GROUP BY g.kind",
     )?;
     let rows = st
-        .query_map([], |r| Ok(DupSummary { kind: r.get(0)?, groups: r.get(1)?, files: r.get(2)?, reclaimable_bytes: r.get(3)? }))?
+        .query_map([], |r| Ok(DupSummary { kind: r.get(0)?, groups: r.get(1)?, files: r.get(2)?, reclaimable_bytes: r.get(3)?, drop_files: r.get(4)? }))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
@@ -565,14 +619,20 @@ pub fn list_groups(conn: &Connection, kind: &str, offset: i64, limit: i64) -> Re
         rows
     };
     let sql = format!(
-        "SELECT {FILE_COLS}, m.keep FROM dup_members m JOIN files f ON f.id = m.file_id JOIN volumes v ON v.id = f.volume_id
-         WHERE m.group_id = ? AND f.quarantined = 0 AND f.missing = 0 ORDER BY m.keep DESC, f.size DESC"
+        "SELECT {FILE_COLS}, m.keep, m.variant FROM dup_members m JOIN files f ON f.id = m.file_id JOIN volumes v ON v.id = f.volume_id
+         WHERE m.group_id = ? AND f.quarantined = 0 AND f.missing = 0 ORDER BY m.rank, f.id"
     );
     let mut st = conn.prepare(&sql)?;
     let mut out = Vec::new();
     for id in ids {
         let members: Vec<DupMember> = st
-            .query_map([id], |r| Ok(DupMember { file: FileRow::from_row(r)?, keep: r.get::<_, i64>(crate::db::FILE_COLS_LEN)? != 0 }))?
+            .query_map([id], |r| {
+                Ok(DupMember {
+                    file: FileRow::from_row(r)?,
+                    keep: r.get::<_, i64>(crate::db::FILE_COLS_LEN)? != 0,
+                    variant: r.get(crate::db::FILE_COLS_LEN + 1)?,
+                })
+            })?
             .collect::<rusqlite::Result<_>>()?;
         let reclaimable_bytes = members.iter().filter(|m| !m.keep).map(|m| m.file.size).sum();
         out.push(DupGroup { id, kind: kind.to_string(), members, reclaimable_bytes });

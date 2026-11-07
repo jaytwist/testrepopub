@@ -1,7 +1,8 @@
 //! Protection: files that are not deleted unless the user insists (`force`). Every delete path
 //! (selection, compare, review, duplicate apply) goes through this one check.
 //!
-//! * `last_copy` — every live copy of the same content is being deleted at once; one is kept.
+//! * `last_copy` — every live copy of the same content is being deleted at once; one is kept
+//!   (content = the 64 KiB prehash, else the full hash — the same key as `identity`).
 //!   A file with no known copy (a lone screenshot) is not protected by this.
 //! * `keep_folder` — inside a folder the user marked "always keep" (duplicate rules).
 //! * `original` — the user marked it as the original of its copies.
@@ -54,14 +55,14 @@ pub fn check(conn: &Connection, ids: &[i64]) -> Result<Vec<Blocked>> {
             out.push(Blocked { id, reason: r.into() });
             continue;
         }
-        let key: Option<String> = conn.query_row("SELECT COALESCE(hash, prehash) FROM files WHERE id = ?", [id], |r| r.get(0))?;
+        let key: Option<String> = conn.query_row("SELECT COALESCE(prehash, hash) FROM files WHERE id = ?", [id], |r| r.get(0))?;
         if let Some(key) = key {
             by_content.entry(key).or_default().push(id);
         }
     }
     // Deleting every live copy of some content: keep one (the marked original if it is there).
     let mut count = conn.prepare_cached(
-        "SELECT COUNT(*) FROM files WHERE (hash = ?1 OR (hash IS NULL AND prehash = ?1)) AND missing = 0 AND quarantined = 0",
+        "SELECT COUNT(*) FROM files WHERE COALESCE(prehash, hash) = ?1 AND missing = 0 AND quarantined = 0",
     )?;
     let mut role = conn.prepare_cached("SELECT role FROM dup_roles WHERE file_id = ?")?;
     for (key, mut members) in by_content {

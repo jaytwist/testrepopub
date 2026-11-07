@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use media_core::dedupe::{self, DupKind, DupRules, Similarity};
 use media_core::scanner::{self, ScanOptions};
-use media_core::{journal, protect, volumes, Db, Progress, StopFlag};
+use media_core::{cleanup, db, identity, journal, protect, volumes, Db, Progress, StopFlag};
 
 mod common;
 use common::*;
@@ -101,4 +101,72 @@ fn protection_applies_to_every_delete() {
     let rep = journal::delete_files(&l.db, &[fav], true, &stop, &quiet).unwrap();
     assert_eq!((rep.deleted, rep.protected), (1, 0), "{rep:?}");
     assert!(!l.a.join("Pictures/fav.jpg").exists());
+}
+
+#[test]
+fn backups_on_other_drives_are_kept() {
+    let l = lib();
+    let a = l.id(&l.a, "Pictures/a.jpg");
+    let a_copy = l.id(&l.a, "Pictures/copy/a.jpg");
+    let backup = l.id(&l.b, "backup/a.jpg");
+    let stop = StopFlag::new();
+    dedupe::run(&l.db, DupKind::Exact, Similarity::High, &stop, &quiet).unwrap();
+    let mut conn = l.db.conn().unwrap();
+    let g = &dedupe::list_groups(&conn, "exact", 0, 10).unwrap()[0];
+    let kept: Vec<i64> = g.members.iter().filter(|m| m.keep).map(|m| m.file.id).collect();
+    assert_eq!(g.members.len(), 3);
+    assert_eq!(kept.len(), 2, "one per drive: {kept:?}");
+    assert!(kept.contains(&backup));
+    assert_eq!(cleanup::summary(&conn).unwrap().exact_duplicates.count, 1);
+
+    identity::refresh_roles(&mut conn).unwrap();
+    // One original; the best copy on the other drive is its backup; the extra copy on the same
+    // drive as one of them is a plain copy.
+    let role = |id: i64| -> String { conn.query_row("SELECT role FROM dup_roles WHERE file_id = ?", [id], |r| r.get(0)).unwrap() };
+    let mut roles = vec![role(a), role(a_copy), role(backup)];
+    roles.sort();
+    assert_eq!(roles, vec!["backup".to_string(), "copy".to_string(), "original".to_string()]);
+    assert_eq!(role(a) == "copy" || role(a_copy) == "copy", true, "the extra copy is on drive A");
+    assert_eq!(cleanup::summary(&conn).unwrap().backups.count, 1);
+
+    // Applying removes only the extra copy on drive A.
+    let rep = dedupe::apply(&l.db, "exact", None, &stop, &quiet).unwrap();
+    assert_eq!(rep.quarantined, 1, "{rep:?}");
+    assert!(l.b.join("backup/a.jpg").is_file());
+    // One copy per drive left: nothing to remove any more.
+    dedupe::run(&l.db, DupKind::Exact, Similarity::High, &stop, &quiet).unwrap();
+    assert_eq!(cleanup::summary(&conn).unwrap().exact_duplicates.count, 0);
+}
+
+#[test]
+fn variant_kinds_from_stored_values() {
+    let l = lib();
+    let conn = l.db.conn().unwrap();
+    let best = db::get_file(&conn, l.id(&l.a, "Pictures/a.jpg")).unwrap().unwrap();
+    let with = |w: i64, h: i64, size: i64| {
+        let mut f = best.clone();
+        (f.width, f.height, f.size) = (Some(w), Some(h), size);
+        f
+    };
+    let (w, h, s) = (best.width.unwrap(), best.height.unwrap(), best.size);
+    assert_eq!(dedupe::variant_kind(&best, &with(w / 2, h / 2, s / 3)), "smaller");
+    assert_eq!(dedupe::variant_kind(&best, &with(w, h, s - 100)), "recompressed");
+    assert_eq!(dedupe::variant_kind(&best, &with(w, h * 3 / 4, s)), "edited", "cropped");
+    assert_eq!(dedupe::variant_kind(&best, &with(h, w, s)), "edited", "rotated");
+}
+
+#[test]
+fn accidental_short_videos() {
+    let l = lib();
+    let conn = l.db.conn().unwrap();
+    for (name, ms) in [("clip.mp4", 1_500), ("movie.mp4", 60_000)] {
+        conn.execute(
+            "INSERT INTO files(volume_id, rel_path, name, ext, kind, size, mtime, duration_ms) VALUES (1, ?1, ?1, 'mp4', 'video', 1000, 0, ?2)",
+            media_core::rusqlite::params![name, ms],
+        )
+        .unwrap();
+    }
+    assert_eq!(cleanup::summary(&conn).unwrap().short_videos.count, 1);
+    let ids = db::query_ids(&conn, &db::FileFilter { suggest: Some("short_video".into()), ..Default::default() }).unwrap();
+    assert_eq!(ids.len(), 1);
 }

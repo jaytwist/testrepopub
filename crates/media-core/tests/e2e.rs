@@ -209,15 +209,10 @@ fn full_workflow() {
     let ds = dedupe::run(&db, DupKind::Exact, Similarity::High, &stop, &quiet).unwrap();
     assert_eq!((ds.groups, ds.files), (1, 2), "{ds:?}");
     let groups = dedupe::list_groups(&conn, "exact", 0, 10).unwrap();
-    assert_eq!(groups[0].members.iter().filter(|m| m.keep).count(), 1);
+    // The copy is on another drive: a backup. Both stay; applying removes nothing.
+    assert_eq!(groups[0].members.iter().filter(|m| m.keep).count(), 2);
     let rep = dedupe::apply(&db, "exact", None, &stop, &quiet).unwrap();
-    assert_eq!(rep.quarantined, 1, "{rep:?}");
-    let q = db::query_files(&conn, &FileFilter::default(), 0, 100).unwrap();
-    assert_eq!(q.len(), 7);
-    assert_eq!(db::library_stats(&conn).unwrap().quarantined_files, 1);
-    // Undo restores the file at its original path.
-    let undo = journal::undo_batch(&conn, &rep.batch_id).unwrap();
-    assert_eq!((undo.restored, undo.failed), (1, 0), "{undo:?}");
+    assert_eq!(rep.quarantined, 0, "{rep:?}");
     assert_eq!(db::query_files(&conn, &FileFilter::default(), 0, 100).unwrap().len(), 8);
     assert!(disk_b.join("backup/IMG_0001.jpg").is_file());
 

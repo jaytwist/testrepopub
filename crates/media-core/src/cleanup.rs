@@ -24,6 +24,8 @@ const BLUR_ABS: f64 = 40.0;
 const BLUR_REL: f64 = 0.25;
 /// Videos at least this big are offered in "large videos".
 pub const LARGE_VIDEO_BYTES: i64 = 500 * 1024 * 1024;
+/// Videos shorter than this are usually taken by accident.
+pub const SHORT_VIDEO_MS: i64 = 3_000;
 
 struct Shot {
     id: i64,
@@ -158,7 +160,15 @@ pub struct CleanupSummary {
     pub burst_groups: i64,
     pub screenshots: Bucket,
     pub large_videos: Bucket,
+    pub short_videos: Bucket,
+    /// Extra copies on the same drive (copies on other drives are backups and stay).
     pub exact_duplicates: Bucket,
+    /// Resized / recompressed versions of a photo that is kept.
+    pub variants_safe: Bucket,
+    /// Edited versions (crop, rotation, …): the user decides.
+    pub variants_edited: Bucket,
+    /// Copies on another drive (kept; shown for reassurance).
+    pub backups: Bucket,
     /// Everything above (duplicates counted once).
     pub total_bytes: i64,
     pub analyzed: i64,
@@ -199,11 +209,32 @@ pub fn summary(conn: &Connection) -> Result<CleanupSummary> {
                AND NOT EXISTS (SELECT 1 FROM dismissals d WHERE d.file_id = f.id AND d.kind = 'large_video')"
         ),
     )?;
+    let short_videos = bucket(
+        conn,
+        &format!(
+            "SELECT COUNT(*), COALESCE(SUM(f.size), 0) FROM files f WHERE {live} AND f.kind = 'video'
+               AND f.duration_ms > 0 AND f.duration_ms < {SHORT_VIDEO_MS}
+               AND NOT EXISTS (SELECT 1 FROM dismissals d WHERE d.file_id = f.id AND d.kind = 'short_video')"
+        ),
+    )?;
     let exact_duplicates = crate::dedupe::summary(conn)?
         .into_iter()
         .find(|s| s.kind == "exact")
-        .map(|s| Bucket { count: s.files - s.groups, bytes: s.reclaimable_bytes })
+        .map(|s| Bucket { count: s.drop_files, bytes: s.reclaimable_bytes })
         .unwrap_or_default();
+    let variants = |which: &str| {
+        format!(
+            "SELECT COUNT(*), COALESCE(SUM(f.size), 0) FROM dup_members m JOIN dup_groups g ON g.id = m.group_id
+               JOIN files f ON f.id = m.file_id
+             WHERE {live} AND g.kind = 'similar_image' AND g.resolved = 0 AND m.variant IN ({which})"
+        )
+    };
+    let variants_safe = bucket(conn, &variants("'smaller', 'recompressed'"))?;
+    let variants_edited = bucket(conn, &variants("'edited'"))?;
+    let backups = bucket(
+        conn,
+        &format!("SELECT COUNT(*), COALESCE(SUM(f.size), 0) FROM dup_roles r JOIN files f ON f.id = r.file_id WHERE {live} AND r.role = 'backup'"),
+    )?;
     let (analyzed, pending): (i64, i64) = conn.query_row(
         &format!(
             "SELECT COALESCE(SUM(a.file_id IS NOT NULL), 0), COALESCE(SUM(a.file_id IS NULL), 0)
@@ -212,8 +243,29 @@ pub fn summary(conn: &Connection) -> Result<CleanupSummary> {
         [],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
-    let total_bytes = blurry.bytes + burst_extras.bytes + screenshots.bytes + large_videos.bytes + exact_duplicates.bytes;
-    Ok(CleanupSummary { blurry, burst_extras, burst_groups, screenshots, large_videos, exact_duplicates, total_bytes, analyzed, pending })
+    let total_bytes = blurry.bytes
+        + burst_extras.bytes
+        + screenshots.bytes
+        + large_videos.bytes
+        + short_videos.bytes
+        + exact_duplicates.bytes
+        + variants_safe.bytes
+        + variants_edited.bytes;
+    Ok(CleanupSummary {
+        blurry,
+        burst_extras,
+        burst_groups,
+        screenshots,
+        large_videos,
+        short_videos,
+        exact_duplicates,
+        variants_safe,
+        variants_edited,
+        backups,
+        total_bytes,
+        analyzed,
+        pending,
+    })
 }
 
 /// Ids of burst shots that are not the best one (to pre-select for review).

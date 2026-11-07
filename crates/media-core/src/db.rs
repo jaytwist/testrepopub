@@ -221,6 +221,11 @@ const MIGRATIONS: &[&str] = &[
     UPDATE files SET width = NULL, height = NULL
      WHERE width > 100000 OR height > 100000 OR width <= 0 OR height <= 0;
     "#,
+    // 6: duplicate members keep their rank and, for similar photos, what kind of variant they are.
+    r#"
+    ALTER TABLE dup_members ADD COLUMN rank INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE dup_members ADD COLUMN variant TEXT;
+    "#,
 ];
 
 pub fn schema_version(conn: &Connection) -> Result<i64> {
@@ -231,8 +236,18 @@ pub fn schema_version(conn: &Connection) -> Result<i64> {
 pub fn migrate(conn: &Connection) -> Result<()> {
     let mut v = schema_version(conn)? as usize;
     while v < MIGRATIONS.len() {
-        conn.execute_batch(&format!("BEGIN; {} PRAGMA user_version = {}; COMMIT;", MIGRATIONS[v], v + 1))
-            .with_context(|| format!("migration {}", v + 1))?;
+        // Statement by statement, so that a column a migration adds that is already there (a
+        // migration run again) does not stop the upgrade.
+        let tx = conn.unchecked_transaction()?;
+        for stmt in MIGRATIONS[v].split(";\n").map(str::trim).filter(|s| !s.is_empty()) {
+            if let Err(e) = tx.execute_batch(stmt) {
+                if !e.to_string().contains("duplicate column name") {
+                    return Err(anyhow::Error::from(e).context(format!("migration {}", v + 1)));
+                }
+            }
+        }
+        tx.execute_batch(&format!("PRAGMA user_version = {};", v + 1))?;
+        tx.commit().with_context(|| format!("migration {}", v + 1))?;
         v += 1;
     }
     Ok(())
@@ -448,7 +463,8 @@ pub struct FileFilter {
     pub has_gps: Option<bool>,
     /// Files directly inside this volume-relative folder ("" = volume root). Use with `volume_id`.
     pub dir: Option<String>,
-    /// Cleanup suggestion kind ("blurry" | "burst_extra" | "screenshot" | "large_video"), excluding
+    /// Cleanup suggestion kind ("blurry" | "burst_extra" | "screenshot" | "large_video" |
+    /// "short_video"), excluding
     /// ones the user dismissed.
     pub suggest: Option<String>,
     /// Only photos that are part of a burst / of this burst.
@@ -601,6 +617,7 @@ impl FileFilter {
             w.push(match k.as_str() {
                 "screenshot" => "EXISTS (SELECT 1 FROM labels l WHERE l.file_id = f.id AND l.label = 'screenshot')".to_string(),
                 "large_video" => format!("f.kind = 'video' AND f.size >= {}", crate::cleanup::LARGE_VIDEO_BYTES),
+                "short_video" => format!("f.kind = 'video' AND f.duration_ms > 0 AND f.duration_ms < {}", crate::cleanup::SHORT_VIDEO_MS),
                 _ => {
                     p.push(Value::Text(k.clone()));
                     "EXISTS (SELECT 1 FROM suggestions s WHERE s.file_id = f.id AND s.kind = ?)".to_string()

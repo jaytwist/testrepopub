@@ -56,8 +56,21 @@ export interface TripsSummary { trips: TripRow[]; home: string; located: number;
 export interface Bucket { count: number; bytes: number }
 export interface CleanupSummary {
   blurry: Bucket; burst_extras: Bucket; burst_groups: number; screenshots: Bucket; large_videos: Bucket;
-  exact_duplicates: Bucket; total_bytes: number; analyzed: number; pending: number;
+  short_videos: Bucket; exact_duplicates: Bucket; variants_safe: Bucket; variants_edited: Bucket; backups: Bucket;
+  total_bytes: number; analyzed: number; pending: number;
 }
+
+/** Where a file stands among copies / versions of the same photo. */
+export type DupRole = "original" | "backup" | "copy" | "variant";
+export const ROLE_NAMES: Record<DupRole, string> = { original: "원본", backup: "백업", copy: "사본", variant: "변형본" };
+export const ROLE_HINTS: Record<DupRole, string> = {
+  original: "같은 사진 중 남길 것",
+  backup: "다른 드라이브에 있는 같은 파일 (지우지 않음)",
+  copy: "같은 드라이브에 있는 똑같은 파일 (지워도 됨)",
+  variant: "크기를 줄이거나 다시 저장하거나 편집한 다른 버전",
+};
+export type VariantKind = "smaller" | "recompressed" | "edited";
+export const VARIANT_NAMES: Record<VariantKind, string> = { smaller: "축소본", recompressed: "재압축본", edited: "편집본" };
 export type SortKey = "taken" | "mtime" | "size" | "name" | "resolution" | "duration";
 
 export interface VolumeRow {
@@ -82,7 +95,7 @@ export interface GridItem {
   copies: number;
   favorite: boolean;
   /** "original" / "copy" when byte-identical copies exist. */
-  dup_role: "original" | "copy" | null;
+  dup_role: DupRole | null;
 }
 export interface ValueCount { value: string; count: number }
 export interface FilterOptions { cameras: ValueCount[]; exts: ValueCount[]; years: number[]; max_size: number; with_gps: number }
@@ -113,11 +126,11 @@ export interface LabelCount { label: string; count: number; user: boolean }
 export interface FileDetail {
   file: FileRow; reasons: [string, string][]; labels: LabelRow[]; abs_path: string; taken: string; confidence: string; thumb_cached: boolean; place: string | null;
   people: [number, string][];
-  dup_role: "original" | "copy" | null; dup_group_size: number;
+  dup_role: DupRole | null; dup_group_size: number;
 }
-export interface DupMember { file: FileRow; keep: boolean }
+export interface DupMember { file: FileRow; keep: boolean; variant: VariantKind | null }
 export interface DupGroup { id: number; kind: string; members: DupMember[]; reclaimable_bytes: number }
-export interface DupSummary { kind: string; groups: number; files: number; reclaimable_bytes: number }
+export interface DupSummary { kind: string; groups: number; files: number; drop_files: number; reclaimable_bytes: number }
 export interface OrganizeOptions {
   target_dir: string; template: string; rename: "keep" | "date_prefix"; mode: "move" | "copy";
   filter: FileFilter; uncertain_folder: string | null; remove_empty_dirs: boolean;

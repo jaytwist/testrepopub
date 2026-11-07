@@ -64,6 +64,17 @@ pub(crate) fn post_analysis(st: &AppState) -> anyhow::Result<()> {
     }
 }
 
+fn upgrade_dup_keepers(st: &AppState) -> anyhow::Result<()> {
+    let mut conn = st.db.conn()?;
+    let done: Option<String> =
+        media_core::rusqlite::OptionalExtension::optional(conn.query_row("SELECT value FROM settings WHERE key = 'dup_keep_v6'", [], |r| r.get(0)))?;
+    if done.is_none() {
+        media_core::dedupe::apply_rules(&mut conn)?;
+        conn.execute("INSERT OR REPLACE INTO settings(key, value) VALUES ('dup_keep_v6', '1')", [])?;
+    }
+    Ok(())
+}
+
 pub(crate) fn refresh_places(st: &AppState) -> anyhow::Result<()> {
     let mut conn = st.db.conn()?;
     media_core::places::refresh(&mut conn)?;
@@ -1077,6 +1088,11 @@ pub fn run() {
             watch_drives(&handle);
             let lane = st.lane.clone();
             std::thread::spawn(move || {
+                // Groups saved before copies on other drives counted as backups: decide them again
+                // once (nothing is read; later manual choices are not touched).
+                if let Err(e) = upgrade_dup_keepers(&handle.state::<AppState>()) {
+                    eprintln!("duplicate keepers upgrade failed: {e:#}");
+                }
                 // Libraries scanned before places existed already have GPS: name them now.
                 if let Err(e) = refresh_places(&handle.state::<AppState>()) {
                     eprintln!("places refresh failed: {e:#}");

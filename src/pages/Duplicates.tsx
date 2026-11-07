@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { confirm } from "@tauri-apps/plugin-dialog";
-import { absPath, api, fmtBytes, fmtCount, fmtDate, thumbUrl, type DupGroup, type DupSummary } from "../api";
+import { absPath, api, fmtBytes, fmtCount, fmtDate, thumbUrl, VARIANT_NAMES, type DupGroup, type DupSummary } from "../api";
 import { useJob } from "../App";
 import Compare from "../components/Compare";
 import DupRulesCard from "../components/DupRules";
@@ -128,6 +128,7 @@ export default function Duplicates() {
                     <input type="checkbox" checked={m.keep} onChange={(e) => toggleKeep(g, m.file.id, e.target.checked)} />
                     {m.keep ? "보존" : "격리"}
                   </label>
+                  {m.variant && <span className={`role-tag variant v-${m.variant}`}>{VARIANT_NAMES[m.variant]}</span>}
                   <div className="dup-meta">
                     <div className="mono small path-tail" title={absPath(m.file)}><bdi>{absPath(m.file)}</bdi></div>
                     <div className="small muted">
