@@ -216,6 +216,11 @@ const MIGRATIONS: &[&str] = &[
         group_size INTEGER NOT NULL
     );
     "#,
+    // 5: broken EXIF sizes (e.g. 4294967295) made width × height overflow; forget them.
+    r#"
+    UPDATE files SET width = NULL, height = NULL
+     WHERE width > 100000 OR height > 100000 OR width <= 0 OR height <= 0;
+    "#,
 ];
 
 pub fn schema_version(conn: &Connection) -> Result<i64> {

@@ -201,9 +201,11 @@ impl Lane {
                             if waited >= regroup_every() {
                                 waited = Duration::ZERO;
                                 let st = app.state::<AppState>();
-                                if crate::post_analysis(&st).is_ok() {
-                                    let _ = app.emit("analysis-done", ());
+                                if let Err(e) = crate::post_analysis(&st) {
+                                    st.lane.status.lock().unwrap().last_error = Some(format!("{e:#}"));
                                 }
+                                // Partial results (e.g. people even if cleanup failed) still show.
+                                let _ = app.emit("analysis-done", ());
                             }
                         }
                     });

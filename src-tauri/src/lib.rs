@@ -47,11 +47,21 @@ struct AppState {
 }
 
 /// Recompute data derived from the per-file analysis (bursts, places, trips, people).
+/// Each step runs even if another failed (a cleanup error once kept people from ever being grouped).
 pub(crate) fn post_analysis(st: &AppState) -> anyhow::Result<()> {
     let mut conn = st.db.conn()?;
-    media_core::cleanup::refresh(&mut conn)?;
-    media_core::people::refresh(&mut conn)?;
-    Ok(())
+    let mut errors = Vec::new();
+    if let Err(e) = media_core::cleanup::refresh(&mut conn) {
+        errors.push(format!("정리 제안 계산 오류: {e:#}"));
+    }
+    if let Err(e) = media_core::people::refresh(&mut conn) {
+        errors.push(format!("인물 묶기 오류: {e:#}"));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(errors.join(" · "))
+    }
 }
 
 pub(crate) fn refresh_places(st: &AppState) -> anyhow::Result<()> {

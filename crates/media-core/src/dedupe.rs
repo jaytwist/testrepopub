@@ -417,7 +417,7 @@ impl DupRules {
 /// oldest, shortest path.
 pub fn rank_members(members: &mut [FileRow], labels: &HashMap<i64, Vec<String>>, rules: &DupRules) {
     let score = |f: &FileRow| {
-        let pixels = f.width.unwrap_or(0) * f.height.unwrap_or(0);
+        let pixels = f.width.unwrap_or(0).saturating_mul(f.height.unwrap_or(0));
         let date_rank = match crate::meta::confidence(&f.date_source) {
             "high" => 0,
             "medium" => 1,

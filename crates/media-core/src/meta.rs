@@ -151,6 +151,12 @@ fn read_embedded(path: &Path) -> Option<Embedded> {
 }
 
 /// Extract everything we index for one file. Never fails: missing data just stays `None`.
+/// A believable image side in pixels. Broken EXIF can say 4294967295, which then overflows
+/// width × height everywhere it is used.
+pub fn sane_side(v: i64) -> bool {
+    (1..=100_000).contains(&v)
+}
+
 pub fn extract(path: &Path, kind: Kind, mtime: i64) -> Meta {
     let mut m = Meta::default();
     let emb = std::panic::catch_unwind(|| read_embedded(path)).ok().flatten();
@@ -159,8 +165,8 @@ pub fn extract(path: &Path, kind: Kind, mtime: i64) -> Meta {
             m.taken_at = Some(to_ts(t));
             m.date_source = e.source.to_string();
         }
-        m.width = e.width.filter(|v| *v > 0);
-        m.height = e.height.filter(|v| *v > 0);
+        m.width = e.width.filter(|v| sane_side(*v));
+        m.height = e.height.filter(|v| sane_side(*v));
         m.duration_ms = e.duration_ms;
         m.camera = e.camera;
         m.lat = e.lat.filter(|v| v.is_finite() && *v != 0.0);
@@ -169,8 +175,8 @@ pub fn extract(path: &Path, kind: Kind, mtime: i64) -> Meta {
     }
     if kind != Kind::Video && (m.width.is_none() || m.height.is_none()) {
         if let Ok(sz) = imagesize::size(path) {
-            m.width = Some(sz.width as i64);
-            m.height = Some(sz.height as i64);
+            m.width = Some(sz.width as i64).filter(|v| sane_side(*v));
+            m.height = Some(sz.height as i64).filter(|v| sane_side(*v));
         }
     }
     // EXIF orientation 5..8 means the stored pixels are rotated 90 degrees.
@@ -298,6 +304,13 @@ pub fn fmt_ts(ts: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn broken_exif_sizes() {
+        assert!(sane_side(4032));
+        assert!(!sane_side(0));
+        assert!(!sane_side(4_294_967_295));
+    }
 
     fn ymdhms(s: &str) -> NaiveDateTime {
         NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").unwrap()

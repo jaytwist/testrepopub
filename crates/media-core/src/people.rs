@@ -56,7 +56,8 @@ fn load_faces(conn: &Connection) -> Result<Vec<FaceVec>> {
     let mut st = conn.prepare(
         "SELECT fc.id, fc.person_id, fc.locked, fc.embedding, fc.score, fc.w, fc.h, f.width, f.height
          FROM faces fc JOIN files f ON f.id = fc.file_id
-         WHERE fc.hidden = 0 AND f.missing = 0 AND f.quarantined = 0",
+         WHERE fc.hidden = 0 AND f.missing = 0 AND f.quarantined = 0
+         ORDER BY fc.id",
     )?;
     let rows = st
         .query_map([], |r| {
@@ -128,7 +129,7 @@ pub fn refresh(conn: &mut Connection) -> Result<PeopleStats> {
             let best = ref_list
                 .iter()
                 .filter(|(p, _)| !rejects.contains(&(f.id, *p)))
-                .map(|(p, r)| (*p, similarity(&f.v, r)))
+                .map(|(p, r)| (*p, dot(&f.v, r)))
                 .filter(|(_, s)| *s >= ASSIGN_SIM)
                 .max_by(|a, b| a.1.total_cmp(&b.1))
                 .map(|(p, _)| p);
@@ -138,33 +139,16 @@ pub fn refresh(conn: &mut Connection) -> Result<PeopleStats> {
     let joined: HashMap<i64, i64> = joins.into_iter().filter_map(|(f, p)| p.map(|p| (f, p))).collect();
     stats.assigned = joined.len();
 
-    // 2. Group the rest (leader-follower on running group references).
+    // 2. Group the rest (leader-follower on running group references). Strangers make this the
+    //    expensive step (faces × groups), so it is skipped when the leftover faces are exactly the
+    //    ones that formed no new person last time — the result would be the same.
     let rest: Vec<&FaceVec> = unassigned.into_iter().filter(|f| !joined.contains_key(&f.id)).collect();
-    struct Group {
-        sum: Vec<f32>,
-        reference: Vec<f32>,
-        members: Vec<i64>,
-    }
-    let mut groups: Vec<Group> = Vec::new();
-    for f in &rest {
-        let best = groups
-            .par_iter()
-            .enumerate()
-            .map(|(i, g)| (i, similarity(&f.v, &g.reference)))
-            .filter(|(_, s)| *s >= LINK_SIM)
-            .max_by(|a, b| a.1.total_cmp(&b.1).then(b.0.cmp(&a.0)));
-        match best {
-            Some((i, _)) => {
-                let g = &mut groups[i];
-                for (a, b) in g.sum.iter_mut().zip(f.v.iter()) {
-                    *a += b;
-                }
-                g.reference = l2_normalize(&g.sum);
-                g.members.push(f.id);
-            }
-            None => groups.push(Group { sum: f.v.clone(), reference: f.v.clone(), members: vec![f.id] }),
-        }
-    }
+    let sig = rest.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, f| (h ^ f.id as u64).wrapping_mul(0x0100_0000_01b3)).to_string();
+    let same_as_last = conn
+        .query_row("SELECT value FROM settings WHERE key = 'people_deferred_sig'", [], |r| r.get::<_, String>(0))
+        .optional()?
+        .is_some_and(|s| s == sig);
+    let groups = if same_as_last { Vec::new() } else { group_leftovers(&rest) };
 
     let tx = conn.transaction()?;
     {
@@ -181,12 +165,117 @@ pub fn refresh(conn: &mut Connection) -> Result<PeopleStats> {
             }
             stats.new_people += 1;
         }
-        stats.deferred = groups.iter().filter(|g| g.members.len() < MIN_FACES).map(|g| g.members.len()).sum();
+        stats.deferred = if same_as_last { rest.len() } else { groups.iter().filter(|g| g.members.len() < MIN_FACES).map(|g| g.members.len()).sum() };
+        if stats.new_people == 0 {
+            tx.execute("INSERT INTO settings(key, value) VALUES ('people_deferred_sig', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [&sig])?;
+        }
         // People left with no faces (all removed / files deleted) disappear.
         tx.execute("DELETE FROM persons WHERE name IS NULL AND NOT EXISTS (SELECT 1 FROM faces WHERE person_id = persons.id)", [])?;
     }
     tx.commit()?;
     Ok(stats)
+}
+
+struct Group {
+    sum: Vec<f32>,
+    members: Vec<i64>,
+}
+
+/// Groups compared per parallel task.
+const BLOCK: usize = 2048;
+
+/// Dot product written so the compiler vectorizes it (a plain `sum()` is a serial add chain).
+#[inline]
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = [0f32; 8];
+    for (ca, cb) in a.chunks_exact(8).zip(b.chunks_exact(8)) {
+        for i in 0..8 {
+            acc[i] += ca[i] * cb[i];
+        }
+    }
+    acc.iter().sum()
+}
+
+/// Faces compared against the group matrix together (one pass over memory per batch).
+const BATCH: usize = 64;
+
+/// Better match: higher similarity, ties to the older (lower-index) group.
+fn better(a: Option<(usize, f32)>, b: (usize, f32)) -> Option<(usize, f32)> {
+    match a {
+        Some(a) if a.1 > b.1 || (a.1 == b.1 && a.0 < b.0) => Some(a),
+        _ => Some(b),
+    }
+}
+
+/// Leader-follower grouping: each face, in order, joins the most similar group reference
+/// (≥ `LINK_SIM`, ties to the older group) or starts a new group.
+///
+/// Same result as comparing one face at a time, but fast on large libraries: references live in
+/// one contiguous matrix that is streamed once per batch of faces (not once per face), and only
+/// the groups changed inside the batch are compared again face by face.
+fn group_leftovers(rest: &[&FaceVec]) -> Vec<Group> {
+    let d = EMBED_DIM;
+    let mut refs: Vec<f32> = Vec::with_capacity(rest.len().min(1 << 20) * d);
+    let mut groups: Vec<Group> = Vec::new();
+    for batch in rest.chunks(BATCH) {
+        // Matches against the groups as they were when the batch started.
+        let found: Vec<(usize, usize, f32)> = refs
+            .par_chunks(BLOCK * d)
+            .enumerate()
+            .flat_map_iter(|(ci, block)| {
+                let mut out = Vec::new();
+                for (j, r) in block.chunks_exact(d).enumerate() {
+                    for (k, f) in batch.iter().enumerate() {
+                        let s = dot(&f.v, r);
+                        if s >= LINK_SIM {
+                            out.push((k, ci * BLOCK + j, s));
+                        }
+                    }
+                }
+                out
+            })
+            .collect();
+        let mut cands: Vec<Vec<(usize, f32)>> = vec![Vec::new(); batch.len()];
+        for (k, g, s) in found {
+            cands[k].push((g, s));
+        }
+        // Groups changed (or created) inside this batch: their earlier scores are stale.
+        let mut touched: Vec<usize> = Vec::new();
+        for (k, f) in batch.iter().enumerate() {
+            let mut best: Option<(usize, f32)> = None;
+            for &(g, s) in &cands[k] {
+                if !touched.contains(&g) {
+                    best = better(best, (g, s));
+                }
+            }
+            for &g in &touched {
+                let s = dot(&f.v, &refs[g * d..(g + 1) * d]);
+                if s >= LINK_SIM {
+                    best = better(best, (g, s));
+                }
+            }
+            let i = match best {
+                Some((i, _)) => {
+                    let g = &mut groups[i];
+                    for (a, b) in g.sum.iter_mut().zip(f.v.iter()) {
+                        *a += b;
+                    }
+                    refs[i * d..(i + 1) * d].copy_from_slice(&l2_normalize(&g.sum));
+                    g.members.push(f.id);
+                    i
+                }
+                None => {
+                    refs.extend_from_slice(&f.v);
+                    groups.push(Group { sum: f.v.clone(), members: vec![f.id] });
+                    groups.len() - 1
+                }
+            };
+            if !touched.contains(&i) {
+                touched.push(i);
+            }
+        }
+    }
+    groups
 }
 
 // ---------------------------------------------------------------------------------------------

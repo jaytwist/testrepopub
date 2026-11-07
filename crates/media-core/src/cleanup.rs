@@ -31,7 +31,7 @@ struct Shot {
     camera: String,
     dhash: u64,
     sharpness: f64,
-    pixels: i64,
+    pixels: f64,
     size: i64,
     faces: i64,
 }
@@ -41,7 +41,7 @@ pub fn refresh(conn: &mut Connection) -> Result<()> {
     let shots: Vec<Shot> = {
         let mut st = conn.prepare(
             "SELECT f.id, f.taken_at, COALESCE(f.camera, ''), a.dhash, COALESCE(a.sharpness, 0),
-                    COALESCE(f.width, 0) * COALESCE(f.height, 0), f.size, COALESCE(a.face_count, 0)
+                    CAST(COALESCE(f.width, 0) AS REAL) * COALESCE(f.height, 0), f.size, COALESCE(a.face_count, 0)
              FROM files f JOIN analysis a ON a.file_id = f.id
              WHERE f.missing = 0 AND f.quarantined = 0 AND f.kind IN ('photo', 'raw') AND f.date_source = 'exif'
                AND a.dhash IS NOT NULL AND f.taken_at IS NOT NULL
@@ -116,7 +116,7 @@ pub fn refresh(conn: &mut Connection) -> Result<()> {
         for (gi, g) in groups.iter().enumerate() {
             let mut ranked: Vec<&&Shot> = g.iter().collect();
             // Best shot: sharpest, then most pixels, then more faces.
-            ranked.sort_by(|a, b| b.sharpness.total_cmp(&a.sharpness).then(b.pixels.cmp(&a.pixels)).then(b.faces.cmp(&a.faces)));
+            ranked.sort_by(|a, b| b.sharpness.total_cmp(&a.sharpness).then(b.pixels.total_cmp(&a.pixels)).then(b.faces.cmp(&a.faces)));
             let bid = gi as i64 + 1;
             for (rank, s) in ranked.iter().enumerate() {
                 ins_b.execute(params![s.id, bid, rank as i64])?;

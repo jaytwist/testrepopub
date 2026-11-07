@@ -120,4 +120,20 @@ fn bursts_and_blur() {
     assert!(db::query_ids(&conn, &FileFilter { suggest: Some("screenshot".into()), ..Default::default() }).unwrap().is_empty());
     assert_eq!(cleanup::summary(&conn).unwrap().screenshots.count, 0);
     assert!(db::query_ids(&conn, &FileFilter { suggest: Some("large_video".into()), ..Default::default() }).unwrap().is_empty());
+
+    // Broken EXIF sizes (4294967295) overflow width × height into a REAL; that once failed the
+    // refresh and, with it, people grouping. Both must still work.
+    conn.execute("UPDATE files SET width = 4294967295, height = 4294967295", []).unwrap();
+    cleanup::refresh(&mut conn).unwrap();
+    media_core::people::refresh(&mut conn).unwrap();
+    let mut probe = db::get_file(&conn, 1).unwrap().unwrap();
+    probe.width = Some(4294967295);
+    probe.height = Some(4294967295);
+    let mut two = vec![probe.clone(), probe];
+    media_core::dedupe::rank_members(&mut two, &Default::default(), &Default::default());
+    // Libraries indexed before the fix: migration 5 forgets the broken sizes (nothing is re-read).
+    conn.execute_batch("PRAGMA user_version = 4").unwrap();
+    let again = Db::open(cache.join("library.db")).unwrap();
+    let broken: i64 = again.conn().unwrap().query_row("SELECT COUNT(*) FROM files WHERE width > 100000", [], |r| r.get(0)).unwrap();
+    assert_eq!(broken, 0);
 }
