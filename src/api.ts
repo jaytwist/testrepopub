@@ -47,6 +47,12 @@ export interface DupRules { keep: string[]; drop: string[] }
 export interface CompareInfo { files: FileDetail[]; identical: number[][]; recommended: number | null }
 export interface PersonRow { id: number; name: string | null; cover_face_id: number | null; photos: number; hidden: boolean }
 export interface FaceRow { id: number; file_id: number; locked: boolean }
+/** A camera card (removable drive with DCIM) and importing from it. */
+export interface Card { mount: string; label: string }
+export interface ImportSettings { target_dir: string; template: string }
+export interface ImportPreview { source_id: number; volume_id: number; new_files: number; new_bytes: number; already: number }
+export const onCardConnected = (cb: (c: Card) => void) => listen<Card>("card-connected", (e) => cb(e.payload));
+
 /** A file that is not deleted unless forced, and why. */
 export interface Blocked { id: number; reason: "last_copy" | "keep_folder" | "original" | "favorite" }
 
@@ -176,6 +182,12 @@ export const api = {
   startScan: (sourceId?: number) => invoke<void>("start_scan", { sourceId: sourceId ?? null, volumeId: null, folder: null }),
   /** Only the sources on this drive. */
   scanVolume: (volumeId: number) => invoke<void>("start_scan", { sourceId: null, volumeId, folder: null }),
+  listCards: () => invoke<Card[]>("list_cards"),
+  getImportSettings: () => invoke<ImportSettings>("get_import_settings"),
+  setImportSettings: (settings: ImportSettings) => invoke<void>("set_import_settings", { settings }),
+  startImportPreview: (mount: string) => invoke<void>("start_import_preview", { mount }),
+  startImport: (mount: string) => invoke<void>("start_import", { mount }),
+  importCancel: (sourceId: number) => invoke<void>("import_cancel", { sourceId }),
   /** Only this folder (inside a registered source): nothing else is listed. */
   scanFolder: (folder: string) => invoke<void>("start_scan", { sourceId: null, volumeId: null, folder }),
   getScanOptions: () => invoke<ScanOptions>("get_scan_options"),

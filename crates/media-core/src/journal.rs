@@ -250,7 +250,7 @@ pub struct BatchRow {
 pub fn list_batches(conn: &Connection) -> Result<Vec<BatchRow>> {
     let mut st = conn.prepare(
         "SELECT b.id, b.kind, b.description, b.created_at, b.op_count, b.state,
-                COALESCE((SELECT SUM(f.size) FROM journal j JOIN files f ON f.id = j.file_id WHERE j.batch_id = b.id AND j.undone = 0), 0)
+                COALESCE((SELECT SUM(f.size) FROM journal j JOIN files f ON f.id = COALESCE(j.new_file_id, j.file_id) WHERE j.batch_id = b.id AND j.undone = 0), 0)
          FROM batches b ORDER BY b.created_at DESC, b.id DESC",
     )?;
     let rows = st

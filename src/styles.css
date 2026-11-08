@@ -520,3 +520,11 @@ kbd { font: 11px/1 ui-monospace, Consolas, monospace; border: 1px solid var(--li
 .tri-meta .diff { color: var(--text); font-weight: 600; }
 .tri-keys { flex-wrap: wrap; font-size: 12px; gap: 14px; }
 .tri-keys kbd, .triage kbd { font-size: 11px; padding: 0 5px; border: 1px solid var(--line); border-radius: 4px; background: var(--panel-2); margin: 0 1px; }
+
+/* Import from a camera card */
+.import-panel { width: min(620px, calc(100vw - 32px)); display: flex; flex-direction: column; gap: 12px; }
+.import-panel h2 { margin: 0; font-size: 17px; }
+.import-row { display: grid; grid-template-columns: 90px 1fr auto; align-items: center; gap: 10px; }
+.import-row .seg { grid-column: 2 / span 2; flex-wrap: wrap; }
+.import-result { min-height: 24px; font-size: 15px; }
+.card-toast { top: 112px; }

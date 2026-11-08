@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useState } from "react";
 import {
-  api, onAnalysisStatus, onDriveConnected, onJobDone, onProgress, onUpdateProgress, type AppInfo, type FileFilter, type GroupBy, type JobDone,
+  api, onAnalysisStatus, onCardConnected, onDriveConnected, type Card, onJobDone, onProgress, onUpdateProgress, type AppInfo, type FileFilter, type GroupBy, type JobDone,
   type LaneStatus, type LibraryStats, type Progress, type UpdateInfo, type UpdateProgress, fmtBytes, fmtCount, fmtEta,
 } from "./api";
 import Library from "./pages/Library";
@@ -12,6 +12,7 @@ import Settings from "./pages/Settings";
 import Cleanup from "./pages/Cleanup";
 import Trips from "./pages/Trips";
 import People from "./pages/People";
+import ImportPanel from "./components/ImportPanel";
 
 export type Page = "library" | "people" | "trips" | "cleanup" | "sources" | "duplicates" | "organize" | "history" | "settings";
 
@@ -77,6 +78,14 @@ function doneText(d: JobDone): string {
     if (r.skipped_offline) parts.push(`연결 안 된 드라이브 ${fmtCount(r.skipped_offline)}개는 건너뜀`);
     return parts.join(" · ") + " — 「작업 기록」에서 되돌릴 수 있습니다";
   }
+  if (d.job === "import") {
+    const r2 = d.result as { copied: number; bytes: number; already: number; failed: number; target_dir: string };
+    const parts = [`${fmtCount(r2.copied)}개를 가져왔습니다 (${fmtBytes(r2.bytes)}) → ${r2.target_dir}`];
+    if (r2.already) parts.push(`이미 있던 ${fmtCount(r2.already)}개는 건너뜀`);
+    if (r2.failed) parts.push(`실패 ${fmtCount(r2.failed)}개`);
+    return parts.join(" · ") + " — 「작업 기록」에서 되돌릴 수 있습니다";
+  }
+  if (d.job === "import:preview") return "SD 카드를 확인했습니다";
   if (d.job === "scan" && Array.isArray(d.result?.scan)) {
     const s = (d.result.scan as Record<string, number>[]).reduce(
       (a, x) => ({
@@ -139,6 +148,15 @@ export default function App() {
   const [plugged, setPlugged] = useState<{ volume_id: number; label: string } | null>(null);
   useEffect(() => {
     const un = onDriveConnected(setPlugged);
+    return () => {
+      un.then((u) => u());
+    };
+  }, []);
+  /** A camera card was plugged in (offer to import), and the import panel. */
+  const [card, setCard] = useState<Card | null>(null);
+  const [importing, setImporting] = useState<Card | null>(null);
+  useEffect(() => {
+    const un = onCardConnected(setCard);
     return () => {
       un.then((u) => u());
     };
@@ -253,9 +271,20 @@ export default function App() {
 
   const pct = progress && progress.total > 0 ? Math.min(100, (progress.done / progress.total) * 100) : null;
 
+  /** A short job can finish before its caller marks it running (the done event arrives first):
+   *  confirm with the backend so the bar never stays on a job that already ended. */
+  const markRunning = (name: string | null) => {
+    setRunning(name);
+    if (name) {
+      api.appInfo().then((i) => {
+        if (!i.job) setRunning((r) => (r === name ? null : r));
+      }).catch(() => {});
+    }
+  };
+
   return (
     <NavContext.Provider value={nav}>
-    <JobContext.Provider value={{ running, progress, lastDone, version, setRunning }}>
+    <JobContext.Provider value={{ running, progress, lastDone, version, setRunning: markRunning }}>
       <div className="app">
         <aside className="sidebar">
           <div className="brand">
@@ -376,6 +405,14 @@ export default function App() {
           </div>
         )}
         {toast && <div className={`toast ${toast.ok ? "ok" : "bad"}`} onClick={() => setToast(null)}>{toast.text}</div>}
+        {card && !importing && (
+          <div className="toast ok drive-toast card-toast">
+            <span>⇩ SD 카드 <b>{card.label}</b>가 연결되었습니다</span>
+            <button className="btn small primary" disabled={!!running} onClick={() => { setImporting(card); setCard(null); }}>새 사진 가져오기</button>
+            <button className="btn small ghost" onClick={() => setCard(null)}>닫기</button>
+          </div>
+        )}
+        {importing && <ImportPanel card={importing} onClose={() => setImporting(null)} />}
         {plugged && (
           <div className="toast ok drive-toast">
             <span>⏏ <b>{plugged.label}</b> 드라이브가 연결되었습니다</span>

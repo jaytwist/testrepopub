@@ -12,6 +12,7 @@ pub mod compare;
 pub mod dedupe;
 pub mod faces;
 pub mod identity;
+pub mod importer;
 pub mod journal;
 pub mod labels;
 pub mod media;

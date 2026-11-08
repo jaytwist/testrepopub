@@ -226,6 +226,55 @@ fn start_scan(app: AppHandle, state: State<AppState>, source_id: Option<i64>, vo
     })
 }
 
+// ---------------------------------------------------------------------------------------------
+// Import from a camera card
+// ---------------------------------------------------------------------------------------------
+
+#[tauri::command]
+fn list_cards() -> Vec<media_core::importer::Card> {
+    media_core::importer::find_cards()
+}
+
+#[tauri::command]
+fn get_import_settings(state: State<AppState>) -> CmdResult<media_core::importer::ImportSettings> {
+    let conn = state.db.conn().map_err(err)?;
+    media_core::importer::ImportSettings::load(&conn).map_err(err)
+}
+
+#[tauri::command]
+fn set_import_settings(state: State<AppState>, settings: media_core::importer::ImportSettings) -> CmdResult<()> {
+    let conn = state.db.conn().map_err(err)?;
+    settings.save(&conn).map_err(err)
+}
+
+/// Count what is new on the card (the card is scanned; the backup drive is not).
+#[tauri::command]
+fn start_import_preview(app: AppHandle, state: State<AppState>, mount: String) -> CmdResult<()> {
+    spawn_job(&app, &state, "import:preview", move |st, progress| {
+        let opts = userfiles::load_options(&st.db.conn()?)?;
+        media_core::importer::preview(&st.db, std::path::Path::new(&mount), &opts, &st.stop, progress)
+    })
+}
+
+/// Copy the card's new photos into the backup folder (indexed while copying), then forget the card.
+#[tauri::command]
+fn start_import(app: AppHandle, state: State<AppState>, mount: String) -> CmdResult<()> {
+    spawn_job(&app, &state, "import", move |st, progress| {
+        let conn = st.db.conn()?;
+        let opts = userfiles::load_options(&conn)?;
+        let settings = media_core::importer::ImportSettings::load(&conn)?;
+        drop(conn);
+        media_core::importer::run(&st.db, std::path::Path::new(&mount), &settings, &opts, &st.stop, progress)
+    })
+}
+
+/// The card was looked at but not imported: forget it again.
+#[tauri::command]
+fn import_cancel(state: State<AppState>, source_id: i64) -> CmdResult<()> {
+    let conn = state.db.conn().map_err(err)?;
+    media_core::importer::forget(&conn, source_id).map_err(err)
+}
+
 #[tauri::command]
 fn get_scan_options(state: State<AppState>) -> CmdResult<ScanOptions> {
     let conn = state.db.conn().map_err(err)?;
@@ -625,6 +674,7 @@ fn watch_drives(app: &AppHandle) {
     let app = app.clone();
     std::thread::spawn(move || {
         let mut known: Option<std::collections::HashSet<i64>> = None;
+        let mut known_cards: Option<std::collections::HashSet<String>> = None;
         loop {
             let online = (|| -> anyhow::Result<(std::collections::HashSet<i64>, Vec<(i64, String)>)> {
                 let st = app.state::<AppState>();
@@ -639,9 +689,27 @@ fn watch_drives(app: &AppHandle) {
                 }
                 Ok((set, labels))
             })();
+            // Camera cards (removable, with DCIM), registered or not: offer to import.
+            let cards: std::collections::HashSet<String> = media_core::importer::find_cards().into_iter().map(|c| c.mount).collect();
+            if let Some(prev) = &known_cards {
+                for c in media_core::importer::find_cards().into_iter().filter(|c| !prev.contains(&c.mount)) {
+                    let _ = app.emit("card-connected", c);
+                }
+            }
+            known_cards = Some(cards);
             if let Ok((set, labels)) = online {
                 if let Some(prev) = &known {
-                    for (id, label) in labels.into_iter().filter(|(id, _)| !prev.contains(id)) {
+                    // A camera card being imported has its own offer; no "check for new files" too.
+                    let card_ids: std::collections::HashSet<i64> = app
+                        .state::<AppState>()
+                        .db
+                        .conn()
+                        .ok()
+                        .map(|c| {
+                            known_cards.iter().flatten().filter_map(|m| c.query_row("SELECT id FROM volumes WHERE mount = ?", [m], |r| r.get(0)).ok()).collect()
+                        })
+                        .unwrap_or_default();
+                    for (id, label) in labels.into_iter().filter(|(id, _)| !prev.contains(id) && !card_ids.contains(id)) {
                         let _ = app.emit("drive-connected", DriveConnected { volume_id: id, label });
                     }
                 }
@@ -1162,6 +1230,12 @@ pub fn run() {
             merge_people,
             reject_faces,
             protect_check,
+            list_cards,
+            get_import_settings,
+            set_import_settings,
+            start_import_preview,
+            start_import,
+            import_cancel,
             triage_groups,
             triage_commit,
             move_faces,

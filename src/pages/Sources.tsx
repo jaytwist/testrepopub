@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import { open, confirm } from "@tauri-apps/plugin-dialog";
-import { api, fmtBytes, fmtCount, type ScanStats, type SourceRow, type SuggestedFolder, type VolumeRow } from "../api";
+import { api, fmtBytes, fmtCount, type Card, type ScanStats, type SourceRow, type SuggestedFolder, type VolumeRow } from "../api";
 import { useJob, useNav } from "../App";
+import ImportPanel from "../components/ImportPanel";
 
 function ago(ts: number) {
   if (!ts) return "스캔한 적 없음";
@@ -76,6 +77,15 @@ export default function Sources() {
     }
   };
 
+  /** Import from a camera card (the only one plugged in, or a choice). */
+  const [importing, setImporting] = useState<Card | null>(null);
+  const importCard = async () => {
+    setError(null);
+    const cards = await api.listCards();
+    if (cards.length === 0) return setError("카메라 SD 카드(DCIM 폴더가 있는 이동식 드라이브)가 보이지 않습니다. 카드를 꽂은 뒤 다시 눌러 주세요.");
+    setImporting(cards[0]);
+  };
+
   const remove = async (s: SourceRow) => {
     const ok = await confirm(`"${s.abs_path}" 를 목록에서 제거할까요?\n\n디스크의 파일은 삭제되지 않고, 앱의 색인만 지워집니다.`, { title: "폴더 제거", kind: "warning" });
     if (!ok) return;
@@ -105,6 +115,7 @@ export default function Sources() {
         </div>
         <div className="btn-row">
           <button className="btn" onClick={() => reload(true)}>드라이브 새로고침</button>
+          <button className="btn" disabled={!!running} onClick={importCard} title="카메라 SD 카드의 새 사진만 백업 폴더로 복사합니다">⇩ SD 카드에서 가져오기</button>
           <button className="btn" disabled={!!running || sources.length === 0} onClick={() => scan()} title="바뀐 파일만 다시 읽습니다. 처음 스캔보다 훨씬 빠릅니다.">새 파일 확인</button>
           <button className="btn primary" onClick={addFolder}>+ 폴더 추가</button>
         </div>
@@ -198,6 +209,7 @@ export default function Sources() {
         시스템 폴더, 프로그램·게임 폴더, 숨김 파일, 아이콘 크기 이미지는 사용자 파일이 아니므로 건너뜁니다.{" "}
         <button className="link" onClick={() => go("settings")}>건너뛸 파일 규칙 바꾸기 (설정)</button>
       </p>
+      {importing && <ImportPanel card={importing} onClose={() => { setImporting(null); reload(); }} />}
     </div>
   );
 }
