@@ -193,15 +193,31 @@ fn remove_source(state: State<AppState>, id: i64) -> CmdResult<()> {
 }
 
 #[tauri::command]
-fn start_scan(app: AppHandle, state: State<AppState>, source_id: Option<i64>) -> CmdResult<()> {
+/// Check for new files: one source, one drive (`volume_id`), one folder (`folder`, inside a
+/// registered source — nothing else is listed), or everything.
+fn start_scan(app: AppHandle, state: State<AppState>, source_id: Option<i64>, volume_id: Option<i64>, folder: Option<String>) -> CmdResult<()> {
+    // Resolve the folder first so a wrong pick is reported right away.
+    let scope = match &folder {
+        Some(f) => {
+            let conn = state.db.conn().map_err(err)?;
+            Some(scanner::locate(&conn, std::path::Path::new(f)).map_err(err)?.ok_or("등록된 폴더 안의 폴더를 골라 주세요")?)
+        }
+        None => None,
+    };
     spawn_job(&app, &state, "scan", move |st, progress| {
         let conn = st.db.conn()?;
         let opts = userfiles::load_options(&conn)?;
         let auto_analysis = analysis::load_options(&conn)?.auto;
         drop(conn);
-        let stats = match source_id {
-            Some(id) => vec![scanner::scan_source(&st.db, id, &opts, &st.stop, progress)?],
-            None => scanner::scan_all(&st.db, &opts, &st.stop, progress)?,
+        let stats = match (scope, source_id, volume_id) {
+            (Some((id, sub)), _, _) => {
+                let s = scanner::scan_scope(&st.db, id, Some(&sub), &opts, &st.stop, progress)?;
+                media_core::identity::backfill_prehashes(&st.db.conn()?)?;
+                vec![s]
+            }
+            (None, Some(id), _) => vec![scanner::scan_source(&st.db, id, &opts, &st.stop, progress)?],
+            (None, None, Some(v)) => scanner::scan_volume(&st.db, v, &opts, &st.stop, progress)?,
+            (None, None, None) => scanner::scan_all(&st.db, &opts, &st.stop, progress)?,
         };
         // With background analysis on, thumbnails come from its single-read pass right after this
         // job; otherwise make them here so the drive can be unplugged and still browsed.

@@ -173,7 +173,11 @@ export const api = {
   listSources: () => invoke<SourceRow[]>("list_sources"),
   addSource: (path: string) => invoke<number>("add_source", { path }),
   removeSource: (id: number) => invoke<void>("remove_source", { id }),
-  startScan: (sourceId?: number) => invoke<void>("start_scan", { sourceId: sourceId ?? null }),
+  startScan: (sourceId?: number) => invoke<void>("start_scan", { sourceId: sourceId ?? null, volumeId: null, folder: null }),
+  /** Only the sources on this drive. */
+  scanVolume: (volumeId: number) => invoke<void>("start_scan", { sourceId: null, volumeId, folder: null }),
+  /** Only this folder (inside a registered source): nothing else is listed. */
+  scanFolder: (folder: string) => invoke<void>("start_scan", { sourceId: null, volumeId: null, folder }),
   getScanOptions: () => invoke<ScanOptions>("get_scan_options"),
   cleanupSummary: () => invoke<CleanupSummary>("cleanup_summary"),
   tripsSummary: () => invoke<TripsSummary>("trips_summary"),

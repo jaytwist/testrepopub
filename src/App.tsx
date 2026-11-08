@@ -77,8 +77,26 @@ function doneText(d: JobDone): string {
     if (r.skipped_offline) parts.push(`연결 안 된 드라이브 ${fmtCount(r.skipped_offline)}개는 건너뜀`);
     return parts.join(" · ") + " — 「작업 기록」에서 되돌릴 수 있습니다";
   }
+  if (d.job === "scan" && Array.isArray(d.result?.scan)) {
+    const s = (d.result.scan as Record<string, number>[]).reduce(
+      (a, x) => ({
+        seen: a.seen + (x.seen ?? 0), fresh: a.fresh + (x.added ?? 0) + (x.updated ?? 0), known: a.known + (x.moved ?? 0) + (x.reused ?? 0),
+        walk: a.walk + (x.walk_ms ?? 0), read: a.read + (x.read_ms ?? 0),
+      }),
+      { seen: 0, fresh: 0, known: 0, walk: 0, read: 0 },
+    );
+    const parts = [`확인 ${fmtCount(s.seen)}개`, `새로 읽음 ${fmtCount(s.fresh)}개`];
+    if (s.known) parts.push(`옮겨지거나 복사된 ${fmtCount(s.known)}개는 다시 읽지 않음`);
+    parts.push(`목록 읽기 ${dur(s.walk)} · 새 파일 읽기 ${dur(s.read)}`);
+    return parts.join(" · ");
+  }
   return "작업이 완료되었습니다";
 }
+
+const dur = (ms: number) => {
+  const s = Math.round(ms / 1000);
+  return s < 60 ? `${s}초` : `${Math.floor(s / 60)}분 ${s % 60}초`;
+};
 
 const NAV: { section: string; items: { id: Page; label: string; icon: string }[] }[] = [
   {
@@ -126,9 +144,12 @@ export default function App() {
     };
   }, []);
   const checkPlugged = async () => {
+    const p = plugged;
     setPlugged(null);
     try {
-      await api.startScan();
+      // Only the drive that was plugged in, not every drive.
+      if (p) await api.scanVolume(p.volume_id);
+      else await api.startScan();
       setRunning("scan");
     } catch (e) {
       setToast({ ok: false, text: String(e) });

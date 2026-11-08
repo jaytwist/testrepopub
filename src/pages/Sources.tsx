@@ -63,6 +63,19 @@ export default function Sources() {
     }
   };
 
+  /** Only a folder you just copied into (e.g. today's SD dump): nothing else is listed. */
+  const scanFolder = async (s: SourceRow) => {
+    setError(null);
+    const folder = await open({ directory: true, defaultPath: s.abs_path, title: "방금 복사한 폴더 고르기" });
+    if (typeof folder !== "string") return;
+    try {
+      await api.scanFolder(folder);
+      setRunning("scan");
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   const remove = async (s: SourceRow) => {
     const ok = await confirm(`"${s.abs_path}" 를 목록에서 제거할까요?\n\n디스크의 파일은 삭제되지 않고, 앱의 색인만 지워집니다.`, { title: "폴더 제거", kind: "warning" });
     if (!ok) return;
@@ -172,7 +185,9 @@ export default function Sources() {
               <td>{s.volume_label} {s.online ? "" : <span className="pill">연결 안 됨</span>}</td>
               <td className="muted">{ago(s.last_scan)}</td>
               <td className="right">
-                <button className="btn small" disabled={!s.online || !!running} onClick={() => scan(s.id)} title="바뀐 파일만 다시 읽습니다">새 파일 확인</button>
+                <button className="btn small" disabled={!s.online || !!running} onClick={() => scanFolder(s)}
+                  title="방금 복사한 폴더만 확인합니다. 드라이브 전체를 훑지 않아 가장 빠릅니다.">폴더만 확인…</button>
+                <button className="btn small" disabled={!s.online || !!running} onClick={() => scan(s.id)} title="바뀐 파일만 다시 읽습니다 (목록은 전체를 훑음)">새 파일 확인</button>
                 <button className="btn small ghost" onClick={() => remove(s)}>제거</button>
               </td>
             </tr>

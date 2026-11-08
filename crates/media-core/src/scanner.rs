@@ -35,6 +35,10 @@ pub struct ScanStats {
     pub errors: u64,
     /// What was deliberately not indexed, and why.
     pub skipped: SkipCounts,
+    /// Time spent listing folders (every file is listed, none is opened).
+    pub walk_ms: u64,
+    /// Time spent reading new / changed files (metadata, fingerprint).
+    pub read_ms: u64,
 }
 
 struct Candidate {
@@ -53,6 +57,13 @@ fn mtime_of(md: &std::fs::Metadata) -> i64 {
 
 /// Scan one registered source.
 pub fn scan_source(db: &Db, source_id: i64, opts: &ScanOptions, stop: &StopFlag, progress: ProgressFn) -> Result<ScanStats> {
+    scan_scope(db, source_id, None, opts, stop, progress)
+}
+
+/// Scan one registered source, or only the folder `sub` inside it (relative to the source, `/`
+/// separated): files elsewhere in the source are not looked at and not marked missing.
+pub fn scan_scope(db: &Db, source_id: i64, sub: Option<&str>, opts: &ScanOptions, stop: &StopFlag, progress: ProgressFn) -> Result<ScanStats> {
+    let started = std::time::Instant::now();
     let mut conn = db.conn()?;
     volumes::refresh(&conn)?;
     let (volume_id, rel_root, mount, online): (i64, String, String, i64) = conn.query_row(
@@ -64,6 +75,13 @@ pub fn scan_source(db: &Db, source_id: i64, opts: &ScanOptions, stop: &StopFlag,
         return Err(anyhow!("드라이브가 연결되어 있지 않습니다 (offline volume)"));
     }
     let vol_root = PathBuf::from(&mount);
+    let sub = sub.map(|s| s.replace('\\', "/").trim_matches('/').to_string()).filter(|s| !s.is_empty());
+    // The part of the volume this scan covers.
+    let rel_root = match &sub {
+        Some(s) if rel_root.is_empty() => s.clone(),
+        Some(s) => format!("{}/{s}", rel_root.trim_end_matches('/')),
+        None => rel_root,
+    };
     let abs_root = volumes::join_rel(&vol_root, &rel_root);
     if !abs_root.is_dir() {
         return Err(anyhow!("폴더를 찾을 수 없습니다: {}", abs_root.display()));
@@ -138,6 +156,8 @@ pub fn scan_source(db: &Db, source_id: i64, opts: &ScanOptions, stop: &StopFlag,
     }
     stats.skipped = skipped.into_inner();
     stats.seen = cands.len() as u64;
+    stats.walk_ms = started.elapsed().as_millis() as u64;
+    let reading = std::time::Instant::now();
 
     // 2. Diff against the index.
     let existing: HashMap<String, (i64, i64, i64)> = {
@@ -263,6 +283,8 @@ pub fn scan_source(db: &Db, source_id: i64, opts: &ScanOptions, stop: &StopFlag,
         tx.commit()?;
     }
 
+    stats.read_ms = reading.elapsed().as_millis() as u64;
+
     // 4. Unchanged files are present again (they may have been marked missing before).
     {
         let tx = conn.transaction()?;
@@ -295,7 +317,9 @@ pub fn scan_source(db: &Db, source_id: i64, opts: &ScanOptions, stop: &StopFlag,
            AND (?2 = '' OR substr(rel_path, 1, length(?2) + 1) = ?2 || '/')",
         params![volume_id, rel_root, opts.min_image_side],
     )? as u64;
-    conn.execute("UPDATE sources SET last_scan = ? WHERE id = ?", params![now, source_id])?;
+    if sub.is_none() {
+        conn.execute("UPDATE sources SET last_scan = ? WHERE id = ?", params![now, source_id])?;
+    }
     progress(Progress::new(&job, "done", total, total, format!("{} files", stats.seen)));
     Ok(stats)
 }
@@ -320,6 +344,49 @@ pub fn scan_all(db: &Db, opts: &ScanOptions, stop: &StopFlag, progress: Progress
     // Older entries that could have a copy get their content fingerprint (once).
     identity::backfill_prehashes(&db.conn()?)?;
     Ok(out)
+}
+
+/// Scan only the sources on one drive (e.g. the one just plugged in).
+pub fn scan_volume(db: &Db, volume_id: i64, opts: &ScanOptions, stop: &StopFlag, progress: ProgressFn) -> Result<Vec<ScanStats>> {
+    let conn = db.conn()?;
+    volumes::refresh(&conn)?;
+    let ids: Vec<i64> = {
+        let mut st = conn.prepare("SELECT s.id FROM sources s JOIN volumes v ON v.id = s.volume_id WHERE v.online = 1 AND v.id = ?")?;
+        let rows = st.query_map([volume_id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        rows
+    };
+    drop(conn);
+    let mut out = Vec::new();
+    for id in ids {
+        if stop.is_stopped() {
+            break;
+        }
+        out.push(scan_source(db, id, opts, stop, progress)?);
+    }
+    identity::backfill_prehashes(&db.conn()?)?;
+    Ok(out)
+}
+
+/// The registered source a folder belongs to, and the folder relative to it (`/` separated).
+/// The innermost source wins when sources are nested.
+pub fn locate(conn: &Connection, folder: &Path) -> Result<Option<(i64, String)>> {
+    volumes::refresh(conn)?;
+    let mut st = conn.prepare("SELECT s.id, v.mount, s.rel_root FROM sources s JOIN volumes v ON v.id = s.volume_id WHERE v.online = 1")?;
+    let rows: Vec<(i64, String, String)> = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+    let norm = |p: &Path| p.to_string_lossy().replace('\\', "/").trim_end_matches('/').to_lowercase();
+    let target = norm(folder);
+    let mut best: Option<(i64, String, usize)> = None;
+    for (id, mount, rel_root) in rows {
+        let root = norm(&volumes::join_rel(Path::new(&mount), &rel_root));
+        let inside = target == root || target.starts_with(&format!("{root}/")) || root.is_empty();
+        if inside && best.as_ref().is_none_or(|b| root.len() > b.2) {
+            // Keep the original letter case of the sub-path.
+            let orig = folder.to_string_lossy().replace('\\', "/");
+            let sub = orig.trim_end_matches('/').get(root.len()..).unwrap_or("").trim_matches('/').to_string();
+            best = Some((id, sub, root.len()));
+        }
+    }
+    Ok(best.map(|(id, sub, _)| (id, sub)))
 }
 
 /// Lookup table from absolute path (as produced by czkawka) to file id, for online files.
