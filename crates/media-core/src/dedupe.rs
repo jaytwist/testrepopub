@@ -688,6 +688,20 @@ pub fn apply(db: &Db, kind: &str, group_ids: Option<Vec<i64>>, stop: &StopFlag, 
          WHERE m.group_id = ? AND f.quarantined = 0 AND f.missing = 0"
     );
     let total = ids.len() as u64;
+    // Protection is checked once for everything that would go (not group by group).
+    let protected: std::collections::HashSet<i64> = {
+        let mut st = conn.prepare(
+            "SELECT m.file_id FROM dup_members m JOIN files f ON f.id = m.file_id
+             WHERE m.group_id = ? AND m.keep = 0 AND f.missing = 0 AND f.quarantined = 0",
+        )?;
+        let mut drop = Vec::new();
+        for gid in &ids {
+            for r in st.query_map([gid], |r| r.get::<_, i64>(0))? {
+                drop.push(r?);
+            }
+        }
+        crate::protect::check(&conn, &drop)?.into_iter().map(|b| b.id).collect()
+    };
     for (i, gid) in ids.iter().enumerate() {
         if stop.is_stopped() {
             break;
@@ -706,8 +720,6 @@ pub fn apply(db: &Db, kind: &str, group_ids: Option<Vec<i64>>, stop: &StopFlag, 
             rep.errors.push(format!("그룹 {gid}: 보존할 파일이 없거나 연결되지 않아 건너뜀"));
             continue;
         }
-        let drop: Vec<i64> = members.iter().filter(|(_, k)| !*k).map(|(f, _)| f.id).collect();
-        let protected: std::collections::HashSet<i64> = crate::protect::check(&conn, &drop)?.into_iter().map(|b| b.id).collect();
         for (f, keep) in &members {
             if *keep {
                 continue;

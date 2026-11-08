@@ -226,6 +226,10 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE dup_members ADD COLUMN rank INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE dup_members ADD COLUMN variant TEXT;
     "#,
+    // 7: content identity (64 KiB fingerprint, else full hash) is looked up by this expression.
+    r#"
+    CREATE INDEX IF NOT EXISTS files_content ON files(COALESCE(prehash, hash));
+    "#,
 ];
 
 pub fn schema_version(conn: &Connection) -> Result<i64> {

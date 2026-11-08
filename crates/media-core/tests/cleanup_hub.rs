@@ -194,3 +194,18 @@ fn quick_review_groups_and_decisions() {
     media_core::triage::commit(&mut conn, &[media_core::triage::Decision { key: g.key.clone(), keep: all }]).unwrap();
     assert!(media_core::triage::groups(&conn, "exact", None, 0, 10).unwrap().is_empty());
 }
+
+#[test]
+fn content_lookups_use_the_index() {
+    let l = lib();
+    let conn = l.db.conn().unwrap();
+    // The same query `protect` runs for every content key: an index search, not a table scan.
+    let plan: Vec<String> = conn
+        .prepare("EXPLAIN QUERY PLAN SELECT COUNT(*) FROM files WHERE COALESCE(prehash, hash) = ?1 AND missing = 0 AND quarantined = 0")
+        .unwrap()
+        .query_map(["x"], |r| r.get::<_, String>(3))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(plan.iter().any(|p| p.contains("files_content")), "{plan:?}");
+}

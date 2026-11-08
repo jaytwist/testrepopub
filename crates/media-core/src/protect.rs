@@ -35,16 +35,18 @@ pub fn check(conn: &Connection, ids: &[i64]) -> Result<Vec<Blocked>> {
     let wanted: HashSet<i64> = ids.iter().copied().collect();
     let mut out: Vec<Blocked> = Vec::new();
     let mut by_content: HashMap<String, Vec<i64>> = HashMap::new();
-    let mut label_st = conn.prepare_cached("SELECT 1 FROM labels WHERE file_id = ? AND label = ?")?;
+    let mut label_st = conn.prepare_cached("SELECT label FROM labels WHERE file_id = ? AND label IN (?, ?)")?;
+    let mut key_st = conn.prepare_cached("SELECT COALESCE(prehash, hash) FROM files WHERE id = ?")?;
     for &id in &wanted {
         let Some(f) = db::get_file(conn, id)? else { continue };
         if f.quarantined || f.missing {
             continue;
         }
-        let mut has = |label: &str| -> rusqlite::Result<bool> { Ok(label_st.query_row(params![id, label], |_| Ok(())).optional()?.is_some()) };
-        let reason = if has(ORIGINAL_LABEL)? {
+        let labels: Vec<String> =
+            label_st.query_map(params![id, ORIGINAL_LABEL, FAVORITE_LABEL], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let reason = if labels.iter().any(|l| l == ORIGINAL_LABEL) {
             Some("original")
-        } else if has(FAVORITE_LABEL)? {
+        } else if !labels.is_empty() {
             Some("favorite")
         } else if rules.is_kept(&f) {
             Some("keep_folder")
@@ -55,12 +57,13 @@ pub fn check(conn: &Connection, ids: &[i64]) -> Result<Vec<Blocked>> {
             out.push(Blocked { id, reason: r.into() });
             continue;
         }
-        let key: Option<String> = conn.query_row("SELECT COALESCE(prehash, hash) FROM files WHERE id = ?", [id], |r| r.get(0))?;
+        let key: Option<String> = key_st.query_row([id], |r| r.get(0))?;
         if let Some(key) = key {
             by_content.entry(key).or_default().push(id);
         }
     }
     // Deleting every live copy of some content: keep one (the marked original if it is there).
+    // `files_content` indexes exactly this expression.
     let mut count = conn.prepare_cached(
         "SELECT COUNT(*) FROM files WHERE COALESCE(prehash, hash) = ?1 AND missing = 0 AND quarantined = 0",
     )?;
