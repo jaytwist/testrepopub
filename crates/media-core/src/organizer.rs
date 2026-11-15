@@ -590,7 +590,7 @@ pub fn plan(db: &Db, opts: &OrganizeOptions, stop: &StopFlag, progress: Progress
         if let Some(p) = place {
             match p.tag {
                 "received" => summary.received += 1,
-                "raw" | "live" | "edited" => summary.paired += 1,
+                "raw" | "live" | "edited" | "version" => summary.paired += 1,
                 _ => {}
             }
             if p.rel_dir.starts_with("큰 동영상/") {
@@ -663,7 +663,7 @@ pub fn plan_tree(plan: &Plan) -> Vec<TreeNode> {
             sources: Vec::new(),
         });
         // The folder's own kind: a RAW / Live Photo / edited version only travels with its photo.
-        let follower = |t: &str| matches!(t, "raw" | "live" | "edited" | "");
+        let follower = |t: &str| matches!(t, "raw" | "live" | "edited" | "version" | "");
         if follower(&n.tag) && !follower(&it.tag) {
             n.tag = it.tag.clone();
         }
@@ -860,6 +860,16 @@ pub fn subset_year(plan: &Plan, key: &str) -> Plan {
     part_of(plan, items)
 }
 
+/// Every file of one year (landing in its folders, or a copy of one of those).
+pub fn year_files(plan: &Plan, key: &str) -> HashSet<i64> {
+    item_years(plan).iter().filter(|(_, y)| y.as_str() == key).map(|(id, _)| *id).collect()
+}
+
+/// The library drive of a plan (the drive files are moved within).
+pub fn lib_vol(plan: &Plan) -> Option<i64> {
+    plan.items.iter().find(|i| !i.cross_volume && matches!(i.action, Action::Move | Action::InPlace | Action::Remove)).map(|i| i.vol)
+}
+
 /// Copies to remove in one year, by the folder they are in now.
 #[derive(Clone, Debug, Serialize)]
 pub struct CopyFolder {
@@ -867,6 +877,8 @@ pub struct CopyFolder {
     pub count: u64,
     pub bytes: i64,
     pub versions: u64,
+    /// 복사본: same name as the original kept (the rest are 사본: same content, another name).
+    pub same_name: u64,
     /// Library folders their originals go to (most first, at most 3).
     pub kept_in: Vec<(String, u64)>,
 }
@@ -885,6 +897,12 @@ pub struct CopyPair {
     pub kept_dst: String,
 }
 
+/// 복사본 (same file name, ignoring case) or 사본 (another name).
+pub fn same_name(a: &str, b: &str) -> bool {
+    let name = |p: &str| Path::new(p).file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    name(a) == name(b)
+}
+
 fn parent_of(p: &str) -> String {
     Path::new(p).parent().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default()
 }
@@ -892,13 +910,17 @@ fn parent_of(p: &str) -> String {
 pub fn year_copies(plan: &Plan, key: &str) -> Vec<CopyFolder> {
     let part = subset_year(plan, key);
     let groups: HashMap<i64, &str> = plan.items.iter().map(|i| (i.file_id, i.group.as_str())).collect();
+    let srcs: HashMap<i64, &str> = plan.items.iter().map(|i| (i.file_id, i.src.as_str())).collect();
     let mut by_dir: HashMap<String, (CopyFolder, HashMap<String, u64>)> = HashMap::new();
     for it in part.items.iter().filter(|i| i.action == Action::Remove) {
         let dir = parent_of(&it.src);
         let e = by_dir
             .entry(dir.clone())
-            .or_insert_with(|| (CopyFolder { dir, count: 0, bytes: 0, versions: 0, kept_in: Vec::new() }, HashMap::new()));
+            .or_insert_with(|| (CopyFolder { dir, count: 0, bytes: 0, versions: 0, same_name: 0, kept_in: Vec::new() }, HashMap::new()));
         e.0.count += 1;
+        if it.kept.and_then(|k| srcs.get(&k)).is_some_and(|k| same_name(k, &it.src)) {
+            e.0.same_name += 1;
+        }
         e.0.bytes += it.size;
         if it.tag == "version" {
             e.0.versions += 1;
@@ -962,7 +984,7 @@ pub fn group_items(plan: &Plan, groups: &[String], offset: usize, limit: usize) 
     v.into_iter()
         .skip(offset)
         .take(limit)
-        .map(|i| KeepItem { file_id: i.file_id, group: i.group.clone(), action: i.action, copies: copies.get(&i.file_id).copied().unwrap_or(0) })
+        .map(|i| KeepItem { file_id: i.file_id, group: i.group.clone(), action: i.action, copies: copies.get(&i.file_id).copied().unwrap_or(0), size: i.size })
         .collect()
 }
 
@@ -1023,22 +1045,40 @@ pub struct FolderDeleteReport {
 /// / original / in a keep folder stay ("the last copy" does not count here: deleting the photos
 /// is the point). Their contents are remembered so copies on other drives are not copied back in.
 pub fn delete_folders(db: &Db, plan: &Plan, groups: &[String], keep_protected: bool, stop: &StopFlag, progress: ProgressFn) -> Result<FolderDeleteReport> {
+    let t = delete_targets(plan, groups);
+    let label = format!("폴더 {}개 영구 삭제", groups.len());
+    let mut rep = delete_for_good(db, &t.ids, &t.copy_in_ids, keep_protected, &label, stop, progress)?;
+    rep.not_copied = t.not_copied;
+    Ok(rep)
+}
+
+/// Delete files for good (no quarantine) and remember their contents, so copies of them on other
+/// drives are not brought into the library again; `copy_in_ids` are photos on other drives that
+/// are only to be kept out (not deleted). With `keep_protected`, ♥ / original / keep-folder files
+/// stay (the "last copy" protection does not apply: deleting the photo is the point).
+pub fn delete_for_good(
+    db: &Db,
+    ids: &[i64],
+    copy_in_ids: &[i64],
+    keep_protected: bool,
+    label: &str,
+    stop: &StopFlag,
+    progress: ProgressFn,
+) -> Result<FolderDeleteReport> {
     let conn = db.conn()?;
-    let mut t = delete_targets(plan, groups);
-    let mut rep = FolderDeleteReport { not_copied: t.not_copied, ..Default::default() };
+    let mut ids: Vec<i64> = ids.to_vec();
+    let mut rep = FolderDeleteReport::default();
     let protected: HashSet<i64> = if keep_protected {
-        crate::protect::check(&conn, &t.ids)?.into_iter().filter(|b| b.reason != "last_copy").map(|b| b.id).collect()
+        crate::protect::check(&conn, &ids)?.into_iter().filter(|b| b.reason != "last_copy").map(|b| b.id).collect()
     } else {
         HashSet::new()
     };
     rep.kept_protected = protected.len() as u64;
-    t.ids.retain(|id| !protected.contains(id));
+    ids.retain(|id| !protected.contains(id));
     // Every photo involved needs a fingerprint to be remembered (a photo with no same-size twin
     // was never fingerprinted): read the missing ones now — a few, chosen by the user.
-    for id in t.ids.iter().chain(t.copy_in_ids.iter()) {
-        let has: bool = conn
-            .query_row("SELECT COALESCE(prehash, hash) IS NOT NULL FROM files WHERE id = ?", [*id], |r| r.get(0))
-            .unwrap_or(true);
+    for id in ids.iter().chain(copy_in_ids.iter()) {
+        let has: bool = conn.query_row("SELECT COALESCE(prehash, hash) IS NOT NULL FROM files WHERE id = ?", [*id], |r| r.get(0)).unwrap_or(true);
         if !has {
             if let Some(f) = db::get_file(&conn, *id)? {
                 if let Ok(h) = journal::prehash_file(&f.abs_path(), f.size as u64) {
@@ -1052,10 +1092,9 @@ pub fn delete_folders(db: &Db, plan: &Plan, groups: &[String], keep_protected: b
     };
     let kept_keys: HashSet<String> = protected.iter().filter_map(|id| key_of(*id)).collect();
     // Fingerprints read before deleting (the rows go with the files).
-    let mut keys: Vec<String> = t.ids.iter().chain(t.copy_in_ids.iter()).filter_map(|id| key_of(*id)).filter(|k| !kept_keys.contains(k)).collect();
-    if !t.ids.is_empty() {
-        let label = format!("폴더 {}개 영구 삭제", groups.len());
-        let d = journal::delete_files(db, &t.ids, true, Some(&label), stop, progress)?;
+    let mut keys: Vec<String> = ids.iter().chain(copy_in_ids.iter()).filter_map(|id| key_of(*id)).filter(|k| !kept_keys.contains(k)).collect();
+    if !ids.is_empty() {
+        let d = journal::delete_files(db, &ids, true, Some(label), stop, progress)?;
         rep.batch_id = d.batch_id.clone();
         rep.failed = d.failed;
         rep.errors = d.errors;
@@ -1068,8 +1107,7 @@ pub fn delete_folders(db: &Db, plan: &Plan, groups: &[String], keep_protected: b
         }
     }
     // Only what is really gone is excluded (a file that could not be deleted keeps its content in).
-    let still_there: HashSet<String> = t
-        .ids
+    let still_there: HashSet<String> = ids
         .iter()
         .filter(|id| conn.query_row("SELECT 1 FROM files WHERE id = ? AND quarantined = 0", [**id], |_| Ok(())).is_ok())
         .filter_map(|id| key_of(*id))
@@ -1092,6 +1130,7 @@ pub struct KeepItem {
     pub group: String,
     pub action: Action,
     pub copies: u32,
+    pub size: i64,
 }
 
 pub fn year_keep(plan: &Plan, key: &str, offset: usize, limit: usize) -> Vec<KeepItem> {
@@ -1110,7 +1149,7 @@ pub fn year_keep(plan: &Plan, key: &str, offset: usize, limit: usize) -> Vec<Kee
     v.into_iter()
         .skip(offset)
         .take(limit)
-        .map(|i| KeepItem { file_id: i.file_id, group: i.group.clone(), action: i.action, copies: copies.get(&i.file_id).copied().unwrap_or(0) })
+        .map(|i| KeepItem { file_id: i.file_id, group: i.group.clone(), action: i.action, copies: copies.get(&i.file_id).copied().unwrap_or(0), size: i.size })
         .collect()
 }
 
@@ -1144,6 +1183,13 @@ pub struct ExecReport {
     /// Copies from other drives not made for lack of room (planning again lists them).
     pub space_skipped: u64,
     pub space_skipped_bytes: i64,
+    /// Photos on the delete list: deleted for good, kept (protected or failed), history entry.
+    pub dropped: u64,
+    pub dropped_bytes: i64,
+    pub drop_kept: u64,
+    pub drop_batch: String,
+    /// Photos on the delete list that are on other drives: left there, not brought in.
+    pub not_brought: u64,
     /// Other files (documents…) left in the folders photos moved out of.
     pub leftover_files: u64,
     pub errors: Vec<String>,
@@ -1169,6 +1215,11 @@ pub struct ExecOptions {
     pub purge: bool,
     /// Names the history entries ("2015년").
     pub label: Option<String>,
+    /// Photos the user put on the delete list (similar photos not kept, picked by hand): deleted
+    /// for good before moving (♥ / original / keep folder stay), not brought back from other drives.
+    pub drop_ids: Vec<i64>,
+    /// Review decisions to remember (kept photos are not suggested again).
+    pub decisions: Vec<crate::triage::Decision>,
 }
 
 pub fn execute(db: &Db, plan: &Plan, stop: &StopFlag, progress: ProgressFn) -> Result<ExecReport> {
@@ -1196,7 +1247,7 @@ pub fn execute_with(db: &Db, plan: &Plan, xo: &ExecOptions, stop: &StopFlag, pro
     let prefix = xo.label.as_deref().map(|l| format!("{l} ")).unwrap_or_default();
     let what = if library {
         let n = |a: Action| work.iter().filter(|i| i.action == a).count();
-        let parts: Vec<String> = [("이동", n(Action::Move)), ("복사", n(Action::Copy))]
+        let parts: Vec<String> = [("이동", n(Action::Move)), ("가져오기", n(Action::Copy))]
             .iter()
             .filter(|(_, c)| *c > 0)
             .map(|(w, c)| format!("{w} {c}"))
@@ -1268,7 +1319,7 @@ pub fn execute_with(db: &Db, plan: &Plan, xo: &ExecOptions, stop: &StopFlag, pro
             }
         }
         rep.versions = ver_n;
-        for (b, n, bytes, name) in [(&copies_batch, copy_n, copy_bytes, "사본 정리"), (&versions_batch, ver_n, ver_bytes, "축소본 격리 (확인 후 비우기)")] {
+        for (b, n, bytes, name) in [(&copies_batch, copy_n, copy_bytes, "복사본·사본 정리"), (&versions_batch, ver_n, ver_bytes, "축소본 격리 (확인 후 비우기)")] {
             journal::finish_batch(&conn, b)?;
             if n == 0 {
                 conn.execute("DELETE FROM batches WHERE id = ?", [b])?;
@@ -1300,6 +1351,34 @@ pub fn execute_with(db: &Db, plan: &Plan, xo: &ExecOptions, stop: &StopFlag, pro
                 }
             }
         }
+    }
+
+    // 2. Photos the user put on the delete list.
+    if !xo.drop_ids.is_empty() && !rep.cancelled {
+        // Photos on other drives are never deleted: they are just not brought in (and remembered).
+        let elsewhere: HashSet<i64> = plan.items.iter().filter(|i| i.cross_volume).map(|i| i.file_id).collect();
+        let (keep_out, del): (Vec<i64>, Vec<i64>) = xo.drop_ids.iter().copied().partition(|id| elsewhere.contains(id));
+        rep.not_brought = keep_out.len() as u64;
+        let d = delete_for_good(db, &del, &keep_out, true, &format!("{prefix}골라서 지운 사진 {}장", del.len()), stop, progress)?;
+        let keep_out: HashSet<i64> = keep_out.into_iter().collect();
+        work.retain(|i| !keep_out.contains(&i.file_id));
+        rep.dropped = d.deleted;
+        rep.dropped_bytes = d.bytes;
+        rep.drop_kept = d.kept_protected + d.failed;
+        rep.drop_batch = d.batch_id;
+        for e in d.errors {
+            if rep.errors.len() < 200 {
+                rep.errors.push(e);
+            }
+        }
+        // Gone now: nothing to move for them.
+        let gone: HashSet<i64> =
+            del.iter().copied().filter(|id| conn.query_row("SELECT 1 FROM files WHERE id = ? AND quarantined = 0", [*id], |_| Ok(())).is_err()).collect();
+        work.retain(|i| !gone.contains(&i.file_id));
+    }
+    if !xo.decisions.is_empty() {
+        let mut c = db.conn()?;
+        crate::triage::commit(&mut c, &xo.decisions)?;
     }
 
     let batch = journal::new_batch(&conn, "organize", &what)?;

@@ -78,7 +78,7 @@ fn year_by_year_with_copies_deleted() {
     std::env::set_var("MO_SPACE_RESERVE", "0");
     std::env::set_var("MO_FREE_SPACE", "1000");
     let part = organizer::subset_year(&plan, "2015");
-    let xo = ExecOptions { purge: true, label: Some("2015년".into()) };
+    let xo = ExecOptions { purge: true, label: Some("2015년".into()), ..Default::default() };
     let rep = organizer::execute_with(&db, &part, &xo, &stop, &quiet).unwrap();
     std::env::remove_var("MO_FREE_SPACE");
     assert_eq!(rep.failed, 0, "{:?}", rep.errors);

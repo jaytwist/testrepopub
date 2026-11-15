@@ -52,8 +52,86 @@ pub fn groups(conn: &Connection, kind: &str, variant: Option<&str>, offset: i64,
     }
 }
 
+/// Groups ("burst" | "similar_image") with a member among `allowed` (e.g. the files of one year
+/// of the library plan), paged. Locked (always stay): edited versions, files on other drives than
+/// `lib_vol` (only the library drive is cleaned up here), and files outside `allowed` (another
+/// year's photos are decided in that year). Groups with nothing left to decide are left out.
+pub fn groups_in(conn: &Connection, kind: &str, allowed: &HashSet<i64>, lib_vol: i64, offset: usize, limit: usize) -> Result<Vec<TriageGroup>> {
+    let ids = group_ids_in(conn, kind, allowed)?;
+    let page: Vec<i64> = ids.into_iter().skip(offset).take(limit).collect();
+    let mut groups = match kind {
+        "burst" => load_bursts(conn, page)?,
+        "similar_image" => load_dups(conn, kind, page)?,
+        _ => bail!("unknown review kind {kind}"),
+    };
+    lock_outside(&mut groups, allowed, lib_vol);
+    Ok(groups)
+}
+
+fn lock_outside(groups: &mut Vec<TriageGroup>, allowed: &HashSet<i64>, lib_vol: i64) {
+    for g in groups.iter_mut() {
+        for m in &mut g.members {
+            let reason = if m.file.volume_id != lib_vol {
+                Some("backup")
+            } else if !allowed.contains(&m.file.id) {
+                Some("other_year")
+            } else if m.variant.as_deref() == Some("edited") {
+                Some("")
+            } else {
+                None
+            };
+            if let Some(r) = reason {
+                if !r.is_empty() {
+                    m.role = Some(r.into());
+                }
+                m.locked = true;
+                m.keep = true;
+            }
+        }
+    }
+    // Something to decide: two photos of this year that may go, at least one of them.
+    groups.retain(|g| g.members.iter().filter(|m| !m.locked).count() >= 2 || (g.members.iter().any(|m| !m.locked) && g.members.len() >= 2 && g.members.iter().any(|m| !m.locked && !m.keep)));
+}
+
+/// How many groups of `kind` there are to review for `allowed` (the same ones `groups_in` gives).
+pub fn count_in(conn: &Connection, kind: &str, allowed: &HashSet<i64>, lib_vol: i64) -> Result<usize> {
+    let ids = group_ids_in(conn, kind, allowed)?;
+    let mut groups = match kind {
+        "burst" => load_bursts(conn, ids)?,
+        _ => load_dups(conn, kind, ids)?,
+    };
+    lock_outside(&mut groups, allowed, lib_vol);
+    Ok(groups.len())
+}
+
+fn group_ids_in(conn: &Connection, kind: &str, allowed: &HashSet<i64>) -> Result<Vec<i64>> {
+    let all: Vec<i64> = match kind {
+        "burst" => burst_ids(conn, i64::MAX, 0)?,
+        "similar_image" => dup_ids(conn, kind, None, i64::MAX, 0)?,
+        _ => bail!("unknown review kind {kind}"),
+    };
+    let sql = match kind {
+        "burst" => "SELECT burst_id, file_id FROM bursts",
+        _ => "SELECT group_id, file_id FROM dup_members",
+    };
+    let mut touching: HashSet<i64> = HashSet::new();
+    let mut st = conn.prepare(sql)?;
+    for r in st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))? {
+        let (g, f) = r?;
+        if allowed.contains(&f) {
+            touching.insert(g);
+        }
+    }
+    Ok(all.into_iter().filter(|g| touching.contains(g)).collect())
+}
+
 fn bursts(conn: &Connection, offset: i64, limit: i64) -> Result<Vec<TriageGroup>> {
-    // Bursts with at least one extra shot not yet kept by the user.
+    let ids = burst_ids(conn, limit, offset)?;
+    load_bursts(conn, ids)
+}
+
+/// Bursts with at least one extra shot not yet kept by the user, newest first.
+fn burst_ids(conn: &Connection, limit: i64, offset: i64) -> Result<Vec<i64>> {
     let ids: Vec<i64> = {
         let mut st = conn.prepare(&format!(
             "SELECT b.burst_id FROM bursts b JOIN files f ON f.id = b.file_id
@@ -67,6 +145,10 @@ fn bursts(conn: &Connection, offset: i64, limit: i64) -> Result<Vec<TriageGroup>
         let rows = st.query_map(params![limit, offset], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
         rows
     };
+    Ok(ids)
+}
+
+fn load_bursts(conn: &Connection, ids: Vec<i64>) -> Result<Vec<TriageGroup>> {
     let mut st = conn.prepare(&format!(
         "SELECT {FILE_COLS}, a.sharpness,
                 EXISTS (SELECT 1 FROM suggestions s WHERE s.file_id = f.id AND s.kind = 'burst_extra')
@@ -89,6 +171,11 @@ fn bursts(conn: &Connection, offset: i64, limit: i64) -> Result<Vec<TriageGroup>
 }
 
 fn dups(conn: &Connection, kind: &str, variant: Option<&str>, offset: i64, limit: i64) -> Result<Vec<TriageGroup>> {
+    let ids = dup_ids(conn, kind, variant, limit, offset)?;
+    load_dups(conn, kind, ids)
+}
+
+fn dup_ids(conn: &Connection, kind: &str, variant: Option<&str>, limit: i64, offset: i64) -> Result<Vec<i64>> {
     let narrow = match variant {
         Some("safe") => "AND EXISTS (SELECT 1 FROM dup_members m2 WHERE m2.group_id = g.id AND m2.variant IN ('smaller', 'recompressed'))",
         Some("edited") => "AND EXISTS (SELECT 1 FROM dup_members m2 WHERE m2.group_id = g.id AND m2.variant = 'edited')",
@@ -104,6 +191,10 @@ fn dups(conn: &Connection, kind: &str, variant: Option<&str>, offset: i64, limit
         let rows = st.query_map(params![kind, limit, offset], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
         rows
     };
+    Ok(ids)
+}
+
+fn load_dups(conn: &Connection, kind: &str, ids: Vec<i64>) -> Result<Vec<TriageGroup>> {
     let mut st = conn.prepare(&format!(
         "SELECT {FILE_COLS}, a.sharpness, m.keep, m.variant
          FROM dup_members m JOIN files f ON f.id = m.file_id JOIN volumes v ON v.id = f.volume_id

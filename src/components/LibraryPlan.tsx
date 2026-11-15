@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { confirm, message, open } from "@tauri-apps/plugin-dialog";
 import {
   api, fmtBytes, fmtCount, thumbUrl,
@@ -6,6 +6,9 @@ import {
   type ImportSettings, type KeepItem, type LibraryOptions, type Merge, type PlanView, type TreeNode, type YearBucket,
 } from "../api";
 import Viewer from "./Viewer";
+import Compare from "./Compare";
+import Triage, { type ReviewResult } from "./Triage";
+import { PhotoTile, PickBar, usePick } from "./PhotoPick";
 import { useJob } from "../App";
 
 const GB = 1024 * 1024 * 1024;
@@ -28,6 +31,24 @@ function yearKey(group: string): string {
   if (s === "받은 사진" || s === "큰 동영상") s = segs[1] ?? "";
   if (/^\d{4}$/.test(s)) return Number(s) < 2010 ? "before2010" : s;
   return "undated";
+}
+
+type ReviewEntry = { keep: number[]; drops: { id: number; size: number }[] };
+
+/** A year's delete list beyond the automatic identical copies: similar photos not kept in a
+ *  review, and photos put on it by hand. Kept while the app is open (until that year is pushed). */
+interface DeleteList {
+  reviewOf: (year: string) => Map<string, ReviewEntry>;
+  saveReview: (year: string, r: ReviewResult) => void;
+  unDrop: (year: string, ids: number[]) => void;
+  /** copyIn: a photo only on another drive — not deleted there, just not brought in. */
+  marked: Map<number, { size: number; year: string; copyIn?: boolean }>;
+  mark: (items: { id: number; size: number; year: string; copyIn?: boolean }[]) => void;
+  unmark: (ids: number[]) => void;
+  /** id -> size of everything on a year's list (reviewed + by hand). */
+  dropsFor: (year: string) => Map<number, number>;
+  /** On any year's list. */
+  listed: Set<number>;
 }
 
 /**
@@ -61,6 +82,47 @@ export default function LibraryPlan() {
   const [excluded, setExcluded] = useState(0);
   const [previewing, setPreviewing] = useState(false);
   const [deleted, setDeleted] = useState<FolderDeleteReport | null>(null);
+  // year -> review group -> decision; photos put on the delete list by hand.
+  const [reviews, setReviews] = useState<Map<string, Map<string, ReviewEntry>>>(new Map());
+  const [marked, setMarked] = useState<Map<number, { size: number; year: string; copyIn?: boolean }>>(new Map());
+  const list: DeleteList = useMemo(() => {
+    const dropsFor = (y: string) => {
+      const m = new Map<number, number>();
+      for (const e of reviews.get(y)?.values() ?? []) for (const d of e.drops) m.set(d.id, d.size);
+      for (const [id, v] of marked) if (v.year === y) m.set(id, v.size);
+      return m;
+    };
+    const listed = new Set<number>(marked.keys());
+    for (const r of reviews.values()) for (const e of r.values()) for (const d of e.drops) listed.add(d.id);
+    return {
+      reviewOf: (y) => reviews.get(y) ?? new Map(),
+      saveReview: (y, r) =>
+        setReviews((prev) => {
+          const next = new Map(prev);
+          const cur = new Map(next.get(y) ?? []);
+          for (const d of r.decisions) cur.set(d.key, { keep: d.keep, drops: r.drops.filter((x) => x.key === d.key).map(({ id, size }) => ({ id, size })) });
+          next.set(y, cur);
+          return next;
+        }),
+      unDrop: (y, ids) =>
+        setReviews((prev) => {
+          const out = new Set(ids);
+          const next = new Map(prev);
+          const cur = new Map(next.get(y) ?? []);
+          for (const [k, e] of cur) {
+            const back = e.drops.filter((d) => out.has(d.id)).map((d) => d.id);
+            if (back.length) cur.set(k, { keep: [...e.keep, ...back], drops: e.drops.filter((d) => !out.has(d.id)) });
+          }
+          next.set(y, cur);
+          return next;
+        }),
+      marked,
+      mark: (items) => setMarked((prev) => { const n = new Map(prev); for (const i of items) n.set(i.id, { size: i.size, year: i.year, copyIn: i.copyIn }); return n; }),
+      unmark: (ids) => setMarked((prev) => { const n = new Map(prev); for (const id of ids) n.delete(id); return n; }),
+      dropsFor,
+      listed,
+    };
+  }, [reviews, marked]);
 
   useEffect(() => {
     api.getImportSettings().then(setSettings).catch((e) => setErr(String(e)));
@@ -127,6 +189,12 @@ export default function LibraryPlan() {
       setTree([]);
       if (lastDone.ok) {
         setResult({ label: lastRunYear ? (years.find((y) => y.key === lastRunYear)?.label ?? "") : "", rep: lastDone.result as ExecReport });
+        if (lastRunYear) {
+          // That year's list is done with.
+          const y = lastRunYear;
+          setReviews((prev) => { const n = new Map(prev); n.delete(y); return n; });
+          setMarked((prev) => new Map([...prev].filter(([, v]) => v.year !== y)));
+        }
         preview(undefined, true); // what is left
       } else setErr(lastDone.error ?? "실행하지 못했습니다");
     }
@@ -169,23 +237,27 @@ export default function LibraryPlan() {
   const pushYear = async (y: YearBucket) => {
     if (!plan) return;
     const purge = !quarantineOnly;
+    const drops = list.dropsFor(y.key);
+    const keptOut = [...list.marked].filter(([, v]) => v.year === y.key && v.copyIn).length;
     const text = [
       `${y.label} 정리를 시작합니다.`,
-      y.moves ? `· ${drive} 안에서 옮김 ${fmtCount(y.moves)}개` : "",
-      y.copies ? `· 다른 드라이브에서 복사 ${fmtCount(y.copies)}개 (${fmtBytes(y.copy_bytes)}) — 원래 자리는 그대로` : "",
       y.remove
         ? purge
-          ? `· ${drive}의 똑같은 사본 ${fmtCount(y.remove)}개 (${fmtBytes(y.remove_bytes)}) 삭제 — 원본과 내용을 끝까지 비교해 같은 것만`
-          : `· ${drive}의 똑같은 사본 ${fmtCount(y.remove)}개 격리함으로 (공간은 「격리함 비우기」 후에 생김)`
+          ? `· ${drive}의 복사본·사본 ${fmtCount(y.remove)}개 (${fmtBytes(y.remove_bytes)}) 삭제 — 원본과 내용을 끝까지 비교해 같은 것만`
+          : `· ${drive}의 복사본·사본 ${fmtCount(y.remove)}개 격리함으로 (공간은 「격리함 비우기」 후에 생김)`
         : "",
-      y.versions ? `· 축소본·재압축본 ${fmtCount(y.versions)}개는 격리함으로 (확인 후 비우기)` : "",
+      drops.size - keptOut ? `· 지울 목록의 사진 ${fmtCount(drops.size - keptOut)}장 영구 삭제 — 비슷한 사진·직접 고른 것 (♥·원본 지정은 남김)` : "",
+      keptOut ? `· 다른 드라이브에만 있는 ${fmtCount(keptOut)}장은 지우지 않고 가져오지만 않음 (다음에도)` : "",
+      y.moves ? `· ${drive} 안에서 옮김 ${fmtCount(y.moves)}개` : "",
+      y.copies ? `· 다른 드라이브에서 가져오기 ${fmtCount(y.copies)}개 (${fmtBytes(y.copy_bytes)}) — 원래 자리는 그대로` : "",
       "",
-      purge && y.remove ? "삭제한 사본은 되돌릴 수 없습니다. 옮긴 것은 「작업 기록」에서 되돌릴 수 있습니다." : "모든 작업은 「작업 기록」에서 되돌릴 수 있습니다.",
+      (purge && y.remove) || drops.size ? "삭제한 것은 되돌릴 수 없습니다. 옮긴 것은 「작업 기록」에서 되돌릴 수 있습니다." : "모든 작업은 「작업 기록」에서 되돌릴 수 있습니다.",
     ].filter((l, i, a) => l || (i > 0 && a[i - 1])).join("\n");
     if (!(await confirm(text, { title: `${y.label} Push`, kind: "warning", okLabel: "실행", cancelLabel: "취소" }))) return;
     try {
       setLastRunYear(y.key);
-      await api.startExecute(plan.id, undefined, y.key, purge);
+      const decisions = [...list.reviewOf(y.key)].map(([key, e]) => ({ key, keep: e.keep }));
+      await api.startExecute(plan.id, undefined, y.key, purge, [...drops.keys()], decisions);
       setRunning("organize:run");
     } catch (e) {
       setErr(String(e));
@@ -272,15 +344,15 @@ export default function LibraryPlan() {
           여러 해에 걸친 모음 폴더는 날짜별로 나눕니다. 낱장은 여행이면 여행 폴더, 아니면 연/월 바로 아래.
           RAW는 JPG 아래 <span className="mono">RAW</span> 폴더로, 받은 사진은 <span className="mono">받은 사진/</span>, 큰 동영상은 <span className="mono">큰 동영상/</span>으로.
         </div>
-        <label>사본</label>
+        <label>복사본·사본</label>
         <div className="col">
           <label className="check-row">
             <input type="checkbox" checked={lib.remove_copies} onChange={(e) => { setLib({ ...lib, remove_copies: e.target.checked }); setPlan(null); }} />
-            라이브러리 드라이브 안의 똑같은 사본은 하나만 남기고 정리 (다른 드라이브는 그대로)
+            라이브러리 드라이브 안의 똑같은 파일(이름이 같으면 복사본, 다르면 사본)은 하나만 남기고 정리 (다른 드라이브는 그대로)
           </label>
           <label className="check-row">
             <input type="checkbox" checked={lib.remove_smaller_versions} onChange={(e) => { setLib({ ...lib, remove_smaller_versions: e.target.checked }); setPlan(null); }} />
-            원본이 있는 축소본·재압축본도 정리 (편집본은 원본 옆에 남김)
+            다른 드라이브의 축소본·재압축본은 가져오지 않음 ({drive}의 것은 원본 옆에 두고 「비슷한 사진 검토」로)
           </label>
         </div>
         <label>큰 동영상</label>
@@ -352,14 +424,16 @@ export default function LibraryPlan() {
                 </div>
               </div>
               {shownYears.map((y) => (
-                <button key={y.key} className={`year-row ${y.key === year ? "on" : ""} ${y.done ? "done" : ""}`} onClick={() => setYear(y.key)}>
-                  <span className="year-name">{y.done ? "✓ " : ""}{y.label}</span>
+                <button key={y.key} className={`year-row ${y.key === year ? "on" : ""} ${y.done && list.dropsFor(y.key).size === 0 ? "done" : ""}`} onClick={() => setYear(y.key)}>
+                  <span className="year-name">{y.done && list.dropsFor(y.key).size === 0 ? "✓ " : ""}{y.label}</span>
                   <span className="muted small">
                     원본 {fmtCount(y.keep)} ({fmtBytes(y.keep_bytes)})
-                    {y.remove ? <> · <span className="bad-text">사본 {fmtCount(y.remove)} ({fmtBytes(y.remove_bytes)})</span></> : null}
+                    {y.remove + list.dropsFor(y.key).size ? (
+                      <> · <span className="bad-text">지울 것 {fmtCount(y.remove + list.dropsFor(y.key).size)}</span></>
+                    ) : null}
                     {y.moves ? ` · 옮김 ${fmtCount(y.moves)}` : ""}
-                    {y.copies ? ` · 복사 ${fmtCount(y.copies)}` : ""}
-                    {y.done ? " · 정리됨" : ""}
+                    {y.copies ? ` · 가져오기 ${fmtCount(y.copies)}` : ""}
+                    {y.done && list.dropsFor(y.key).size === 0 ? " · 정리됨" : ""}
                   </span>
                 </button>
               ))}
@@ -379,6 +453,7 @@ export default function LibraryPlan() {
                 runFolder={runFolder}
                 sel={sel}
                 toggleSel={toggleSel}
+                list={list}
                 quarantineOnly={quarantineOnly}
                 setQuarantineOnly={setQuarantineOnly}
                 push={() => pushYear(cur)}
@@ -386,7 +461,7 @@ export default function LibraryPlan() {
             )}
           </div>
 
-          {previewing && plan && <SelectionPreview planId={plan.id} groups={sel} onClose={() => setPreviewing(false)} />}
+          {previewing && plan && <SelectionPreview planId={plan.id} groups={sel} list={list} onClose={() => setPreviewing(false)} />}
 
           {(rules.length > 0 || merges.length > 0 || excluded > 0) && (
             <div className="muted small">
@@ -421,13 +496,16 @@ function RunResult({ label, rep, drive }: { label: string; rep: ExecReport; driv
   const bad = rep.failed > 0 || rep.purge_kept > 0;
   return (
     <div className={`alert ${bad ? "bad" : "ok"}`}>
-      <b>{label ? `${label} 끝남` : "끝남"}</b> — 옮김·복사 {fmtCount(rep.done)}개
-      {rep.purged ? ` · ${drive} 사본 ${fmtCount(rep.purged)}개 삭제 (${fmtBytes(rep.purged_bytes)} 확보)` : ""}
+      <b>{label ? `${label} 끝남` : "끝남"}</b> — 옮김·가져오기 {fmtCount(rep.done)}개
+      {rep.purged ? ` · ${drive} 복사본·사본 ${fmtCount(rep.purged)}개 삭제 (${fmtBytes(rep.purged_bytes)} 확보)` : ""}
+      {rep.dropped ? ` · 지울 목록의 사진 ${fmtCount(rep.dropped)}장 삭제 (${fmtBytes(rep.dropped_bytes)})` : ""}
+      {rep.drop_kept ? ` · 보호된 ${fmtCount(rep.drop_kept)}장은 남김(♥·원본 지정 등)` : ""}
+      {rep.not_brought ? ` · 다른 드라이브의 ${fmtCount(rep.not_brought)}장은 가져오지 않음` : ""}
       {rep.removed - rep.purged - rep.purge_kept - rep.versions > 0 ? ` · 사본 ${fmtCount(rep.removed - rep.purged - rep.purge_kept - rep.versions)}개 격리함으로` : ""}
       {rep.versions ? ` · 축소본 ${fmtCount(rep.versions)}개 격리함으로 (작업 기록에서 확인 후 비우기)` : ""}
       {rep.remove_skipped ? ` · 보호된 사본 ${fmtCount(rep.remove_skipped)}개 남김(♥·원본 지정 등)` : ""}
       {rep.purge_kept ? ` · 내용이 달라 ${fmtCount(rep.purge_kept)}개는 지우지 않고 격리함에 둠` : ""}
-      {rep.space_skipped ? ` · 공간이 모자라 ${fmtCount(rep.space_skipped)}개 (${fmtBytes(rep.space_skipped_bytes)})는 아직 복사 안 함 — 다른 해를 정리한 뒤 다시 실행하세요` : ""}
+      {rep.space_skipped ? ` · 공간이 모자라 ${fmtCount(rep.space_skipped)}개 (${fmtBytes(rep.space_skipped_bytes)})는 아직 가져오지 못함 — 다른 해를 정리한 뒤 다시 실행하세요` : ""}
       {rep.failed ? ` · 실패 ${fmtCount(rep.failed)}개` : ""}
       {rep.leftover_files ? ` · 사진·영상이 아닌 파일 ${fmtCount(rep.leftover_files)}개는 원래 폴더에 남음` : ""}
       {rep.cancelled ? " · 중간에 멈춤 (다시 실행하면 남은 것만)" : ""}
@@ -455,26 +533,29 @@ function SpaceBar({ space, drive, year, purge }: { space: DiskSpace | null; driv
         <div className="small">
           {year.label}: {gain > 0 && <span className="ok-text">사본 삭제 +{fmtBytes(gain)}</span>}
           {gain > 0 && cost > 0 && " · "}
-          {cost > 0 && <span>복사 −{fmtBytes(cost)}</span>} → 끝나면 약 <b>{fmtBytes(Math.max(0, after))}</b>
-          {short && <span className="bad-text"> · 공간이 모자라 일부만 복사됩니다 (나머지는 다음에)</span>}
+          {cost > 0 && <span>가져오기 −{fmtBytes(cost)}</span>} → 끝나면 약 <b>{fmtBytes(Math.max(0, after))}</b>
+          {short && <span className="bad-text"> · 공간이 모자라 일부만 가져옵니다 (나머지는 다음에)</span>}
         </div>
       )}
     </div>
   );
 }
 
-type Tab = "where" | "copies" | "keep";
+type Tab = "where" | "list" | "similar" | "keep";
 
 function YearDetail(props: {
   planId: string; y: YearBucket; nodes: TreeNode[]; drive: string; running: boolean;
   renaming: { node: TreeNode; name: string } | null; setRenaming: (r: { node: TreeNode; name: string } | null) => void;
   saveRule: (n: TreeNode, kind: FolderRule["kind"], name?: string | null) => void; runFolder: (group: string) => void;
-  sel: string[]; toggleSel: (group: string) => void;
+  sel: string[]; toggleSel: (group: string) => void; list: DeleteList;
   quarantineOnly: boolean; setQuarantineOnly: (v: boolean) => void; push: () => void;
 }) {
-  const { planId, y, nodes, drive, running, renaming, setRenaming, saveRule, runFolder, sel, toggleSel } = props;
+  const { planId, y, nodes, drive, running, renaming, setRenaming, saveRule, runFolder, sel, toggleSel, list } = props;
   const [tab, setTab] = useState<Tab>("where");
-  const work = y.moves + y.copies + y.remove + y.versions;
+  const drops = list.dropsFor(y.key);
+  const work = y.moves + y.copies + y.remove + y.versions + drops.size;
+  const done = y.done && drops.size === 0;
+  const toDelete = y.remove + drops.size;
   return (
     <div className="year-detail">
       <div className="year-detail-head">
@@ -486,7 +567,8 @@ function YearDetail(props: {
       </div>
       <div className="seg">
         <button className={tab === "where" ? "on" : ""} onClick={() => setTab("where")}>옮길 곳 ({fmtCount(nodes.length)}개 폴더)</button>
-        <button className={tab === "copies" ? "on" : ""} onClick={() => setTab("copies")}>지울 사본 ({fmtCount(y.remove + y.versions)})</button>
+        <button className={tab === "list" ? "on" : ""} onClick={() => setTab("list")}>지울 목록 ({fmtCount(toDelete)})</button>
+        <button className={tab === "similar" ? "on" : ""} onClick={() => setTab("similar")}>비슷한 사진 검토</button>
         <button className={tab === "keep" ? "on" : ""} onClick={() => setTab("keep")}>살릴 원본 ({fmtCount(y.keep)})</button>
       </div>
 
@@ -513,7 +595,7 @@ function YearDetail(props: {
                   {n.tag && <span className="pill">{TAGS[n.tag] ?? n.tag}</span>}
                   <span className="muted small">
                     {fmtCount(n.count)}개
-                    {n.moves ? ` · 옮김 ${fmtCount(n.moves)}` : ""}{n.copies ? ` · 복사 ${fmtCount(n.copies)}` : ""}{n.in_place ? ` · 제자리 ${fmtCount(n.in_place)}` : ""}
+                    {n.moves ? ` · 옮김 ${fmtCount(n.moves)}` : ""}{n.copies ? ` · 가져오기 ${fmtCount(n.copies)}` : ""}{n.in_place ? ` · 제자리 ${fmtCount(n.in_place)}` : ""}
                   </span>
                   <span className="spacer" />
                   {isEvent && (
@@ -537,21 +619,22 @@ function YearDetail(props: {
           })}
         </div>
       )}
-      {tab === "copies" && <CopiesTab planId={planId} year={y.key} drive={drive} />}
-      {tab === "keep" && <KeepTab planId={planId} year={y.key} total={y.keep} />}
+      {tab === "list" && <DeleteListTab planId={planId} year={y.key} drive={drive} copies={y.remove} list={list} />}
+      {tab === "similar" && <SimilarTab planId={planId} year={y.key} label={y.label} list={list} />}
+      {tab === "keep" && <KeepTab planId={planId} year={y.key} total={y.keep} list={list} />}
 
       <div className="year-push">
-        {y.done ? (
+        {done ? (
           <span className="ok-text">✓ {y.label}은(는) 정리가 끝났습니다.</span>
         ) : (
           <>
             <button className="btn primary" disabled={running || work === 0} onClick={props.push}>
-              {y.label} Push — 정리{y.remove ? "하고 사본 지우기" : "하기"}
+              {y.label} Push — 정리{toDelete ? `하고 지울 목록 ${fmtCount(toDelete)}개 지우기` : "하기"}
             </button>
             {y.remove > 0 && (
               <label className="check-row small">
                 <input type="checkbox" checked={props.quarantineOnly} onChange={(e) => props.setQuarantineOnly(e.target.checked)} />
-                사본은 지우지 말고 격리함에만 두기 (공간이 생기지 않음)
+                복사본·사본은 지우지 말고 격리함에만 두기 (공간이 생기지 않음)
               </label>
             )}
           </>
@@ -584,7 +667,8 @@ function CopiesTab({ planId, year, drive }: { planId: string; year: string; driv
   return (
     <div className="copy-folders">
       <div className="muted small">
-        {drive} 안에서 원본과 내용이 똑같은 사본입니다. 원래 있던 폴더별로 묶었습니다. 지우기 직전에 원본과 내용을 끝까지 비교하고, 하나라도 다르면 지우지 않습니다.
+        {drive} 안에서 원본과 내용이 똑같은 파일입니다 — 이름도 같으면 「복사본」, 이름이 다르면 「사본」. 원래 있던 폴더별로 묶었습니다.
+        지우기 직전에 원본과 내용을 끝까지 비교하고, 하나라도 다르면 지우지 않습니다.
       </div>
       {folders.map((f) => (
         <div key={f.dir} className="lib-sec">
@@ -592,7 +676,7 @@ function CopiesTab({ planId, year, drive }: { planId: string; year: string; driv
             <span>{openDir === f.dir ? "▾" : "▸"}</span>
             <span className="mono grow ellipsis" title={f.dir}><bdi>{f.dir}</bdi></span>
             <span className="muted small nowrap">
-              {fmtCount(f.count)}개 · {fmtBytes(f.bytes)}{f.versions ? ` (축소본 ${fmtCount(f.versions)})` : ""}
+              {fmtCount(f.count)}개 · {fmtBytes(f.bytes)} (복사본 {fmtCount(f.same_name)} · 사본 {fmtCount(f.count - f.same_name)})
             </span>
           </button>
           <div className="muted small copy-kept-in">
@@ -608,7 +692,7 @@ function CopiesTab({ planId, year, drive }: { planId: string; year: string; driv
                   </figure>
                   <figure>
                     <img src={thumbUrl(p.file_id)} loading="lazy" alt="" />
-                    <figcaption className="bad-text">{kept.has(p.file_id) ? "남김" : p.tag === "version" ? "축소본 (격리)" : "지울 사본"}</figcaption>
+                    <figcaption className="bad-text">{kept.has(p.file_id) ? "남김" : sameName(p.src, p.kept_src) ? "복사본" : "사본"}</figcaption>
                   </figure>
                   <div className="copy-paths small">
                     <div className="mono" title={p.src}><span className="muted">사본</span> {tail(p.src)} <span className="muted">({fmtBytes(p.size)})</span></div>
@@ -616,7 +700,7 @@ function CopiesTab({ planId, year, drive }: { planId: string; year: string; driv
                     {p.kept_dst !== p.kept_src && <div className="mono" title={p.kept_dst}><span className="muted">→ 갈 곳</span> {tail(p.kept_dst, 4)}</div>}
                   </div>
                   {!kept.has(p.file_id) && (
-                    <button className="btn small ghost" onClick={() => keep(p.file_id)} title="이 사본도 원본으로 지정해 지우지 않음">이건 남기기</button>
+                    <button className="btn small ghost" onClick={() => keep(p.file_id)} title="원본으로 지정해 지우지 않음(다음에도)">목록에서 빼기</button>
                   )}
                 </div>
               ))}
@@ -629,37 +713,173 @@ function CopiesTab({ planId, year, drive }: { planId: string; year: string; driv
   );
 }
 
-function KeepTab({ planId, year, total }: { planId: string; year: string; total: number }) {
+function KeepTab({ planId, year, total, list }: { planId: string; year: string; total: number; list: DeleteList }) {
   const [items, setItems] = useState<KeepItem[] | null>(null);
   useEffect(() => {
-    api.yearKeep(planId, year, 0, 240).then(setItems).catch(() => setItems([]));
+    api.yearKeep(planId, year, 0, 600).then(setItems).catch(() => setItems([]));
   }, [planId, year]);
-  const more = async () => setItems([...(items ?? []), ...(await api.yearKeep(planId, year, items?.length ?? 0, 240).catch(() => []))]);
-  const groups = useMemo(() => {
-    const m = new Map<string, KeepItem[]>();
-    for (const it of items ?? []) (m.get(it.group) ?? m.set(it.group, []).get(it.group)!).push(it);
-    return [...m.entries()];
-  }, [items]);
+  const more = async () => setItems([...(items ?? []), ...(await api.yearKeep(planId, year, items?.length ?? 0, 600).catch(() => []))]);
   if (!items) return <div className="muted small">불러오는 중…</div>;
   return (
     <div className="keep-tab">
+      <PhotoGrid
+        items={items.map((i) => ({ id: i.file_id, size: i.size, group: i.group, copies: i.copies, copyIn: i.action === "copy" }))}
+        list={list}
+        prefer="add"
+        onAdd={(ids) => list.mark(ids.map((id) => { const it = items.find((i) => i.file_id === id); return { id, size: it?.size ?? 0, year, copyIn: it?.action === "copy" }; }))}
+        onRemove={(ids) => { list.unmark(ids); list.unDrop(year, ids); }}
+      />
+      {items.length < total && <button className="btn small" onClick={more}>더 보기 ({fmtCount(total - items.length)}개 남음)</button>}
+    </div>
+  );
+}
+
+/** The year's delete list in one place: identical copies (automatic), similar photos not kept in
+ *  the review, and photos put on it by hand — each can be taken off again. */
+function DeleteListTab({ planId, year, drive, copies, list }: { planId: string; year: string; drive: string; copies: number; list: DeleteList }) {
+  const reviewed = [...list.reviewOf(year).values()].flatMap((e) => e.drops);
+  const byHand = [...list.marked].filter(([, v]) => v.year === year).map(([id, v]) => ({ id, size: v.size, copyIn: v.copyIn }));
+  return (
+    <div className="delete-list">
+      <h4>복사본·사본 — 자동 ({fmtCount(copies)})</h4>
+      <CopiesTab planId={planId} year={year} drive={drive} />
+      <h4>비슷한 사진에서 남기지 않은 것 ({fmtCount(reviewed.length)})</h4>
+      {reviewed.length === 0 ? (
+        <div className="muted small">「비슷한 사진 검토」에서 연사·축소본 묶음을 훑어보면 남기지 않은 사진이 여기에 들어옵니다.</div>
+      ) : (
+        <PhotoGrid items={reviewed} list={list} prefer="remove" onRemove={(ids) => list.unDrop(year, ids)} />
+      )}
+      <h4>직접 넣은 사진 ({fmtCount(byHand.length)})</h4>
+      {byHand.length === 0 ? (
+        <div className="muted small">「살릴 원본」이나 폴더 미리보기에서 사진을 골라 「지울 목록에 넣기」를 누르면 여기에 들어옵니다.</div>
+      ) : (
+        <PhotoGrid items={byHand} list={list} prefer="remove" onRemove={(ids) => list.unmark(ids)} />
+      )}
+      <div className="muted small">
+        다른 드라이브(C: 등)에만 있는 사진은 지우지 않고 「안 가져옴」 — 라이브러리로 가져오지만 않습니다. 검토 결과와 직접 넣은 사진은 이 해를 Push하거나 앱을 끌 때까지 기억합니다.
+      </div>
+    </div>
+  );
+}
+
+/** Bursts and similar photos of the year, reviewed group by group (keyboard); what is not kept
+ *  goes on the year's delete list. */
+function SimilarTab({ planId, year, label, list }: { planId: string; year: string; label: string; list: DeleteList }) {
+  const [counts, setCounts] = useState<{ bursts: number; similar: number; unanalyzed: number } | null>(null);
+  const [review, setReview] = useState<"burst" | "similar_image" | null>(null);
+  const load = useCallback(() => {
+    api.yearTriageCounts(planId, year).then(setCounts).catch(() => setCounts(null));
+  }, [planId, year]);
+  useEffect(load, [load]);
+  const decided = list.reviewOf(year);
+  const drops = [...decided.values()].reduce((a, e) => a + e.drops.length, 0);
+  const initial = new Map([...decided].map(([k, e]) => [k, new Set(e.keep)]));
+  const reviewedOf = (prefix: string) => [...decided.keys()].filter((k) => k.startsWith(prefix)).length;
+  return (
+    <div className="similar-tab">
+      <div className="muted small">
+        묶음마다 남길 한 장을 추천합니다(가장 선명하고 큰 것). 훑어본 묶음에서 남기지 않은 사진만 「지울 목록」에 들어가고, Push할 때 지워집니다.
+        편집본과 다른 드라이브의 사진은 지우지 않습니다.
+      </div>
+      {counts == null ? (
+        <div className="muted small">세는 중…</div>
+      ) : (
+        <div className="similar-rows">
+          <div className="similar-row">
+            <b>연사</b> <span className="muted">{fmtCount(counts.bursts)}묶음 · 훑어봄 {fmtCount(reviewedOf("burst:"))}</span>
+            <span className="spacer" />
+            <button className="btn small" disabled={counts.bursts === 0} onClick={() => setReview("burst")}>{reviewedOf("burst:") ? "이어서 검토" : "검토 시작"}</button>
+          </div>
+          <div className="similar-row">
+            <b>비슷한 사진</b> <span className="muted">(축소본·재압축본·편집본) {fmtCount(counts.similar)}묶음 · 훑어봄 {fmtCount(reviewedOf("dup:"))}</span>
+            <span className="spacer" />
+            <button className="btn small" disabled={counts.similar === 0} onClick={() => setReview("similar_image")}>{reviewedOf("dup:") ? "이어서 검토" : "검토 시작"}</button>
+          </div>
+          {drops > 0 && <div className="small">지울 목록에 들어간 사진 <b>{fmtCount(drops)}</b>장 — 「지울 목록」 탭에서 확인·빼기</div>}
+          {counts.unanalyzed > 0 && (
+            <div className="muted small">아직 분석하지 않은 사진 {fmtCount(counts.unanalyzed)}장은 묶음에 없습니다(분석이 끝나면 나타남).</div>
+          )}
+        </div>
+      )}
+      {review && (
+        <Triage
+          kind={review}
+          title={`${label} ${review === "burst" ? "연사" : "비슷한 사진"} 검토`}
+          source={{ planId, year }}
+          initial={initial}
+          onFinish={(r) => list.saveReview(year, r)}
+          onClose={() => { setReview(null); load(); }}
+        />
+      )}
+    </div>
+  );
+}
+
+/** Thumbnails with picking (Ctrl / Shift / drag), the viewer on a plain click, and compare. */
+function PhotoGrid({ items, list, prefer, onAdd, onRemove }: {
+  items: { id: number; size: number; group?: string; copies?: number; copyIn?: boolean }[];
+  list: DeleteList;
+  prefer: "add" | "remove";
+  onAdd?: (ids: number[]) => void;
+  onRemove?: (ids: number[]) => void;
+}) {
+  const order = useMemo(() => items.map((i) => i.id), [items]);
+  const sizes = useMemo(() => new Map(items.map((i) => [i.id, i.size])), [items]);
+  const [view, setView] = useState<{ items: GridItem[]; index: number } | null>(null);
+  const [cmp, setCmp] = useState<number[] | null>(null);
+  const openAt = useCallback(async (id: number) => {
+    const rows = await api.grid({ ids: order }, 0, order.length).catch(() => [] as GridItem[]);
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    const all = order.map((i) => byId.get(i)).filter((x): x is GridItem => x != null);
+    const index = all.findIndex((x) => x.id === id);
+    if (index >= 0) setView({ items: all, index });
+  }, [order]);
+  const pick = usePick(order, openAt);
+  const groups = useMemo(() => {
+    const m = new Map<string, typeof items>();
+    for (const it of items) (m.get(it.group ?? "") ?? m.set(it.group ?? "", []).get(it.group ?? "")!).push(it);
+    return [...m.entries()];
+  }, [items]);
+  const bytes = [...pick.picked].reduce((a, id) => a + (sizes.get(id) ?? 0), 0);
+  const ids = () => [...pick.picked];
+  return (
+    <>
+      <PickBar
+        count={pick.picked.size}
+        bytes={bytes}
+        prefer={prefer}
+        onAdd={onAdd && (() => { onAdd(ids()); pick.clear(); })}
+        onRemove={onRemove && (() => { onRemove(ids()); pick.clear(); })}
+        onCompare={() => setCmp(ids())}
+        onClear={pick.clear}
+      />
       {groups.map(([g, its]) => (
         <div key={g} className="keep-group">
-          <div className="mono small keep-group-head">{g}</div>
+          {g && (
+            <div className="small keep-group-head">
+              <span className="mono">{g}</span> <span className="muted">· {fmtCount(its.length)}장</span>{" "}
+              <button className="link" onClick={() => pick.pickAll(its.map((i) => i.id))}>모두 선택</button>
+            </div>
+          )}
           <div className="keep-grid">
             {its.map((it) => (
-              <div key={it.file_id} className="keep-tile" title={it.copies ? `사본 ${it.copies}개 정리` : ""}>
-                <img src={thumbUrl(it.file_id)} loading="lazy" alt="" />
-                {it.copies > 0 && <span className="keep-badge">사본 {it.copies}</span>}
-                {it.action === "copy" && <span className="keep-badge copyin">복사</span>}
-              </div>
+              <PhotoTile key={it.id} id={it.id} picked={pick.picked.has(it.id)} marked={list.listed.has(it.id)} markLabel={it.copyIn ? "안 가져옴" : "지움"} {...pick.tileProps(it.id)}>
+                {it.copies ? <span className="keep-badge">사본 {it.copies}</span> : null}
+                {it.copyIn ? <span className="keep-badge copyin">가져옴</span> : null}
+              </PhotoTile>
             ))}
           </div>
         </div>
       ))}
-      {items.length < total && <button className="btn small" onClick={more}>더 보기 ({fmtCount(total - items.length)}개 남음)</button>}
-    </div>
+      {view && <Viewer items={view.items} index={view.index} onIndex={(index) => setView((v) => (v ? { ...v, index } : v))} onClose={() => setView(null)} />}
+      {cmp && <Compare ids={cmp} onClose={() => setCmp(null)} />}
+    </>
   );
+}
+
+function sameName(a: string, b: string): boolean {
+  const name = (p: string) => p.split(/[\\/]/).pop()?.toLowerCase() ?? "";
+  return name(a) === name(b);
 }
 
 /** "계획 12초 — 사본·배치 4초 · …": where planning time goes (to tell what is slow on this PC). */
@@ -676,59 +896,36 @@ function PlanTiming({ timing }: { timing: [string, number][] }) {
   );
 }
 
-/** Photos of the picked folders, by folder; a click opens the photo big (← → through them). */
-function SelectionPreview({ planId, groups, onClose }: { planId: string; groups: string[]; onClose: () => void }) {
+/** Photos of the picked folders, by folder; a click opens the photo big, Ctrl/Shift/drag picks
+ *  photos to put on (or take off) their year's delete list. */
+function SelectionPreview({ planId, groups, list, onClose }: { planId: string; groups: string[]; list: DeleteList; onClose: () => void }) {
   const [items, setItems] = useState<KeepItem[] | null>(null);
-  const [view, setView] = useState<{ items: GridItem[]; index: number } | null>(null);
   useEffect(() => {
     api.groupItems(planId, groups, 0, 2000).then(setItems).catch(() => setItems([]));
   }, [planId, groups]);
-  const byGroup = useMemo(() => {
-    const m = new Map<string, KeepItem[]>();
-    for (const g of groups) m.set(g, []);
-    for (const it of items ?? []) (m.get(it.group) ?? m.set(it.group, []).get(it.group)!).push(it);
-    return [...m.entries()];
+  const ordered = useMemo(() => {
+    const rank = new Map(groups.map((g, i) => [g, i]));
+    return [...(items ?? [])].sort((a, b) => (rank.get(a.group) ?? 0) - (rank.get(b.group) ?? 0));
   }, [items, groups]);
-  const openAt = async (id: number) => {
-    const ids = (items ?? []).map((i) => i.file_id);
-    const rows = await api.grid({ ids }, 0, ids.length).catch(() => [] as GridItem[]);
-    const byId = new Map(rows.map((r) => [r.id, r]));
-    const list = ids.map((i) => byId.get(i)).filter((x): x is GridItem => x != null);
-    const index = list.findIndex((x) => x.id === id);
-    if (index >= 0) setView({ items: list, index });
-  };
   return (
-    <>
     <div className="send-back" onClick={onClose}>
       <div className="card sel-preview" onClick={(e) => e.stopPropagation()}>
         <div className="row-between">
-          <h3>선택한 폴더 미리보기</h3>
+          <h3>선택한 폴더 미리보기 {groups.length > 1 && <span className="muted small">— 기준: <span className="mono">{groups[0]}</span></span>}</h3>
           <button className="btn small ghost" onClick={onClose}>닫기</button>
         </div>
         {!items && <div className="muted small">불러오는 중…</div>}
-        {byGroup.map(([g, its], i) => (
-          <div key={g} className="keep-group">
-            <div className="small keep-group-head">
-              {i === 0 && groups.length > 1 && <span className="pill ok">기준</span>} <span className="mono">{g}</span>
-              <span className="muted"> · {fmtCount(its.length)}개</span>
-            </div>
-            <div className="keep-grid">
-              {its.map((it) => (
-                <button key={it.file_id} className="keep-tile" onClick={() => openAt(it.file_id)}>
-                  <img src={thumbUrl(it.file_id)} loading="lazy" alt="" />
-                  {it.copies > 0 && <span className="keep-badge">사본 {it.copies}</span>}
-                  {it.action === "copy" && <span className="keep-badge copyin">복사</span>}
-                </button>
-              ))}
-            </div>
-          </div>
-        ))}
+        {items && (
+          <PhotoGrid
+            items={ordered.map((i) => ({ id: i.file_id, size: i.size, group: i.group, copies: i.copies, copyIn: i.action === "copy" }))}
+            list={list}
+            prefer="add"
+            onAdd={(ids) => list.mark(ids.map((id) => { const it = ordered.find((i) => i.file_id === id); return { id, size: it?.size ?? 0, year: yearKey(it?.group ?? ""), copyIn: it?.action === "copy" }; }))}
+            onRemove={(ids) => { list.unmark(ids); for (const y of new Set(ordered.filter((i) => ids.includes(i.file_id)).map((i) => yearKey(i.group)))) list.unDrop(y, ids); }}
+          />
+        )}
         {items && items.length >= 2000 && <div className="muted small">처음 2,000개만 보여 줍니다.</div>}
       </div>
     </div>
-    {view && (
-      <Viewer items={view.items} index={view.index} onIndex={(index) => setView((v) => (v ? { ...v, index } : v))} onClose={() => setView(null)} />
-    )}
-    </>
   );
 }

@@ -54,6 +54,12 @@ pub(crate) fn post_analysis(st: &AppState) -> anyhow::Result<()> {
     if let Err(e) = media_core::cleanup::refresh(&mut conn) {
         errors.push(format!("정리 제안 계산 오류: {e:#}"));
     }
+    // Similar photos from the stored fingerprints (no files read; under a second for a big
+    // library), so each year's 「비슷한 사진」 review is ready without a manual search. Decisions
+    // already made are kept.
+    if let Err(e) = media_core::dedupe::find_similar_images(&st.db, media_core::dedupe::Similarity::High, &StopFlag::new(), &|_| {}) {
+        errors.push(format!("비슷한 사진 찾기 오류: {e:#}"));
+    }
     if let Err(e) = media_core::people::refresh(&mut conn) {
         errors.push(format!("인물 묶기 오류: {e:#}"));
     }
@@ -1052,11 +1058,18 @@ fn start_execute(
     groups: Option<Vec<String>>,
     year: Option<String>,
     purge: Option<bool>,
+    drop_ids: Option<Vec<i64>>,
+    decisions: Option<Vec<media_core::triage::Decision>>,
 ) -> CmdResult<()> {
     let plan = state.plans.lock().unwrap().get(&plan_id).cloned().ok_or("계획이 만료되었습니다. 다시 미리보기를 실행하세요")?;
     spawn_job(&app, &state, "organize:run", move |st, progress| {
         // Only some folders ("try one first") or one year: re-plan afterwards for the rest.
-        let xo = organizer::ExecOptions { purge: purge.unwrap_or(false), label: year.as_deref().map(organizer::year_label) };
+        let xo = organizer::ExecOptions {
+            purge: purge.unwrap_or(false),
+            label: year.as_deref().map(organizer::year_label),
+            drop_ids: drop_ids.unwrap_or_default(),
+            decisions: decisions.unwrap_or_default(),
+        };
         let part = match (&groups, &year) {
             (Some(g), _) => organizer::subset(&plan, g),
             (None, Some(y)) => organizer::subset_year(&plan, y),
@@ -1101,6 +1114,47 @@ struct DiskSpace {
     total: u64,
     /// Always left free on the library drive.
     reserve: u64,
+}
+
+/// One year's bursts / similar photos to review (other drives and edited versions locked).
+#[tauri::command]
+fn year_triage_groups(
+    state: State<AppState>,
+    plan_id: String,
+    year: String,
+    kind: String,
+    offset: usize,
+    limit: usize,
+) -> CmdResult<Vec<media_core::triage::TriageGroup>> {
+    let (files, lib) = with_plan(&state, &plan_id, |p| (organizer::year_files(p, &year), organizer::lib_vol(p)))?;
+    let conn = state.db.conn().map_err(err)?;
+    media_core::triage::groups_in(&conn, &kind, &files, lib.unwrap_or(-1), offset, limit).map_err(err)
+}
+
+#[derive(Serialize)]
+struct YearTriageCounts {
+    bursts: usize,
+    similar: usize,
+    /// Photos of the year not analysed yet (not in any group so far).
+    unanalyzed: usize,
+}
+
+#[tauri::command]
+fn year_triage_counts(state: State<AppState>, plan_id: String, year: String) -> CmdResult<YearTriageCounts> {
+    let (files, lib) = with_plan(&state, &plan_id, |p| (organizer::year_files(p, &year), organizer::lib_vol(p).unwrap_or(-1)))?;
+    let conn = state.db.conn().map_err(err)?;
+    let unanalyzed: std::collections::HashSet<i64> = {
+        let mut st = conn
+            .prepare("SELECT f.id FROM files f WHERE f.kind = 'photo' AND NOT EXISTS (SELECT 1 FROM analysis a WHERE a.file_id = f.id)")
+            .map_err(err)?;
+        let rows = st.query_map([], |r| r.get(0)).map_err(err)?.collect::<Result<_, _>>().map_err(err)?;
+        rows
+    };
+    Ok(YearTriageCounts {
+        bursts: media_core::triage::count_in(&conn, "burst", &files, lib).map_err(err)?,
+        similar: media_core::triage::count_in(&conn, "similar_image", &files, lib).map_err(err)?,
+        unanalyzed: files.iter().filter(|id| unanalyzed.contains(id)).count(),
+    })
 }
 
 /// Files planned into the chosen library folders (preview of a selection).
@@ -1451,6 +1505,8 @@ pub fn run() {
             disk_space,
             set_faces_enabled,
             group_items,
+            year_triage_groups,
+            year_triage_counts,
             get_library_merges,
             set_library_merges,
             library_excluded_count,

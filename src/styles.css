@@ -591,3 +591,18 @@ kbd { font: 11px/1 ui-monospace, Consolas, monospace; border: 1px solid var(--li
 .sel-preview h3 { margin: 0; }
 button.keep-tile { border: 0; padding: 0; cursor: pointer; }
 .plan-timing { margin: 2px 0 8px; }
+.keep-tile.picked { outline: 3px solid var(--accent); outline-offset: -3px; }
+.keep-tile.marked img { opacity: 0.45; }
+.pick-check { position: absolute; top: 4px; right: 4px; width: 20px; height: 20px; border-radius: 50%; background: var(--accent); color: #fff; font-size: 12px; display: grid; place-items: center; }
+.keep-badge.drop { left: 4px; top: 4px; bottom: auto; background: var(--bad); }
+.keep-tile { user-select: none; }
+.pick-bar { position: sticky; top: 8px; z-index: 4; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 8px 12px; margin: 4px 0 8px; border-radius: 10px; background: var(--panel); border: 1px solid var(--accent); box-shadow: var(--shadow); }
+.pick-bar .spacer { flex: 1; }
+.pick-bar.idle { border-style: dashed; border-color: var(--line); box-shadow: none; position: static; min-height: 38px; }
+.pick-bar { min-height: 38px; }
+.btn.danger-solid { background: var(--bad); border-color: var(--bad); color: #fff; }
+.delete-list { display: flex; flex-direction: column; gap: 8px; }
+.delete-list h4 { margin: 10px 0 2px; font-size: 14px; }
+.similar-tab, .similar-rows { display: flex; flex-direction: column; gap: 8px; }
+.similar-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; }
+.similar-row .spacer { flex: 1; }

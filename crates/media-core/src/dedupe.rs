@@ -518,6 +518,36 @@ pub fn apply_rules(conn: &mut Connection) -> Result<usize> {
 
 fn save_groups(conn: &mut Connection, kind: DupKind, groups: Vec<Vec<FileRow>>) -> Result<DedupeStats> {
     let tx = conn.transaction()?;
+    // What the user already decided survives a new search: a group inside one already resolved
+    // is not suggested again, and a group with the same files keeps its keep / drop choices.
+    let members_of = |resolved: i64| -> Result<Vec<(i64, Vec<(i64, bool)>)>> {
+        let mut st = tx.prepare(
+            "SELECT g.id, m.file_id, m.keep FROM dup_groups g JOIN dup_members m ON m.group_id = g.id
+             WHERE g.kind = ? AND g.resolved = ? ORDER BY g.id",
+        )?;
+        let mut out: Vec<(i64, Vec<(i64, bool)>)> = Vec::new();
+        for r in st.query_map(params![kind.as_str(), resolved], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)? != 0)))? {
+            let (g, f, k) = r?;
+            match out.last_mut() {
+                Some((id, v)) if *id == g => v.push((f, k)),
+                _ => out.push((g, vec![(f, k)])),
+            }
+        }
+        Ok(out)
+    };
+    let resolved_sets: Vec<std::collections::HashSet<i64>> = members_of(1)?.into_iter().map(|(_, v)| v.into_iter().map(|(f, _)| f).collect()).collect();
+    let earlier: HashMap<Vec<i64>, HashMap<i64, bool>> = members_of(0)?
+        .into_iter()
+        .map(|(_, v)| {
+            let mut key: Vec<i64> = v.iter().map(|(f, _)| *f).collect();
+            key.sort();
+            (key, v.into_iter().collect())
+        })
+        .collect();
+    let groups: Vec<Vec<FileRow>> = groups
+        .into_iter()
+        .filter(|g| !resolved_sets.iter().any(|s| g.iter().all(|f| s.contains(&f.id))))
+        .collect();
     tx.execute("DELETE FROM dup_groups WHERE kind = ? AND resolved = 0", [kind.as_str()])?;
     let mut stats = DedupeStats { kind: kind.as_str().into(), ..Default::default() };
     let now = crate::now_ts();
@@ -535,7 +565,11 @@ fn save_groups(conn: &mut Connection, kind: DupKind, groups: Vec<Vec<FileRow>>) 
             rank_members(&mut g, &labels, &rules);
             ins_g.execute(params![kind.as_str(), now])?;
             let gid = tx.last_insert_rowid();
+            let mut key: Vec<i64> = g.iter().map(|f| f.id).collect();
+            key.sort();
+            let before = earlier.get(&key);
             for (i, (f, (keep, variant))) in g.iter().zip(decide(kind.as_str(), &g)).enumerate() {
+                let keep = before.and_then(|b| b.get(&f.id).copied()).unwrap_or(keep);
                 ins_m.execute(params![gid, f.id, keep as i64, i as i64, variant])?;
                 if !keep {
                     stats.reclaimable_bytes += f.size;

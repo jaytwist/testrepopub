@@ -9,12 +9,24 @@ import { confirmDelete } from "../deleteFlow";
 const PAGE = 100;
 const folderOf = (p: string) => p.slice(0, Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\"))) || p;
 
+/** What a review decided: kept files per group, and the files not kept (to delete). */
+export interface ReviewResult {
+  decisions: { key: string; keep: number[] }[];
+  drops: { id: number; size: number; key: string }[];
+}
+
 interface Props {
   kind: TriageKind;
   /** Similar photos: only groups with resized/recompressed ("safe") or edited versions. */
   variant?: "safe" | "edited";
   title: string;
   onClose: () => void;
+  /** Year mode (「한 곳으로 정리」): only that year's groups; nothing is deleted here — the result
+   *  goes back to the year's delete list (deleted when the year is pushed). */
+  source?: { planId: string; year: string };
+  onFinish?: (r: ReviewResult) => void;
+  /** Year mode: decisions made earlier, to go on from. */
+  initial?: Map<string, Set<number>>;
 }
 
 /**
@@ -23,13 +35,14 @@ interface Props {
  * Decisions are remembered; the dropped files are removed together at the end (one confirmation,
  * protected files stay, undoable from 「작업 기록」).
  */
-export default function Triage({ kind, variant, title, onClose }: Props) {
+export default function Triage({ kind, variant, title, onClose, source, onFinish, initial }: Props) {
   const { running, setRunning } = useJob();
   const [groups, setGroups] = useState<TriageGroup[] | null>(null);
   const [more, setMore] = useState(true);
   const [idx, setIdx] = useState(0);
-  const [keep, setKeep] = useState<Map<string, Set<number>>>(new Map());
-  const [done, setDone] = useState<string[]>([]);
+  const [keep, setKeep] = useState<Map<string, Set<number>>>(() => new Map(initial ?? []));
+  const [done, setDone] = useState<string[]>(() => [...(initial?.keys() ?? [])]);
+  const resumed = useRef(false);
   const [srcs, setSrcs] = useState<Record<number, string>>({});
   const [err, setErr] = useState<string | null>(null);
   const loading = useRef(false);
@@ -38,7 +51,9 @@ export default function Triage({ kind, variant, title, onClose }: Props) {
     if (loading.current || !more) return;
     loading.current = true;
     try {
-      const page = await api.triageGroups(kind, variant ?? null, groups?.length ?? 0, PAGE);
+      const page = source
+        ? await api.yearTriageGroups(source.planId, source.year, kind, groups?.length ?? 0, PAGE)
+        : await api.triageGroups(kind, variant ?? null, groups?.length ?? 0, PAGE);
       setGroups((g) => [...(g ?? []), ...page]);
       if (page.length < PAGE) setMore(false);
     } catch (e) {
@@ -52,6 +67,14 @@ export default function Triage({ kind, variant, title, onClose }: Props) {
   useEffect(() => {
     if (groups == null || (more && idx > groups.length - 10)) loadMore();
   }, [idx, groups, more, loadMore]);
+
+  // Going on from earlier decisions: start at the first group not decided yet.
+  useEffect(() => {
+    if (resumed.current || !groups || !initial?.size) return;
+    resumed.current = true;
+    const first = groups.findIndex((gr) => !initial.has(gr.key));
+    if (first > 0) setIdx(first);
+  }, [groups]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const g = groups?.[idx];
   const keepOf = useCallback(
@@ -113,6 +136,19 @@ export default function Triage({ kind, variant, title, onClose }: Props) {
   const dropBytes = drops.reduce((a, f) => a + f.size, 0);
 
   const finish = async () => {
+    if (onFinish) {
+      const byKey = new Map((groups ?? []).map((gr) => [gr.key, gr]));
+      onFinish({
+        decisions: done.map((k) => ({ key: k, keep: [...(keep.get(k) ?? [])] })),
+        drops: done.flatMap((k) => {
+          const gr = byKey.get(k);
+          const s = keep.get(k) ?? new Set<number>();
+          return (gr?.members ?? []).filter((m) => !s.has(m.file.id) && !m.locked).map((m) => ({ id: m.file.id, size: m.file.size, key: k }));
+        }),
+      });
+      onClose();
+      return;
+    }
     try {
       if (done.length > 0) await api.triageCommit(done.map((k) => ({ key: k, keep: [...(keep.get(k) ?? [])] })));
       if (drops.length > 0 && !running && (await confirmDelete(drops.map((f) => f.id), title, dropBytes, title))) setRunning("delete");
@@ -168,7 +204,9 @@ export default function Triage({ kind, variant, title, onClose }: Props) {
         <span className="tri-drop">지울 것 <b>{fmtCount(drops.length)}</b>개 · {fmtBytes(dropBytes)}</span>
         <span className="spacer" />
         <button className="btn primary" onClick={finish}>
-          {drops.length > 0 ? `끝내고 ${fmtCount(drops.length)}개 정리` : "끝내기"} <kbd>Esc</kbd>
+          {source
+            ? drops.length > 0 ? `끝내기 — 지울 목록에 ${fmtCount(drops.length)}장` : "끝내기"
+            : drops.length > 0 ? `끝내고 ${fmtCount(drops.length)}개 정리` : "끝내기"} <kbd>Esc</kbd>
         </button>
       </header>
       {err && <div className="alert bad">{err}</div>}
@@ -189,7 +227,8 @@ export default function Triage({ kind, variant, title, onClose }: Props) {
             const isVideo = m.file.kind === "video";
             return (
               <div key={m.file.id} className={`tri-card ${kept ? "keep" : "drop"} ${m.locked ? "locked" : ""}`}
-                onClick={() => toggle(m)} title={m.locked ? "다른 드라이브의 백업: 지우지 않습니다" : "누르면 남기기/지우기"}>
+                onClick={() => toggle(m)}
+                title={m.locked ? (m.role === "backup" ? "다른 드라이브의 백업: 지우지 않습니다" : m.role === "other_year" ? "다른 해의 사진: 그 해를 정리할 때 검토합니다" : "편집본: 항상 남깁니다") : "누르면 남기기/지우기"}>
                 <div className="tri-img">
                   <img src={srcs[m.file.id] ?? thumbUrl(m.file.id)} alt="" draggable={false}
                     onError={(e) => ((e.target as HTMLImageElement).src = thumbUrl(m.file.id))} />
@@ -200,6 +239,7 @@ export default function Triage({ kind, variant, title, onClose }: Props) {
                 <div className="cmp-tags">
                   {i === 0 && <span className="badge-best">★ 추천</span>}
                   {m.role === "backup" && <span className="role-tag backup">백업 · 지우지 않음</span>}
+                  {m.role === "other_year" && <span className="role-tag backup">다른 해 · 그 해에서 검토</span>}
                   {m.variant && <span className="role-tag variant">{VARIANT_NAMES[m.variant]}</span>}
                   {kind === "burst" && m.sharpness != null && maxSharp > 0 && (
                     <span className="muted small">선명도 {Math.round((100 * m.sharpness) / maxSharp)}%</span>
@@ -226,7 +266,11 @@ export default function Triage({ kind, variant, title, onClose }: Props) {
         <span><kbd>S</kbd> 모두 남기기</span>
         <span><kbd>Z</kbd> 이전 묶음</span>
         <span className="spacer" />
-        <span className="muted small">지운 파일은 격리 폴더로 옮겨지며 「작업 기록」에서 되돌릴 수 있습니다</span>
+        <span className="muted small">
+          {source
+            ? "남기지 않은 사진은 이 해의 「지울 목록」에 들어가고, Push할 때 영구 삭제됩니다"
+            : "지운 파일은 격리 폴더로 옮겨지며 「작업 기록」에서 되돌릴 수 있습니다"}
+        </span>
       </footer>
     </div>
   );

@@ -35,7 +35,8 @@ pub struct LibraryOptions {
     pub event_span_days: i64,
     /// Remove identical copies on the library drive (one is kept).
     pub remove_copies: bool,
-    /// Remove resized / recompressed versions on the library drive when the original is kept.
+    /// Resized / recompressed versions on other drives are not brought in when the original is
+    /// kept (on the library drive they go beside their original, for review).
     pub remove_smaller_versions: bool,
 }
 
@@ -431,6 +432,17 @@ pub fn layout(conn: &Connection, lib_vol: i64, lib_root: &str, ids: &[i64], opts
                 }
             }
         }
+        // A version travels with its original only when taken around the same time (or with no
+        // trusted date): look-alike shots from other days are filed by their own date.
+        let near = |a: i64, b: i64| -> bool {
+            match (by_id.get(&a).map(|&i| &files[i]), by_id.get(&b).map(|&i| &files[i])) {
+                (Some(x), Some(y)) => match (x.taken, y.taken) {
+                    (Some(p), Some(q)) if x.trusted && y.trusted => (p - q).abs() <= 86_400,
+                    _ => true,
+                },
+                _ => true,
+            }
+        };
         for members in by_group.values() {
             let Some(&(lead, _)) = members.iter().find(|(_, v)| v.is_none()) else { continue };
             if !matches!(act.get(&lead).map(|a| a.0), Some(Act::Move | Act::Copy)) {
@@ -438,18 +450,19 @@ pub fn layout(conn: &Connection, lib_vol: i64, lib_root: &str, ids: &[i64], opts
             }
             for (id, v) in members {
                 match v.as_deref() {
-                    Some("smaller" | "recompressed") if opts.remove_smaller_versions => {
-                        match act.get(id).map(|a| a.0) {
-                            Some(Act::Move) => {
-                                act.insert(*id, (Act::Remove, Some(lead), "version"));
-                            }
-                            Some(Act::Copy) => {
-                                act.insert(*id, (Act::Leave, Some(lead), "version"));
-                            }
-                            _ => {}
+                    // Resized / recompressed versions: not deleted on their own (they only look
+                    // alike) — on the library drive they go beside their original and are offered
+                    // in the year's 「비슷한 사진」 review; on other drives they are not brought in.
+                    Some("smaller" | "recompressed") => match act.get(id).map(|a| a.0) {
+                        Some(Act::Copy) if opts.remove_smaller_versions => {
+                            act.insert(*id, (Act::Leave, Some(lead), "version"));
                         }
-                    }
-                    Some("edited") => {
+                        Some(Act::Move | Act::Copy) if near(*id, lead) => {
+                            follow.insert(*id, (lead, "", "version"));
+                        }
+                        _ => {}
+                    },
+                    Some("edited") if near(*id, lead) => {
                         follow.insert(*id, (lead, "", "edited"));
                     }
                     _ => {}

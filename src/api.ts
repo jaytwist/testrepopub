@@ -79,7 +79,7 @@ export type VariantKind = "smaller" | "recompressed" | "edited";
 
 /** Quick review: one group (burst, copies, versions) with the suggested keepers. */
 export interface TriageMember {
-  file: FileRow; keep: boolean; role: "backup" | null; variant: VariantKind | null; sharpness: number | null; locked: boolean;
+  file: FileRow; keep: boolean; role: "backup" | "other_year" | null; variant: VariantKind | null; sharpness: number | null; locked: boolean;
 }
 export interface TriageGroup { key: string; members: TriageMember[] }
 export type TriageKind = "burst" | "exact" | "similar_image" | "similar_video";
@@ -171,9 +171,9 @@ export interface YearBucket {
   key: string; label: string; keep: number; keep_bytes: number; moves: number; copies: number; copy_bytes: number;
   in_place: number; remove: number; remove_bytes: number; versions: number; versions_bytes: number; done: boolean;
 }
-export interface CopyFolder { dir: string; count: number; bytes: number; versions: number; kept_in: [string, number][] }
+export interface CopyFolder { dir: string; count: number; bytes: number; versions: number; same_name: number; kept_in: [string, number][] }
 export interface CopyPair { file_id: number; src: string; size: number; tag: string; kept_id: number; kept_src: string; kept_dst: string }
-export interface KeepItem { file_id: number; group: string; action: PlanItem["action"]; copies: number }
+export interface KeepItem { file_id: number; group: string; action: PlanItem["action"]; copies: number; size: number }
 export interface DiskSpace { free: number; total: number; reserve: number }
 /** Library folder `from` merged into `into`. */
 export interface Merge { from: string; into: string }
@@ -182,7 +182,8 @@ export interface FolderDeleteReport { batch_id: string; deleted: number; bytes: 
 export interface ExecReport {
   batch_id: string; done: number; failed: number; bytes: number; sidecars: number; removed: number; removed_bytes: number;
   remove_skipped: number; copies_batch: string; versions_batch: string; versions: number; purged: number; purged_bytes: number;
-  purge_kept: number; space_skipped: number; space_skipped_bytes: number; leftover_files: number; errors: string[]; cancelled: boolean;
+  purge_kept: number; space_skipped: number; space_skipped_bytes: number; leftover_files: number;
+  dropped: number; dropped_bytes: number; drop_kept: number; drop_batch: string; not_brought: number; errors: string[]; cancelled: boolean;
 }
 export interface FolderRule { volume_id: number; rel_dir: string; kind: "event" | "loose" | "skip"; name: string | null }
 export interface PlanView { id: string; summary: PlanSummary; options: OrganizeOptions }
@@ -298,14 +299,19 @@ export const api = {
   planItems: (planId: string, action: string | null, offset: number, limit: number) =>
     invoke<PlanItem[]>("plan_items", { planId, action, offset, limit }),
   /** Run a plan; `groups` runs only those destination folders (try one first). */
-  startExecute: (planId: string, groups?: string[], year?: string, purge?: boolean) =>
-    invoke<void>("start_execute", { planId, groups: groups ?? null, year: year ?? null, purge: purge ?? null }),
+  startExecute: (planId: string, groups?: string[], year?: string, purge?: boolean, dropIds?: number[], decisions?: { key: string; keep: number[] }[]) =>
+    invoke<void>("start_execute", {
+      planId, groups: groups ?? null, year: year ?? null, purge: purge ?? null, dropIds: dropIds ?? null, decisions: decisions ?? null,
+    }),
   libraryYears: (planId: string) => invoke<YearBucket[]>("library_years", { planId }),
   yearCopies: (planId: string, year: string) => invoke<CopyFolder[]>("year_copies", { planId, year }),
   yearCopyPairs: (planId: string, year: string, dir: string, offset: number, limit: number) =>
     invoke<CopyPair[]>("year_copy_pairs", { planId, year, dir, offset, limit }),
   yearKeep: (planId: string, year: string, offset: number, limit: number) => invoke<KeepItem[]>("year_keep", { planId, year, offset, limit }),
   diskSpace: (path: string) => invoke<DiskSpace | null>("disk_space", { path }),
+  yearTriageGroups: (planId: string, year: string, kind: string, offset: number, limit: number) =>
+    invoke<TriageGroup[]>("year_triage_groups", { planId, year, kind, offset, limit }),
+  yearTriageCounts: (planId: string, year: string) => invoke<{ bursts: number; similar: number; unanalyzed: number }>("year_triage_counts", { planId, year }),
   groupItems: (planId: string, groups: string[], offset: number, limit: number) => invoke<KeepItem[]>("group_items", { planId, groups, offset, limit }),
   getLibraryMerges: () => invoke<Merge[]>("get_library_merges"),
   setLibraryMerges: (merges: Merge[]) => invoke<void>("set_library_merges", { merges }),
