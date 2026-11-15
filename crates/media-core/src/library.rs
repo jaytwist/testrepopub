@@ -302,7 +302,16 @@ impl F {
 /// Where each of `ids` belongs in the library on volume `lib_vol`.
 /// `lib_root` is the library folder relative to its drive (`사진`): a copy already filed there is
 /// the one kept.
-pub fn layout(conn: &Connection, lib_vol: i64, lib_root: &str, ids: &[i64], opts: &LibraryOptions, rules: &[FolderRule]) -> Result<HashMap<i64, Placement>> {
+/// `all` is every indexed file (`db::all_files`), loaded once by the caller.
+pub fn layout(
+    conn: &Connection,
+    lib_vol: i64,
+    lib_root: &str,
+    ids: &[i64],
+    opts: &LibraryOptions,
+    rules: &[FolderRule],
+    all: &HashMap<i64, FileRow>,
+) -> Result<HashMap<i64, Placement>> {
     let lib_root = lib_root.replace('\\', "/").trim_matches('/').to_string();
     let wanted: HashSet<i64> = ids.iter().copied().collect();
     let files: Vec<F> = {
@@ -342,8 +351,7 @@ pub fn layout(conn: &Connection, lib_vol: i64, lib_root: &str, ids: &[i64], opts
             .collect()
     };
     let by_id: HashMap<i64, usize> = files.iter().enumerate().map(|(i, f)| (f.id, i)).collect();
-    // Rows for the copy ranking and trips, loaded once (not one query per file).
-    let all = db::all_files(conn)?;
+    // Trips, loaded once (not one query per file).
     let trips: HashMap<i64, (String, i64)> = {
         let mut st = conn.prepare("SELECT tf.file_id, t.title, t.start_ts FROM trip_files tf JOIN trips t ON t.id = tf.trip_id")?;
         let m = st.query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?.collect::<rusqlite::Result<HashMap<i64, (String, i64)>>>()?;

@@ -143,9 +143,22 @@ pub struct Plan {
     pub options: OrganizeOptions,
     pub items: Vec<PlanItem>,
     pub summary: PlanSummary,
-    /// Library: the year of each file (worked out once; the year views use it on every click).
+    /// Library: where things are in `items` (built once; the year views use it on every click).
     #[serde(skip)]
-    pub years: HashMap<i64, String>,
+    pub index: PlanIndex,
+}
+
+/// Lookups into a plan's items, so the year views do not walk (or copy) the whole plan each time.
+#[derive(Clone, Debug, Default)]
+pub struct PlanIndex {
+    built: bool,
+    /// Year -> positions in `items` of everything belonging to it (files the library keeps, and
+    /// the copies of those to remove), in plan order.
+    by_year: HashMap<String, Vec<u32>>,
+    /// File -> its position in `items`.
+    pos: HashMap<i64, u32>,
+    /// Kept file -> how many copies of it are removed.
+    copies: HashMap<i64, u32>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -371,13 +384,15 @@ pub fn plan(db: &Db, opts: &OrganizeOptions, stop: &StopFlag, progress: Progress
     let trips = crate::places::trip_titles(&conn)?;
     let persons = crate::people::folder_names(&conn)?;
     let library = opts.layout == "library";
+    // Every indexed file, read once for the whole plan.
+    let rows = db::all_files(&conn)?;
     lap("목록", &mut t);
     // Planning reads nothing from the drives: fingerprints missing for same-size files are read
     // in the background (`identity::backfill_prehashes`); until then those files stay put.
     let mut placements = if library {
         let lib_vol: i64 = conn.query_row("SELECT id FROM volumes WHERE uid = ?", [&tvol.uid], |r| r.get(0)).unwrap_or(-1);
         let lib_root = volumes::rel_of(&tvol.root, &target).unwrap_or_default();
-        crate::library::layout(&conn, lib_vol, &lib_root, &ids, &opts.library, &crate::library::load_rules(&conn)?)?
+        crate::library::layout(&conn, lib_vol, &lib_root, &ids, &opts.library, &crate::library::load_rules(&conn)?, &rows)?
     } else {
         HashMap::new()
     };
@@ -397,7 +412,7 @@ pub fn plan(db: &Db, opts: &OrganizeOptions, stop: &StopFlag, progress: Progress
     // work, so a year with only those left shows as done.
     let protected: HashSet<i64> = {
         let rm: Vec<i64> = placements.iter().filter(|(_, p)| p.act == crate::library::Act::Remove).map(|(id, _)| *id).collect();
-        if rm.is_empty() { HashSet::new() } else { crate::protect::check(&conn, &rm)?.into_iter().map(|b| b.id).collect() }
+        if rm.is_empty() { HashSet::new() } else { crate::protect::check_many(&conn, &rm, &rows)?.into_iter().map(|b| b.id).collect() }
     };
     lap("보호 확인", &mut t);
     let mut events: HashSet<String> = HashSet::new();
@@ -437,7 +452,6 @@ pub fn plan(db: &Db, opts: &OrganizeOptions, stop: &StopFlag, progress: Progress
     }
     let total = ids.len() as u64;
     let empty = Vec::new();
-    let rows = db::all_files(&conn)?;
     for (i, id) in ids.iter().enumerate() {
         if stop.is_stopped() {
             bail!("cancelled");
@@ -618,9 +632,9 @@ pub fn plan(db: &Db, opts: &OrganizeOptions, stop: &StopFlag, progress: Progress
     summary.timing = timing;
     summary.timing.push(("전체".into(), clock.elapsed().as_millis() as u64));
     progress(Progress::new("organize:plan", "done", total, total, ""));
-    let mut plan = Plan { id: uuid::Uuid::new_v4().simple().to_string(), options: opts.clone(), items, summary, years: HashMap::new() };
+    let mut plan = Plan { id: uuid::Uuid::new_v4().simple().to_string(), options: opts.clone(), items, summary, index: PlanIndex::default() };
     if library {
-        plan.years = compute_years(&plan);
+        plan.index = build_index(&plan);
     }
     Ok(plan)
 }
@@ -724,7 +738,7 @@ fn part_of(plan: &Plan, items: Vec<PlanItem>) -> Plan {
             _ => {}
         }
     }
-    Plan { id: plan.id.clone(), options: plan.options.clone(), items, summary, years: plan.years.clone() }
+    Plan { id: plan.id.clone(), options: plan.options.clone(), items, summary, index: PlanIndex::default() }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -734,15 +748,19 @@ fn part_of(plan: &Plan, items: Vec<PlanItem>) -> Plan {
 /// The year a library folder belongs to: `2015/…`, `받은 사진/2015/…`, `큰 동영상/2015/…` → "2015";
 /// before 2010 → "before2010"; `_날짜확인필요` → "undated".
 pub fn year_key(group: &str) -> String {
+    year_str(group).to_string()
+}
+
+fn year_str(group: &str) -> &str {
     let mut segs = group.split('/');
     let mut s = segs.next().unwrap_or("");
     if s == "받은 사진" || s == "큰 동영상" {
         s = segs.next().unwrap_or("");
     }
     match s.parse::<i32>() {
-        Ok(y) if s.len() == 4 && y < 2010 => "before2010".into(),
-        Ok(_) if s.len() == 4 => s.to_string(),
-        _ => "undated".into(),
+        Ok(y) if s.len() == 4 && y < 2010 => "before2010",
+        Ok(_) if s.len() == 4 => s,
+        _ => "undated",
     }
 }
 
@@ -762,28 +780,62 @@ fn year_rank(key: &str) -> (u8, String) {
     }
 }
 
-/// Year of each planned file: files landing in the library by their folder, copies to remove by
-/// the file kept instead (so a copy shows up with its original, wherever it lies now).
-fn item_years(plan: &Plan) -> std::borrow::Cow<'_, HashMap<i64, String>> {
-    if plan.years.is_empty() {
-        std::borrow::Cow::Owned(compute_years(plan))
+/// The plan's index (built with the plan; worked out here for a plan made by hand).
+fn index_of(plan: &Plan) -> std::borrow::Cow<'_, PlanIndex> {
+    if plan.index.built {
+        std::borrow::Cow::Borrowed(&plan.index)
     } else {
-        std::borrow::Cow::Borrowed(&plan.years)
+        std::borrow::Cow::Owned(build_index(plan))
     }
 }
 
-fn compute_years(plan: &Plan) -> HashMap<i64, String> {
-    let mut years: HashMap<i64, String> = plan
-        .items
-        .iter()
-        .filter(|i| matches!(i.action, Action::Move | Action::Copy | Action::InPlace | Action::SkipDuplicate))
-        .map(|i| (i.file_id, year_key(&i.group)))
-        .collect();
-    for it in plan.items.iter().filter(|i| i.action == Action::Remove) {
-        let y = it.kept.and_then(|k| years.get(&k).cloned()).unwrap_or_else(|| "undated".into());
-        years.insert(it.file_id, y);
+/// Year of each planned file: files landing in the library by their folder, copies to remove by
+/// the file kept instead (so a copy shows up with its original, wherever it lies now).
+fn build_index(plan: &Plan) -> PlanIndex {
+    let keeps = |i: &PlanItem| matches!(i.action, Action::Move | Action::Copy | Action::InPlace | Action::SkipDuplicate);
+    let mut ix = PlanIndex { built: true, ..Default::default() };
+    ix.pos.reserve(plan.items.len());
+    let mut names: Vec<&str> = Vec::new(); // distinct years (a handful)
+    // Year (as a position in `names`) of each item that lands in the library.
+    let mut year_ix: Vec<Option<u16>> = vec![None; plan.items.len()];
+    for (n, it) in plan.items.iter().enumerate() {
+        ix.pos.insert(it.file_id, n as u32);
+        if keeps(it) {
+            let y = year_str(&it.group);
+            let yi = names.iter().position(|x| *x == y).unwrap_or_else(|| {
+                names.push(y);
+                names.len() - 1
+            });
+            year_ix[n] = Some(yi as u16);
+        }
     }
-    years
+    let undated = names.iter().position(|x| *x == "undated").unwrap_or_else(|| {
+        names.push("undated");
+        names.len() - 1
+    });
+    let mut lists: Vec<Vec<u32>> = vec![Vec::new(); names.len()];
+    for (n, it) in plan.items.iter().enumerate() {
+        let yi = match it.action {
+            Action::Remove => {
+                if let Some(k) = it.kept {
+                    *ix.copies.entry(k).or_default() += 1;
+                }
+                // A copy belongs to the year of the file kept instead.
+                Some(it.kept.and_then(|k| ix.pos.get(&k)).and_then(|p| year_ix[*p as usize]).map(|y| y as usize).unwrap_or(undated))
+            }
+            _ => year_ix[n].map(|y| y as usize),
+        };
+        if let Some(yi) = yi {
+            lists[yi].push(n as u32);
+        }
+    }
+    ix.by_year = names.iter().zip(lists).filter(|(_, l)| !l.is_empty()).map(|(n, l)| (n.to_string(), l)).collect();
+    ix
+}
+
+/// The items of one year, in plan order.
+fn year_items<'a>(plan: &'a Plan, ix: &'a PlanIndex, key: &str) -> impl Iterator<Item = &'a PlanItem> + 'a {
+    ix.by_year.get(key).map(|v| v.as_slice()).unwrap_or(&[]).iter().map(move |n| &plan.items[*n as usize])
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -808,10 +860,9 @@ pub struct YearBucket {
 }
 
 pub fn year_buckets(plan: &Plan) -> Vec<YearBucket> {
-    let years = item_years(plan);
+    let ix = index_of(plan);
     let mut out: HashMap<String, YearBucket> = HashMap::new();
-    for it in &plan.items {
-        let Some(y) = years.get(&it.file_id) else { continue };
+    for (y, it) in ix.by_year.keys().flat_map(|y| year_items(plan, &ix, y).map(move |it| (y, it))) {
         let b = out.entry(y.clone()).or_insert_with(|| YearBucket { key: y.clone(), label: year_label(y), ..Default::default() });
         match it.action {
             Action::Move | Action::Copy | Action::InPlace | Action::SkipDuplicate => {
@@ -850,19 +901,15 @@ pub fn year_buckets(plan: &Plan) -> Vec<YearBucket> {
 
 /// One year of the plan: what lands in that year's folders and the copies of those files.
 pub fn subset_year(plan: &Plan, key: &str) -> Plan {
-    let years = item_years(plan);
-    let items: Vec<PlanItem> = plan
-        .items
-        .iter()
-        .filter(|i| matches!(i.action, Action::Move | Action::Copy | Action::Remove) && years.get(&i.file_id).is_some_and(|y| y == key))
-        .cloned()
-        .collect();
+    let ix = index_of(plan);
+    let items: Vec<PlanItem> = year_items(plan, &ix, key).filter(|i| matches!(i.action, Action::Move | Action::Copy | Action::Remove)).cloned().collect();
     part_of(plan, items)
 }
 
 /// Every file of one year (landing in its folders, or a copy of one of those).
 pub fn year_files(plan: &Plan, key: &str) -> HashSet<i64> {
-    item_years(plan).iter().filter(|(_, y)| y.as_str() == key).map(|(id, _)| *id).collect()
+    let ix = index_of(plan);
+    year_items(plan, &ix, key).map(|i| i.file_id).collect()
 }
 
 /// The library drive of a plan (the drive files are moved within).
@@ -908,25 +955,25 @@ fn parent_of(p: &str) -> String {
 }
 
 pub fn year_copies(plan: &Plan, key: &str) -> Vec<CopyFolder> {
-    let part = subset_year(plan, key);
-    let groups: HashMap<i64, &str> = plan.items.iter().map(|i| (i.file_id, i.group.as_str())).collect();
-    let srcs: HashMap<i64, &str> = plan.items.iter().map(|i| (i.file_id, i.src.as_str())).collect();
+    let ix = index_of(plan);
+    let item = |id: i64| ix.pos.get(&id).map(|n| &plan.items[*n as usize]);
     let mut by_dir: HashMap<String, (CopyFolder, HashMap<String, u64>)> = HashMap::new();
-    for it in part.items.iter().filter(|i| i.action == Action::Remove) {
+    for it in year_items(plan, &ix, key).filter(|i| i.action == Action::Remove) {
         let dir = parent_of(&it.src);
         let e = by_dir
             .entry(dir.clone())
             .or_insert_with(|| (CopyFolder { dir, count: 0, bytes: 0, versions: 0, same_name: 0, kept_in: Vec::new() }, HashMap::new()));
         e.0.count += 1;
-        if it.kept.and_then(|k| srcs.get(&k)).is_some_and(|k| same_name(k, &it.src)) {
+        let kept = it.kept.and_then(item);
+        if kept.is_some_and(|k| same_name(&k.src, &it.src)) {
             e.0.same_name += 1;
         }
         e.0.bytes += it.size;
         if it.tag == "version" {
             e.0.versions += 1;
         }
-        if let Some(g) = it.kept.and_then(|k| groups.get(&k)) {
-            *e.1.entry(g.to_string()).or_default() += 1;
+        if let Some(k) = kept {
+            *e.1.entry(k.group.clone()).or_default() += 1;
         }
     }
     let mut out: Vec<CopyFolder> = by_dir
@@ -944,15 +991,13 @@ pub fn year_copies(plan: &Plan, key: &str) -> Vec<CopyFolder> {
 }
 
 pub fn year_copy_pairs(plan: &Plan, key: &str, dir: &str, offset: usize, limit: usize) -> Vec<CopyPair> {
-    let part = subset_year(plan, key);
-    let by_id: HashMap<i64, &PlanItem> = plan.items.iter().map(|i| (i.file_id, i)).collect();
-    part.items
-        .iter()
+    let ix = index_of(plan);
+    year_items(plan, &ix, key)
         .filter(|i| i.action == Action::Remove && parent_of(&i.src) == dir)
         .skip(offset)
         .take(limit)
         .filter_map(|i| {
-            let k = by_id.get(&i.kept?)?;
+            let k = &plan.items[*ix.pos.get(&i.kept?)? as usize];
             Some(CopyPair {
                 file_id: i.file_id,
                 src: i.src.clone(),
@@ -969,12 +1014,8 @@ pub fn year_copy_pairs(plan: &Plan, key: &str, dir: &str, offset: usize, limit: 
 /// Files planned into the given library folders (for the preview of a selection).
 pub fn group_items(plan: &Plan, groups: &[String], offset: usize, limit: usize) -> Vec<KeepItem> {
     let want: HashSet<&str> = groups.iter().map(String::as_str).collect();
-    let mut copies: HashMap<i64, u32> = HashMap::new();
-    for it in plan.items.iter().filter(|i| i.action == Action::Remove) {
-        if let Some(k) = it.kept {
-            *copies.entry(k).or_default() += 1;
-        }
-    }
+    let ix = index_of(plan);
+    let copies = &ix.copies;
     let mut v: Vec<&PlanItem> = plan
         .items
         .iter()
@@ -1134,17 +1175,10 @@ pub struct KeepItem {
 }
 
 pub fn year_keep(plan: &Plan, key: &str, offset: usize, limit: usize) -> Vec<KeepItem> {
-    let mut copies: HashMap<i64, u32> = HashMap::new();
-    for it in plan.items.iter().filter(|i| i.action == Action::Remove) {
-        if let Some(k) = it.kept {
-            *copies.entry(k).or_default() += 1;
-        }
-    }
-    let mut v: Vec<&PlanItem> = plan
-        .items
-        .iter()
-        .filter(|i| matches!(i.action, Action::Move | Action::Copy | Action::InPlace | Action::SkipDuplicate) && year_key(&i.group) == key)
-        .collect();
+    let ix = index_of(plan);
+    let copies = &ix.copies;
+    let mut v: Vec<&PlanItem> =
+        year_items(plan, &ix, key).filter(|i| matches!(i.action, Action::Move | Action::Copy | Action::InPlace | Action::SkipDuplicate)).collect();
     v.sort_by(|a, b| a.group.cmp(&b.group).then(a.dst.cmp(&b.dst)));
     v.into_iter()
         .skip(offset)

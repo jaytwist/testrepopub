@@ -552,6 +552,8 @@ function YearDetail(props: {
 }) {
   const { planId, y, nodes, drive, running, renaming, setRenaming, saveRule, runFolder, sel, toggleSel, list } = props;
   const [tab, setTab] = useState<Tab>("where");
+  // A year can have thousands of folders: drawn 300 at a time.
+  const [shown, setShown] = useState(300);
   const drops = list.dropsFor(y.key);
   const work = y.moves + y.copies + y.remove + y.versions + drops.size;
   const done = y.done && drops.size === 0;
@@ -575,7 +577,7 @@ function YearDetail(props: {
       {tab === "where" && (
         <div className="lib-tree">
           {nodes.length === 0 && <div className="muted small">이 해에는 옮길 폴더가 없습니다.</div>}
-          {nodes.map((n) => {
+          {nodes.slice(0, shown).map((n) => {
             const isEvent = n.tag === "event" && n.from_dir;
             return (
               <div key={n.group} className={`lib-node ${n.moves + n.copies === 0 ? "done" : ""} ${sel.includes(n.group) ? "picked" : ""}`}>
@@ -617,6 +619,9 @@ function YearDetail(props: {
               </div>
             );
           })}
+          {nodes.length > shown && (
+            <button className="btn small" onClick={() => setShown(shown + 300)}>폴더 더 보기 ({fmtCount(nodes.length - shown)}개 남음)</button>
+          )}
         </div>
       )}
       {tab === "list" && <DeleteListTab planId={planId} year={y.key} drive={drive} copies={y.remove} list={list} />}
@@ -649,6 +654,7 @@ function CopiesTab({ planId, year, drive }: { planId: string; year: string; driv
   const [openDir, setOpenDir] = useState<string | null>(null);
   const [pairs, setPairs] = useState<CopyPair[]>([]);
   const [kept, setKept] = useState<Set<number>>(new Set());
+  const [shown, setShown] = useState(200);
   useEffect(() => {
     api.yearCopies(planId, year).then(setFolders).catch(() => setFolders([]));
   }, [planId, year]);
@@ -670,7 +676,7 @@ function CopiesTab({ planId, year, drive }: { planId: string; year: string; driv
         {drive} 안에서 원본과 내용이 똑같은 파일입니다 — 이름도 같으면 「복사본」, 이름이 다르면 「사본」. 원래 있던 폴더별로 묶었습니다.
         지우기 직전에 원본과 내용을 끝까지 비교하고, 하나라도 다르면 지우지 않습니다.
       </div>
-      {folders.map((f) => (
+      {folders.slice(0, shown).map((f) => (
         <div key={f.dir} className="lib-sec">
           <button className="lib-sec-head" onClick={() => openFolder(f.dir)}>
             <span>{openDir === f.dir ? "▾" : "▸"}</span>
@@ -709,6 +715,9 @@ function CopiesTab({ planId, year, drive }: { planId: string; year: string; driv
           )}
         </div>
       ))}
+      {folders.length > shown && (
+        <button className="btn small" onClick={() => setShown(shown + 200)}>폴더 더 보기 ({fmtCount(folders.length - shown)}개 남음)</button>
+      )}
     </div>
   );
 }

@@ -30,6 +30,74 @@ pub struct Blocked {
 }
 
 /// Which of `ids` are protected, and why (one reason per file, most important first).
+/// `check` for many files at once (a whole plan's copies): the same answer, from a handful of
+/// queries over the tables instead of several per file. `rows` is `db::all_files`.
+pub fn check_many(conn: &Connection, ids: &[i64], rows: &HashMap<i64, db::FileRow>) -> Result<Vec<Blocked>> {
+    if ids.len() < 500 {
+        return check(conn, ids);
+    }
+    let rules = DupRules::load(conn)?;
+    let wanted: HashSet<i64> = ids.iter().copied().collect();
+    // ♥ / original labels of all files.
+    let mut marks: HashMap<i64, bool> = HashMap::new(); // id -> is original (else favourite)
+    {
+        let mut st = conn.prepare("SELECT file_id, label FROM labels WHERE label IN (?, ?)")?;
+        for r in st.query_map(params![ORIGINAL_LABEL, FAVORITE_LABEL], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+            let (id, l) = r?;
+            let e = marks.entry(id).or_insert(false);
+            *e |= l == ORIGINAL_LABEL;
+        }
+    }
+    // Content key of every live file, and how many live files share each.
+    let mut key_of: HashMap<i64, String> = HashMap::new();
+    let mut live: HashMap<String, usize> = HashMap::new();
+    {
+        let mut st = conn.prepare("SELECT id, COALESCE(prehash, hash) FROM files WHERE missing = 0 AND quarantined = 0 AND COALESCE(prehash, hash) IS NOT NULL")?;
+        for r in st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+            let (id, k) = r?;
+            *live.entry(k.clone()).or_default() += 1;
+            if wanted.contains(&id) {
+                key_of.insert(id, k);
+            }
+        }
+    }
+    let originals: HashSet<i64> = {
+        let mut st = conn.prepare("SELECT file_id FROM dup_roles WHERE role = 'original'")?;
+        let s = st.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        s
+    };
+    let mut out: Vec<Blocked> = Vec::new();
+    let mut by_content: HashMap<&str, Vec<i64>> = HashMap::new();
+    for &id in &wanted {
+        // `rows` holds only live files (not missing, not quarantined).
+        let Some(f) = rows.get(&id) else { continue };
+        let reason = match marks.get(&id) {
+            Some(true) => Some("original"),
+            Some(false) => Some("favorite"),
+            None if rules.is_kept(f) => Some("keep_folder"),
+            None => None,
+        };
+        if let Some(r) = reason {
+            out.push(Blocked { id, reason: r.into() });
+            continue;
+        }
+        if let Some(k) = key_of.get(&id) {
+            by_content.entry(k.as_str()).or_default().push(id);
+        }
+    }
+    for (key, mut members) in by_content {
+        let n = live.get(key).copied().unwrap_or(0);
+        if n < 2 || n > members.len() {
+            continue;
+        }
+        members.sort();
+        let keep = members.iter().copied().find(|m| originals.contains(m)).unwrap_or(members[0]);
+        out.push(Blocked { id: keep, reason: "last_copy".into() });
+    }
+    out.sort_by_key(|b| b.id);
+    Ok(out)
+}
+
 pub fn check(conn: &Connection, ids: &[i64]) -> Result<Vec<Blocked>> {
     let rules = DupRules::load(conn)?;
     let wanted: HashSet<i64> = ids.iter().copied().collect();
