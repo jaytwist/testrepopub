@@ -195,7 +195,16 @@ fn remove_source(state: State<AppState>, id: i64) -> CmdResult<()> {
 #[tauri::command]
 /// Check for new files: one source, one drive (`volume_id`), one folder (`folder`, inside a
 /// registered source — nothing else is listed), or everything.
-fn start_scan(app: AppHandle, state: State<AppState>, source_id: Option<i64>, volume_id: Option<i64>, folder: Option<String>) -> CmdResult<()> {
+fn start_scan(
+    app: AppHandle,
+    state: State<AppState>,
+    source_id: Option<i64>,
+    volume_id: Option<i64>,
+    folder: Option<String>,
+    full: Option<bool>,
+) -> CmdResult<()> {
+    // Quick check by default (unchanged folders are not listed); `full` lists everything.
+    let mode = if full.unwrap_or(false) { scanner::Mode::Full } else { scanner::Mode::Auto };
     // Resolve the folder first so a wrong pick is reported right away.
     let scope = match &folder {
         Some(f) => {
@@ -211,13 +220,13 @@ fn start_scan(app: AppHandle, state: State<AppState>, source_id: Option<i64>, vo
         drop(conn);
         let stats = match (scope, source_id, volume_id) {
             (Some((id, sub)), _, _) => {
-                let s = scanner::scan_scope(&st.db, id, Some(&sub), &opts, &st.stop, progress)?;
+                let s = scanner::scan_with(&st.db, id, Some(&sub), &opts, mode, &st.stop, progress)?;
                 media_core::identity::backfill_prehashes(&st.db.conn()?)?;
                 vec![s]
             }
-            (None, Some(id), _) => vec![scanner::scan_source(&st.db, id, &opts, &st.stop, progress)?],
-            (None, None, Some(v)) => scanner::scan_volume(&st.db, v, &opts, &st.stop, progress)?,
-            (None, None, None) => scanner::scan_all(&st.db, &opts, &st.stop, progress)?,
+            (None, Some(id), _) => vec![scanner::scan_with(&st.db, id, None, &opts, mode, &st.stop, progress)?],
+            (None, None, Some(v)) => scanner::scan_volume_with(&st.db, v, &opts, mode, &st.stop, progress)?,
+            (None, None, None) => scanner::scan_all_with(&st.db, &opts, mode, &st.stop, progress)?,
         };
         // With background analysis on, thumbnails come from its single-read pass right after this
         // job; otherwise make them here so the drive can be unplugged and still browsed.

@@ -180,9 +180,9 @@ export const api = {
   listSources: () => invoke<SourceRow[]>("list_sources"),
   addSource: (path: string) => invoke<number>("add_source", { path }),
   removeSource: (id: number) => invoke<void>("remove_source", { id }),
-  startScan: (sourceId?: number) => invoke<void>("start_scan", { sourceId: sourceId ?? null, volumeId: null, folder: null }),
+  startScan: (sourceId?: number, full = false) => invoke<void>("start_scan", { sourceId: sourceId ?? null, volumeId: null, folder: null, full }),
   /** Only the sources on this drive. */
-  scanVolume: (volumeId: number) => invoke<void>("start_scan", { sourceId: null, volumeId, folder: null }),
+  scanVolume: (volumeId: number) => invoke<void>("start_scan", { sourceId: null, volumeId, folder: null, full: false }),
   listCards: () => invoke<Card[]>("list_cards"),
   getImportSettings: () => invoke<ImportSettings>("get_import_settings"),
   setImportSettings: (settings: ImportSettings) => invoke<void>("set_import_settings", { settings }),
@@ -190,7 +190,7 @@ export const api = {
   startImport: (mount: string) => invoke<void>("start_import", { mount }),
   importCancel: (sourceId: number) => invoke<void>("import_cancel", { sourceId }),
   /** Only this folder (inside a registered source): nothing else is listed. */
-  scanFolder: (folder: string) => invoke<void>("start_scan", { sourceId: null, volumeId: null, folder }),
+  scanFolder: (folder: string) => invoke<void>("start_scan", { sourceId: null, volumeId: null, folder, full: false }),
   getScanOptions: () => invoke<ScanOptions>("get_scan_options"),
   cleanupSummary: () => invoke<CleanupSummary>("cleanup_summary"),
   tripsSummary: () => invoke<TripsSummary>("trips_summary"),

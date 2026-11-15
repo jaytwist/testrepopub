@@ -49,3 +49,43 @@ fn only_the_folder_or_drive_asked_for() {
     let after_c: i64 = conn.query_row("SELECT last_scan FROM sources WHERE id = ?", [sc], |r| r.get(0)).unwrap();
     assert_eq!(last_c, after_c, "drive C was not scanned");
 }
+
+/// Quick check: unchanged folders are not listed again; new, renamed and deleted files are still
+/// found (their folder's time changed). A file edited in place is only seen by a full check.
+#[test]
+fn quick_check_lists_only_changed_folders() {
+    use media_core::scanner::Mode;
+    let tmp = tempfile::tempdir().unwrap();
+    let e = drive(tmp.path(), "diskE");
+    for (i, dir) in ["2023/여름", "2023/가을", "2024/봄", "2024/여름"].iter().enumerate() {
+        write_jpeg(&e.join(dir).join("a.jpg"), &picture(i as u32, 800, 600), Some(("2023:07:01 10:00:00", "Canon", "EOS")));
+    }
+    let db = Db::open(tmp.path().join("app/library.db")).unwrap();
+    let conn = db.conn().unwrap();
+    let sid = volumes::add_source(&conn, &e).unwrap();
+    let (stop, opts) = (StopFlag::new(), ScanOptions::default());
+    let first = scanner::scan_with(&db, sid, None, &opts, Mode::Auto, &stop, &quiet).unwrap();
+    assert!(!first.quick, "the first scan lists everything");
+    assert_eq!(first.added, 4);
+
+    // Nothing changed: every folder's time is the same, nothing is listed.
+    let again = scanner::scan_with(&db, sid, None, &opts, Mode::Auto, &stop, &quiet).unwrap();
+    assert!(again.quick);
+    assert_eq!((again.dirs_listed, again.unchanged, again.added, again.missing), (0, 4, 0, 0), "{again:?}");
+
+    // A new photo in one folder, one deleted in another: only those two folders are listed.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    write_jpeg(&e.join("2024/봄/b.jpg"), &picture(9, 800, 600), Some(("2024:04:01 10:00:00", "Canon", "EOS")));
+    fs::remove_file(e.join("2023/가을/a.jpg")).unwrap();
+    let st = scanner::scan_with(&db, sid, None, &opts, Mode::Auto, &stop, &quiet).unwrap();
+    assert!(st.quick);
+    assert_eq!((st.added, st.missing, st.dirs_listed), (1, 1, 2), "{st:?}");
+
+    // Edited in place (same name, folder time unchanged): only a full check sees it.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    write_jpeg(&e.join("2023/여름/a.jpg"), &picture(42, 900, 700), Some(("2023:07:01 10:00:00", "Canon", "EOS")));
+    let q = scanner::scan_with(&db, sid, None, &opts, Mode::Auto, &stop, &quiet).unwrap();
+    let full = scanner::scan_with(&db, sid, None, &opts, Mode::Full, &stop, &quiet).unwrap();
+    assert!(!full.quick);
+    assert_eq!(full.updated, 1, "full check: {full:?} (quick: {q:?})");
+}

@@ -91,12 +91,14 @@ function doneText(d: JobDone): string {
       (a, x) => ({
         seen: a.seen + (x.seen ?? 0), fresh: a.fresh + (x.added ?? 0) + (x.updated ?? 0), known: a.known + (x.moved ?? 0) + (x.reused ?? 0),
         walk: a.walk + (x.walk_ms ?? 0), read: a.read + (x.read_ms ?? 0),
+        quick: a.quick || !!x.quick, listed: a.listed + (x.dirs_listed ?? 0), reusedDirs: a.reusedDirs + (x.dirs_reused ?? 0),
       }),
-      { seen: 0, fresh: 0, known: 0, walk: 0, read: 0 },
+      { seen: 0, fresh: 0, known: 0, walk: 0, read: 0, quick: false, listed: 0, reusedDirs: 0 },
     );
     const parts = [`확인 ${fmtCount(s.seen)}개`, `새로 읽음 ${fmtCount(s.fresh)}개`];
     if (s.known) parts.push(`옮겨지거나 복사된 ${fmtCount(s.known)}개는 다시 읽지 않음`);
     parts.push(`목록 읽기 ${dur(s.walk)} · 새 파일 읽기 ${dur(s.read)}`);
+    if (s.quick) parts.push(`빠른 확인: 폴더 ${fmtCount(s.listed + s.reusedDirs)}개 중 바뀐 ${fmtCount(s.listed)}개만 읽음`);
     return parts.join(" · ");
   }
   return "작업이 완료되었습니다";

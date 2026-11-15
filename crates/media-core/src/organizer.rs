@@ -223,6 +223,20 @@ fn same_bytes(ha: Option<&str>, a: &Path, hb: Option<&str>, b: &Path) -> bool {
     matches!((ha, hb), (Ok(x), Ok(y)) if x == y)
 }
 
+/// Files in a folder (lower-cased name -> size); empty if the folder does not exist yet.
+fn list_dir(dir: &Path) -> HashMap<String, i64> {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| {
+                    let md = e.metadata().ok()?;
+                    md.is_file().then(|| (e.file_name().to_string_lossy().to_lowercase(), md.len() as i64))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn key(p: &Path) -> String {
     // NTFS/exFAT are case-insensitive; treat paths that differ only by case as the same.
     p.to_string_lossy().to_lowercase()
@@ -259,6 +273,9 @@ pub fn plan(db: &Db, opts: &OrganizeOptions, stop: &StopFlag, progress: Progress
     // dst key -> (size, src path, known hash) of the file that claimed it first in this plan.
     let mut claimed: HashMap<String, (i64, PathBuf, Option<String>)> = HashMap::new();
     let mut folders: HashSet<String> = HashSet::new();
+    // What already sits in each destination folder (lower-cased name -> size), read once per
+    // folder instead of a disk lookup per file.
+    let mut on_disk: HashMap<String, HashMap<String, i64>> = HashMap::new();
     let total = ids.len() as u64;
     let empty = Vec::new();
     for (i, id) in ids.iter().enumerate() {
@@ -318,10 +335,10 @@ pub fn plan(db: &Db, opts: &OrganizeOptions, stop: &StopFlag, progress: Progress
                 n += 1;
                 continue;
             }
-            if cand.exists() {
+            let listing = on_disk.entry(key(&dir)).or_insert_with(|| list_dir(&dir));
+            if let Some(size) = listing.get(&name.to_lowercase()).copied() {
                 // Same bytes already there? Then this file is a duplicate: skip it.
-                let same = std::fs::metadata(&cand).map(|m| m.len() as i64 == f.size).unwrap_or(false)
-                    && same_bytes(None, &cand, f.hash.as_deref(), &src);
+                let same = size == f.size && same_bytes(None, &cand, f.hash.as_deref(), &src);
                 if same {
                     item.action = Action::SkipDuplicate;
                     break cand;
@@ -400,6 +417,10 @@ pub fn execute(db: &Db, plan: &Plan, stop: &StopFlag, progress: ProgressFn) -> R
     let source_roots: Vec<PathBuf> = db::list_sources(&conn)?.into_iter().map(|s| PathBuf::from(s.abs_path)).collect();
     let total = work.len() as u64;
 
+    // Index updates are committed every few hundred files instead of one by one (much faster on
+    // big libraries). A crash loses at most that many index updates; the next scan recognises
+    // those files at their new place by content, so nothing is lost or read again.
+    conn.execute_batch("BEGIN")?;
     for (i, it) in work.iter().enumerate() {
         if stop.is_stopped() {
             rep.cancelled = true;
@@ -407,6 +428,9 @@ pub fn execute(db: &Db, plan: &Plan, stop: &StopFlag, progress: ProgressFn) -> R
         }
         if i % 10 == 0 {
             progress(Progress::new("organize:run", "run", i as u64, total, it.src.clone()));
+        }
+        if i > 0 && i % 200 == 0 {
+            conn.execute_batch("COMMIT; BEGIN")?;
         }
         let res: Result<()> = (|| {
             let Some(f) = db::get_file(&conn, it.file_id)? else { bail!("인덱스에서 사라짐") };
@@ -445,6 +469,7 @@ pub fn execute(db: &Db, plan: &Plan, stop: &StopFlag, progress: ProgressFn) -> R
             }
         }
     }
+    conn.execute_batch("COMMIT")?;
     if plan.options.remove_empty_dirs {
         for d in touched_dirs {
             // Never remove a source root itself or anything above it.

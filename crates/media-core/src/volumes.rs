@@ -102,6 +102,21 @@ mod platform {
         identify_root(&root_str)
     }
 
+    /// NTFS / ReFS update a folder's time when an entry is added, removed or renamed; FAT and
+    /// exFAT (cards, many USB drives) do not reliably.
+    pub fn dir_times_reliable(root: &Path) -> bool {
+        let mut s = root.to_string_lossy().into_owned();
+        if !s.ends_with('\\') {
+            s.push('\\');
+        }
+        let w: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut fsname = [0u16; 64];
+        let ok = unsafe { GetVolumeInformationW(PCWSTR(w.as_ptr()), None, None, None, None, Some(&mut fsname)) }.is_ok();
+        let len = fsname.iter().position(|&c| c == 0).unwrap_or(fsname.len());
+        let fs = String::from_utf16_lossy(&fsname[..len]).to_uppercase();
+        ok && (fs == "NTFS" || fs == "REFS")
+    }
+
     fn identify_root(root_str: &str) -> Result<VolumeInfo> {
         let wroot: Vec<u16> = root_str.encode_utf16().chain(std::iter::once(0)).collect();
         let mut label = [0u16; 261];
@@ -181,6 +196,11 @@ mod platform {
     pub fn mounted() -> Vec<VolumeInfo> {
         Vec::new()
     }
+
+    /// Unix file systems update a directory's time when entries change.
+    pub fn dir_times_reliable(_root: &Path) -> bool {
+        true
+    }
 }
 
 pub fn identify(path: &Path) -> Result<VolumeInfo> {
@@ -189,6 +209,12 @@ pub fn identify(path: &Path) -> Result<VolumeInfo> {
 
 /// Currently mounted volumes, keyed by uid. On non-Windows this is empty and
 /// `refresh` instead re-identifies each known mount path.
+/// Whether quick checks (unchanged folder time = unchanged folder) are safe on this drive.
+/// `MO_FULL_SCANS=1` turns them off.
+pub fn dir_times_reliable(root: &Path) -> bool {
+    std::env::var("MO_FULL_SCANS").map(|v| v != "1").unwrap_or(true) && platform::dir_times_reliable(root)
+}
+
 pub fn mounted() -> HashMap<String, VolumeInfo> {
     platform::mounted().into_iter().map(|v| (v.uid.clone(), v)).collect()
 }

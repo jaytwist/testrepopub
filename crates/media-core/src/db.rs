@@ -230,6 +230,16 @@ const MIGRATIONS: &[&str] = &[
     r#"
     CREATE INDEX IF NOT EXISTS files_content ON files(COALESCE(prehash, hash));
     "#,
+    // 8: folder times for quick checks; when each source was last listed in full.
+    r#"
+    CREATE TABLE IF NOT EXISTS dirs (
+        volume_id INTEGER NOT NULL,
+        rel_dir   TEXT NOT NULL,
+        mtime     INTEGER NOT NULL,
+        PRIMARY KEY(volume_id, rel_dir)
+    );
+    ALTER TABLE sources ADD COLUMN last_full INTEGER NOT NULL DEFAULT 0;
+    "#,
 ];
 
 pub fn schema_version(conn: &Connection) -> Result<i64> {

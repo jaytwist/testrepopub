@@ -39,6 +39,10 @@ pub struct ScanStats {
     pub walk_ms: u64,
     /// Time spent reading new / changed files (metadata, fingerprint).
     pub read_ms: u64,
+    /// Quick check: unchanged folders were not listed again.
+    pub quick: bool,
+    pub dirs_listed: u64,
+    pub dirs_reused: u64,
 }
 
 struct Candidate {
@@ -49,6 +53,47 @@ struct Candidate {
     kind: Kind,
     size: u64,
     mtime: i64,
+}
+
+/// Folder times in nanoseconds: a change within the same second as the last scan still counts.
+fn mtime_ns(md: &std::fs::Metadata) -> i64 {
+    md.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_nanos() as i64).unwrap_or(0)
+}
+
+/// Folders known from the last scan of this part of the volume (`rel_dir` -> time).
+fn stored_dirs(conn: &Connection, volume_id: i64, rel_root: &str) -> Result<HashMap<String, i64>> {
+    let mut st = conn.prepare(
+        "SELECT rel_dir, mtime FROM dirs WHERE volume_id = ?1 AND (?2 = '' OR rel_dir = ?2 OR substr(rel_dir, 1, length(?2) + 1) = ?2 || '/')",
+    )?;
+    let rows = st.query_map(params![volume_id, rel_root], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
+struct IndexedFile {
+    rel: String,
+    name: String,
+    ext: String,
+    kind: Kind,
+    size: i64,
+    mtime: i64,
+}
+
+/// Indexed files of this part of the volume, by folder.
+fn indexed_by_dir(conn: &Connection, volume_id: i64, rel_root: &str) -> Result<HashMap<String, Vec<IndexedFile>>> {
+    let mut st = conn.prepare(
+        "SELECT rel_path, name, ext, kind, size, mtime FROM files WHERE volume_id = ?1 AND missing = 0
+           AND (?2 = '' OR substr(rel_path, 1, length(?2) + 1) = ?2 || '/')",
+    )?;
+    let mut out: HashMap<String, Vec<IndexedFile>> = HashMap::new();
+    for r in st.query_map(params![volume_id, rel_root], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, i64>(4)?, r.get::<_, i64>(5)?))
+    })? {
+        let (rel, name, ext, kind, size, mtime) = r?;
+        let Some(kind) = Kind::parse(&kind) else { continue };
+        let dir = rel.rfind('/').map(|i| rel[..i].to_string()).unwrap_or_default();
+        out.entry(dir).or_default().push(IndexedFile { rel, name, ext, kind, size, mtime });
+    }
+    Ok(out)
 }
 
 fn mtime_of(md: &std::fs::Metadata) -> i64 {
@@ -63,13 +108,30 @@ pub fn scan_source(db: &Db, source_id: i64, opts: &ScanOptions, stop: &StopFlag,
 /// Scan one registered source, or only the folder `sub` inside it (relative to the source, `/`
 /// separated): files elsewhere in the source are not looked at and not marked missing.
 pub fn scan_scope(db: &Db, source_id: i64, sub: Option<&str>, opts: &ScanOptions, stop: &StopFlag, progress: ProgressFn) -> Result<ScanStats> {
+    scan_with(db, source_id, sub, opts, Mode::Auto, stop, progress)
+}
+
+/// How much of the tree a scan lists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// Quick check where it is safe (folder times are reliable and a full listing is recent).
+    Auto,
+    /// List every folder (also catches files changed in place).
+    Full,
+}
+
+/// A full listing at least this often, even when quick checks are possible: a file edited in
+/// place (same name) does not change its folder's time.
+const FULL_EVERY_SECS: i64 = 30 * 86_400;
+
+pub fn scan_with(db: &Db, source_id: i64, sub: Option<&str>, opts: &ScanOptions, mode: Mode, stop: &StopFlag, progress: ProgressFn) -> Result<ScanStats> {
     let started = std::time::Instant::now();
     let mut conn = db.conn()?;
     volumes::refresh(&conn)?;
-    let (volume_id, rel_root, mount, online): (i64, String, String, i64) = conn.query_row(
-        "SELECT s.volume_id, s.rel_root, v.mount, v.online FROM sources s JOIN volumes v ON v.id = s.volume_id WHERE s.id = ?",
+    let (volume_id, rel_root, mount, online, last_full): (i64, String, String, i64, i64) = conn.query_row(
+        "SELECT s.volume_id, s.rel_root, v.mount, v.online, s.last_full FROM sources s JOIN volumes v ON v.id = s.volume_id WHERE s.id = ?",
         [source_id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
     )?;
     if online == 0 {
         return Err(anyhow!("드라이브가 연결되어 있지 않습니다 (offline volume)"));
@@ -89,6 +151,7 @@ pub fn scan_scope(db: &Db, source_id: i64, sub: Option<&str>, opts: &ScanOptions
 
     let job = format!("scan:{source_id}");
     let mut stats = ScanStats { source_id, ..Default::default() };
+    let quick = mode == Mode::Auto && crate::now_ts() - last_full < FULL_EVERY_SECS && volumes::dir_times_reliable(&vol_root);
 
     // 1. Walk, skipping anything that is not the user's own media.
     let rules = Rules::new(opts);
@@ -96,54 +159,142 @@ pub fn scan_scope(db: &Db, source_id: i64, sub: Option<&str>, opts: &ScanOptions
     let mut apps = AppDirDetector::default();
     let mut cands: Vec<Candidate> = Vec::new();
     let mut walked: u64 = 0;
-    let walker = WalkDir::new(&abs_root).follow_links(false).into_iter().filter_entry(|e| {
-        if e.depth() == 0 || !e.file_type().is_dir() {
-            return true;
-        }
-        let md = e.metadata().ok();
-        match rules.dir_skip(e.path(), md.as_ref()) {
-            Some(reason) => {
-                skipped.borrow_mut().add(reason);
-                false
-            }
-            None => true,
-        }
-    });
-    for entry in walker {
-        if stop.is_stopped() {
-            return Err(anyhow!("cancelled"));
-        }
-        let Ok(entry) = entry else {
-            stats.errors += 1;
-            continue;
-        };
-        walked += 1;
-        if walked % 2000 == 0 {
-            progress(Progress::new(&job, "walk", cands.len() as u64, 0, entry.path().to_string_lossy()));
-        }
-        if !entry.file_type().is_file() {
-            continue;
-        }
+    // Every folder seen, with its modification time (for the next quick check).
+    let mut seen_dirs: Vec<(String, i64)> = Vec::new();
+    // A media file found while listing a folder.
+    let consider = |path: &Path, name: String, md: &std::fs::Metadata, cands: &mut Vec<Candidate>, apps: &mut AppDirDetector| {
         if opts.skip_app_folders {
-            apps.observe(entry.path());
+            apps.observe(path);
         }
-        let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with("._") {
-            continue; // macOS resource forks on exFAT drives
+            return; // macOS resource forks on exFAT drives
         }
         let ext = ext_of(&name);
-        let Some(kind) = kind_for_ext(&ext) else { continue };
-        let Ok(md) = entry.metadata() else {
-            stats.errors += 1;
-            continue;
-        };
+        let Some(kind) = kind_for_ext(&ext) else { return };
         let size = md.len();
-        if let Some(reason) = rules.file_skip(&name, kind == Kind::Video, size, &md) {
+        if let Some(reason) = rules.file_skip(&name, kind == Kind::Video, size, md) {
             skipped.borrow_mut().add(reason);
-            continue;
+            return;
         }
-        let Ok(rel) = volumes::rel_of(&vol_root, entry.path()) else { continue };
-        cands.push(Candidate { rel, abs: entry.path().to_path_buf(), name, ext, kind, size, mtime: mtime_of(&md) });
+        let Ok(rel) = volumes::rel_of(&vol_root, path) else { return };
+        cands.push(Candidate { rel, abs: path.to_path_buf(), name, ext, kind, size, mtime: mtime_of(md) });
+    };
+    let known_dirs: HashMap<String, i64> = if quick { stored_dirs(&conn, volume_id, &rel_root)? } else { HashMap::new() };
+    if quick && !known_dirs.is_empty() {
+        // Quick check: a folder whose modification time is unchanged has the same entries as last
+        // time (NTFS and Unix update it when a file is added, removed or renamed in it), so its
+        // files come from the index and only its subfolders are visited. Changed folders are listed.
+        let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
+        for d in known_dirs.keys() {
+            if d != &rel_root {
+                let parent = d.rfind('/').map(|i| &d[..i]).unwrap_or("");
+                children.entry(parent).or_default().push(d.as_str());
+            }
+        }
+        let indexed = indexed_by_dir(&conn, volume_id, &rel_root)?;
+        let mut stack: Vec<String> = vec![rel_root.clone()];
+        while let Some(rel_dir) = stack.pop() {
+            if stop.is_stopped() {
+                return Err(anyhow!("cancelled"));
+            }
+            let abs = volumes::join_rel(&vol_root, &rel_dir);
+            let Ok(md) = std::fs::metadata(&abs) else { continue };
+            let mt = mtime_ns(&md);
+            seen_dirs.push((rel_dir.clone(), mt));
+            walked += 1;
+            if walked % 500 == 0 {
+                progress(Progress::new(&job, "walk", cands.len() as u64, 0, abs.to_string_lossy()));
+            }
+            if known_dirs.get(&rel_dir) == Some(&mt) {
+                stats.dirs_reused += 1;
+                for f in indexed.get(rel_dir.as_str()).into_iter().flatten() {
+                    cands.push(Candidate {
+                        rel: f.rel.clone(),
+                        abs: volumes::join_rel(&vol_root, &f.rel),
+                        name: f.name.clone(),
+                        ext: f.ext.clone(),
+                        kind: f.kind,
+                        size: f.size as u64,
+                        mtime: f.mtime,
+                    });
+                }
+                for c in children.get(rel_dir.as_str()).into_iter().flatten() {
+                    stack.push((*c).to_string());
+                }
+                continue;
+            }
+            stats.dirs_listed += 1;
+            let Ok(rd) = std::fs::read_dir(&abs) else {
+                stats.errors += 1;
+                continue;
+            };
+            for e in rd.flatten() {
+                let Ok(ft) = e.file_type() else { continue };
+                let path = e.path();
+                if ft.is_dir() {
+                    let md = e.metadata().ok();
+                    match rules.dir_skip(&path, md.as_ref()) {
+                        Some(reason) => skipped.borrow_mut().add(reason),
+                        None => {
+                            if let Ok(r) = volumes::rel_of(&vol_root, &path) {
+                                stack.push(r);
+                            }
+                        }
+                    }
+                } else if ft.is_file() {
+                    let Ok(md) = e.metadata() else {
+                        stats.errors += 1;
+                        continue;
+                    };
+                    consider(&path, e.file_name().to_string_lossy().into_owned(), &md, &mut cands, &mut apps);
+                }
+            }
+        }
+        stats.quick = true;
+    } else {
+        let walker = WalkDir::new(&abs_root).follow_links(false).into_iter().filter_entry(|e| {
+            if e.depth() == 0 || !e.file_type().is_dir() {
+                return true;
+            }
+            let md = e.metadata().ok();
+            match rules.dir_skip(e.path(), md.as_ref()) {
+                Some(reason) => {
+                    skipped.borrow_mut().add(reason);
+                    false
+                }
+                None => true,
+            }
+        });
+        for entry in walker {
+            if stop.is_stopped() {
+                return Err(anyhow!("cancelled"));
+            }
+            let Ok(entry) = entry else {
+                stats.errors += 1;
+                continue;
+            };
+            walked += 1;
+            if walked % 2000 == 0 {
+                progress(Progress::new(&job, "walk", cands.len() as u64, 0, entry.path().to_string_lossy()));
+            }
+            if entry.file_type().is_dir() {
+                // The time is read before the folder is listed, so a change during the scan is
+                // seen next time.
+                if let (Ok(md), Ok(rel)) = (entry.metadata(), volumes::rel_of(&vol_root, entry.path())) {
+                    seen_dirs.push((rel, mtime_ns(&md)));
+                }
+                stats.dirs_listed += 1;
+                continue;
+            }
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let Ok(md) = entry.metadata() else {
+                stats.errors += 1;
+                continue;
+            };
+            consider(entry.path(), entry.file_name().to_string_lossy().into_owned(), &md, &mut cands, &mut apps);
+        }
     }
     // Media shipped inside installed programs and games (icons, textures, sample clips).
     if opts.skip_app_folders {
@@ -317,8 +468,26 @@ pub fn scan_scope(db: &Db, source_id: i64, sub: Option<&str>, opts: &ScanOptions
            AND (?2 = '' OR substr(rel_path, 1, length(?2) + 1) = ?2 || '/')",
         params![volume_id, rel_root, opts.min_image_side],
     )? as u64;
+    // Folder times for the next quick check (only for this scan's part of the volume).
+    {
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM dirs WHERE volume_id = ?1 AND (?2 = '' OR rel_dir = ?2 OR substr(rel_dir, 1, length(?2) + 1) = ?2 || '/')",
+            params![volume_id, rel_root],
+        )?;
+        {
+            let mut ins = tx.prepare("INSERT OR REPLACE INTO dirs(volume_id, rel_dir, mtime) VALUES (?, ?, ?)")?;
+            for (d, mt) in &seen_dirs {
+                ins.execute(params![volume_id, d, mt])?;
+            }
+        }
+        tx.commit()?;
+    }
     if sub.is_none() {
         conn.execute("UPDATE sources SET last_scan = ? WHERE id = ?", params![now, source_id])?;
+        if !stats.quick {
+            conn.execute("UPDATE sources SET last_full = ? WHERE id = ?", params![now, source_id])?;
+        }
     }
     progress(Progress::new(&job, "done", total, total, format!("{} files", stats.seen)));
     Ok(stats)
@@ -326,6 +495,10 @@ pub fn scan_scope(db: &Db, source_id: i64, sub: Option<&str>, opts: &ScanOptions
 
 /// Scan every source whose volume is currently online.
 pub fn scan_all(db: &Db, opts: &ScanOptions, stop: &StopFlag, progress: ProgressFn) -> Result<Vec<ScanStats>> {
+    scan_all_with(db, opts, Mode::Auto, stop, progress)
+}
+
+pub fn scan_all_with(db: &Db, opts: &ScanOptions, mode: Mode, stop: &StopFlag, progress: ProgressFn) -> Result<Vec<ScanStats>> {
     let conn = db.conn()?;
     volumes::refresh(&conn)?;
     let ids: Vec<i64> = {
@@ -339,7 +512,7 @@ pub fn scan_all(db: &Db, opts: &ScanOptions, stop: &StopFlag, progress: Progress
         if stop.is_stopped() {
             break;
         }
-        out.push(scan_source(db, id, opts, stop, progress)?);
+        out.push(scan_with(db, id, None, opts, mode, stop, progress)?);
     }
     // Older entries that could have a copy get their content fingerprint (once).
     identity::backfill_prehashes(&db.conn()?)?;
@@ -348,6 +521,10 @@ pub fn scan_all(db: &Db, opts: &ScanOptions, stop: &StopFlag, progress: Progress
 
 /// Scan only the sources on one drive (e.g. the one just plugged in).
 pub fn scan_volume(db: &Db, volume_id: i64, opts: &ScanOptions, stop: &StopFlag, progress: ProgressFn) -> Result<Vec<ScanStats>> {
+    scan_volume_with(db, volume_id, opts, Mode::Auto, stop, progress)
+}
+
+pub fn scan_volume_with(db: &Db, volume_id: i64, opts: &ScanOptions, mode: Mode, stop: &StopFlag, progress: ProgressFn) -> Result<Vec<ScanStats>> {
     let conn = db.conn()?;
     volumes::refresh(&conn)?;
     let ids: Vec<i64> = {
@@ -361,7 +538,7 @@ pub fn scan_volume(db: &Db, volume_id: i64, opts: &ScanOptions, stop: &StopFlag,
         if stop.is_stopped() {
             break;
         }
-        out.push(scan_source(db, id, opts, stop, progress)?);
+        out.push(scan_with(db, id, None, opts, mode, stop, progress)?);
     }
     identity::backfill_prehashes(&db.conn()?)?;
     Ok(out)

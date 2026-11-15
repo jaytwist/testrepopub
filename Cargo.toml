@@ -15,3 +15,8 @@ strip = true
 # czkawka_core and image decoding are slow in debug builds; optimize deps even in dev.
 [profile.dev.package."*"]
 opt-level = 2
+debug = false
+
+# Line tables are enough for backtraces; full debug info made each test binary hundreds of MB.
+[profile.dev]
+debug = "line-tables-only"

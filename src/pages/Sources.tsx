@@ -54,10 +54,10 @@ export default function Sources() {
     }
   };
 
-  const scan = async (id?: number) => {
+  const scan = async (id?: number, full = false) => {
     setError(null);
     try {
-      await api.startScan(id);
+      await api.startScan(id, full);
       setRunning("scan");
     } catch (e) {
       setError(String(e));
@@ -116,7 +116,9 @@ export default function Sources() {
         <div className="btn-row">
           <button className="btn" onClick={() => reload(true)}>드라이브 새로고침</button>
           <button className="btn" disabled={!!running} onClick={importCard} title="카메라 SD 카드의 새 사진만 백업 폴더로 복사합니다">⇩ SD 카드에서 가져오기</button>
-          <button className="btn" disabled={!!running || sources.length === 0} onClick={() => scan()} title="바뀐 파일만 다시 읽습니다. 처음 스캔보다 훨씬 빠릅니다.">새 파일 확인</button>
+          <button className="btn" disabled={!!running || sources.length === 0} onClick={() => scan()} title="바뀐 폴더만 확인합니다. 처음 스캔보다 훨씬 빠릅니다.">새 파일 확인</button>
+          <button className="btn ghost" disabled={!!running || sources.length === 0} onClick={() => scan(undefined, true)}
+            title="모든 폴더를 다시 훑습니다. 같은 이름으로 덮어쓴 사진까지 찾습니다 (30일마다 자동으로 한 번).">전체 확인</button>
           <button className="btn primary" onClick={addFolder}>+ 폴더 추가</button>
         </div>
       </header>
