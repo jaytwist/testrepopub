@@ -706,7 +706,16 @@ pub fn apply(db: &Db, kind: &str, group_ids: Option<Vec<i64>>, stop: &StopFlag, 
                 rep.protected += 1;
                 continue;
             }
-            match journal::quarantine(&conn, &batch, f) {
+            // Identical copies remember their kept twin: emptying the quarantine then compares
+            // the two byte for byte before deleting.
+            let twin = (kind == "exact")
+                .then(|| keepers.iter().find(|k| k.volume_id == f.volume_id).or(keepers.first()).map(|k| k.id))
+                .flatten();
+            let res = match twin {
+                Some(t) => journal::quarantine_copy(&conn, &batch, f, t),
+                None => journal::quarantine(&conn, &batch, f),
+            };
+            match res {
                 Ok(()) => {
                     rep.quarantined += 1;
                     rep.bytes += f.size;

@@ -46,7 +46,8 @@ export default function History() {
       <header className="page-head">
         <div>
           <h1>작업 기록 · 되돌리기</h1>
-          <div className="muted">앱이 한 모든 이동·복사·격리는 기록되어 되돌릴 수 있습니다. 중복 정리나 삭제로 지운 파일은 같은 드라이브의 격리 폴더에 보관되며, 「격리함 비우기」를 해야만 실제로 삭제됩니다.</div>
+          <div className="muted">앱이 한 모든 이동·복사·격리는 기록되어 되돌릴 수 있습니다. 중복 정리나 삭제로 지운 파일은 같은 드라이브의 격리 폴더에 보관되며, 「격리함 비우기」를 해야만 실제로 삭제됩니다.
+            (「한 곳으로 정리」에서 한 해씩 Push할 때 지운 사본은 원본과 내용을 비교한 뒤 바로 삭제되어 「격리함 비움」으로 표시됩니다.)</div>
         </div>
       </header>
       {error && <div className="alert bad">{error}</div>}

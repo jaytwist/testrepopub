@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import { confirm, open } from "@tauri-apps/plugin-dialog";
 import {
-  api, fmtBytes, fmtCount,
-  type FolderRule, type ImportSettings, type LibraryOptions, type PlanItem, type PlanView, type TreeNode,
+  api, fmtBytes, fmtCount, thumbUrl,
+  type CopyFolder, type CopyPair, type DiskSpace, type ExecReport, type FolderRule, type ImportSettings, type KeepItem,
+  type LibraryOptions, type PlanView, type TreeNode, type YearBucket,
 } from "../api";
 import { useJob } from "../App";
 
@@ -12,14 +13,29 @@ const TAGS: Record<string, string> = {
   event: "이벤트", trip: "여행", loose: "낱장", received: "받은 사진", screenshot: "스크린샷", undated: "날짜 모름",
   raw: "RAW", live: "Live Photo", edited: "편집본",
 };
-/** Top-level areas that are not years. */
-const AREAS: Record<string, string> = { "받은 사진": "받은 사진", "큰 동영상": "큰 동영상 (2GB 이상)", "_날짜확인필요": "날짜 확인 필요" };
+
+/** The end of a path (last folders and the name), for long paths in narrow rows. */
+function tail(p: string, n = 3): string {
+  const parts = p.split(/[\\/]/).filter(Boolean);
+  return parts.length > n ? `…/${parts.slice(-n).join("/")}` : p;
+}
+
+/** The year a library folder belongs to (same rule as the backend's `year_key`). */
+function yearKey(group: string): string {
+  const segs = group.split("/");
+  let s = segs[0] ?? "";
+  if (s === "받은 사진" || s === "큰 동영상") s = segs[1] ?? "";
+  if (/^\d{4}$/.test(s)) return Number(s) < 2010 ? "before2010" : s;
+  return "undated";
+}
 
 /**
- * "라이브러리로 모으기": every photo and video into one library as year / year-month / event,
- * events named after the folders they came from. The preview is a folder tree; events can be
- * renamed, turned into loose photos or left out before running; one folder can be tried first.
- * Other drives are copied from and left as they are; copies on the library drive are removed.
+ * "라이브러리로 모으기", one year at a time: every photo and video into one library as
+ * year / year-month / event (events named after the folders they came from). Each year shows
+ * where things go, the copies that will be deleted (next to the original kept), and the photos
+ * kept; once confirmed, that year is pushed: copies on the library drive are deleted (after a
+ * byte-for-byte check) to make room, then files are moved, then files only on other drives are
+ * copied in. Other drives are left as they are.
  */
 export default function LibraryPlan() {
   const { running, setRunning, lastDone } = useJob();
@@ -27,13 +43,17 @@ export default function LibraryPlan() {
   const [lib, setLib] = useState<LibraryOptions>(DEFAULT_LIB);
   const [plan, setPlan] = useState<PlanView | null>(null);
   const [tree, setTree] = useState<TreeNode[]>([]);
-  const [removes, setRemoves] = useState<PlanItem[]>([]);
+  const [years, setYears] = useState<YearBucket[]>([]);
+  const [year, setYear] = useState<string | null>(null);
+  const [byCopies, setByCopies] = useState(false);
+  const [space, setSpace] = useState<DiskSpace | null>(null);
   const [rules, setRules] = useState<FolderRule[]>([]);
-  const [open_, setOpen] = useState<Set<string>>(new Set());
   const [renaming, setRenaming] = useState<{ node: TreeNode; name: string } | null>(null);
   const [err, setErr] = useState<string | null>(null);
-  const [result, setResult] = useState<any>(null);
+  const [result, setResult] = useState<{ label: string; rep: ExecReport } | null>(null);
   const [planning, setPlanning] = useState(false);
+  const [quarantineOnly, setQuarantineOnly] = useState(false);
+  const [lastRunYear, setLastRunYear] = useState<string | null>(null);
 
   useEffect(() => {
     api.getImportSettings().then(setSettings).catch((e) => setErr(String(e)));
@@ -46,10 +66,10 @@ export default function LibraryPlan() {
     const m = /^([A-Za-z]:)/.exec(d);
     return m ? m[1].toUpperCase() : "라이브러리 드라이브";
   })();
-  const preview = async (target = settings?.target_dir) => {
+  const preview = async (target = settings?.target_dir, keepResult = false) => {
     if (!target) return pickTarget();
     setErr(null);
-    setResult(null);
+    if (!keepResult) setResult(null);
     setPlanning(true);
     try {
       await api.startPlan({
@@ -71,16 +91,25 @@ export default function LibraryPlan() {
         const p = lastDone.result as PlanView;
         setPlan(p);
         api.planTree(p.id).then(setTree).catch((e) => setErr(String(e)));
-        api.planItems(p.id, "remove", 0, 300).then(setRemoves).catch(() => setRemoves([]));
+        api.libraryYears(p.id).then((ys) => {
+          setYears(ys);
+          // Stay on the chosen year unless it is finished; then the next one with work.
+          setYear((cur) => {
+            const still = ys.find((y) => y.key === cur);
+            if (still && !still.done) return cur;
+            return (ys.find((y) => !y.done) ?? ys[0])?.key ?? null;
+          });
+        }).catch((e) => setErr(String(e)));
+        if (p.options.target_dir) api.diskSpace(p.options.target_dir).then(setSpace).catch(() => setSpace(null));
       } else setErr(lastDone.error ?? "미리보기를 만들지 못했습니다");
     }
     if (lastDone.job === "organize:run") {
       setPlan(null);
       setTree([]);
       if (lastDone.ok) {
-        setResult(lastDone.result);
-        preview(); // what is left (after trying one folder, or nothing)
-      }
+        setResult({ label: lastRunYear ? (years.find((y) => y.key === lastRunYear)?.label ?? "") : "", rep: lastDone.result as ExecReport });
+        preview(undefined, true); // what is left
+      } else setErr(lastDone.error ?? "실행하지 못했습니다");
     }
   }, [lastDone]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -102,40 +131,56 @@ export default function LibraryPlan() {
     preview();
   };
 
-  const run = async (groups?: string[]) => {
+  /** Try one folder first. */
+  const runFolder = async (group: string) => {
     if (!plan) return;
-    const s = plan.summary;
-    const text = groups
-      ? `「${groups[0]}」 폴더만 먼저 정리합니다. 결과를 확인한 뒤 나머지를 실행하세요.`
-      : [
-          `라이브러리(${settings?.target_dir})로 모읍니다.`,
-          `· ${drive} 안에서 옮김 ${fmtCount(s.moves)}개`,
-          s.copies ? `· 다른 드라이브에서 복사 ${fmtCount(s.copies)}개 (${fmtBytes(s.copy_bytes)}) — 원래 자리는 그대로` : "",
-          s.remove ? `· 라이브러리 드라이브 안의 똑같은 사본 ${fmtCount(s.remove)}개 정리 (${fmtBytes(s.remove_bytes)}, 격리)` : "",
-          "",
-          "모든 작업은 「작업 기록」에서 한 번에 되돌릴 수 있습니다.",
-        ].filter(Boolean).join("\n");
-    if (!(await confirm(text, { title: "라이브러리로 모으기", kind: "warning", okLabel: "실행", cancelLabel: "취소" }))) return;
+    const ok = await confirm(`「${group}」 폴더만 먼저 정리합니다. 이 폴더 원본의 ${drive} 사본도 함께 정리됩니다(격리, 되돌리기 가능).`,
+      { title: "이 폴더만 먼저", kind: "warning", okLabel: "실행", cancelLabel: "취소" });
+    if (!ok) return;
     try {
-      await api.startExecute(plan.id, groups);
+      setLastRunYear(null);
+      await api.startExecute(plan.id, [group]);
       setRunning("organize:run");
     } catch (e) {
       setErr(String(e));
     }
   };
 
-  // year / area -> nodes
-  const sections = useMemo(() => {
-    const m = new Map<string, TreeNode[]>();
-    for (const n of tree) {
-      const top = n.group.split("/")[0] || "(라이브러리 바로 아래)";
-      (m.get(top) ?? m.set(top, []).get(top)!).push(n);
+  /** Push one year: delete its copies (checked byte by byte), move, copy in. */
+  const pushYear = async (y: YearBucket) => {
+    if (!plan) return;
+    const purge = !quarantineOnly;
+    const text = [
+      `${y.label} 정리를 시작합니다.`,
+      y.moves ? `· ${drive} 안에서 옮김 ${fmtCount(y.moves)}개` : "",
+      y.copies ? `· 다른 드라이브에서 복사 ${fmtCount(y.copies)}개 (${fmtBytes(y.copy_bytes)}) — 원래 자리는 그대로` : "",
+      y.remove
+        ? purge
+          ? `· ${drive}의 똑같은 사본 ${fmtCount(y.remove)}개 (${fmtBytes(y.remove_bytes)}) 삭제 — 원본과 내용을 끝까지 비교해 같은 것만`
+          : `· ${drive}의 똑같은 사본 ${fmtCount(y.remove)}개 격리함으로 (공간은 「격리함 비우기」 후에 생김)`
+        : "",
+      y.versions ? `· 축소본·재압축본 ${fmtCount(y.versions)}개는 격리함으로 (확인 후 비우기)` : "",
+      "",
+      purge && y.remove ? "삭제한 사본은 되돌릴 수 없습니다. 옮긴 것은 「작업 기록」에서 되돌릴 수 있습니다." : "모든 작업은 「작업 기록」에서 되돌릴 수 있습니다.",
+    ].filter((l, i, a) => l || (i > 0 && a[i - 1])).join("\n");
+    if (!(await confirm(text, { title: `${y.label} Push`, kind: "warning", okLabel: "실행", cancelLabel: "취소" }))) return;
+    try {
+      setLastRunYear(y.key);
+      await api.startExecute(plan.id, undefined, y.key, purge);
+      setRunning("organize:run");
+    } catch (e) {
+      setErr(String(e));
     }
-    const keys = [...m.keys()].sort((a, b) => Number(a in AREAS) - Number(b in AREAS) || b.localeCompare(a));
-    return keys.map((k) => ({ key: k, nodes: m.get(k)!, count: m.get(k)!.reduce((a, n) => a + n.count, 0), todo: m.get(k)!.reduce((a, n) => a + n.moves + n.copies, 0) }));
-  }, [tree]);
-  const toggle = (k: string) => setOpen((o) => { const n = new Set(o); n.has(k) ? n.delete(k) : n.add(k); return n; });
+  };
+
+  const shownYears = useMemo(
+    () => (byCopies ? [...years].sort((a, b) => Number(a.done) - Number(b.done) || b.remove_bytes - a.remove_bytes) : years),
+    [years, byCopies],
+  );
+  const cur = years.find((y) => y.key === year) ?? null;
+  const yearNodes = useMemo(() => (year ? tree.filter((n) => yearKey(n.group) === year) : []), [tree, year]);
   const s = plan?.summary;
+  const todoYears = years.filter((y) => !y.done).length;
 
   return (
     <div className="library-plan">
@@ -170,14 +215,7 @@ export default function LibraryPlan() {
         </div>
       </div>
       {err && <div className="alert bad">{err}</div>}
-      {result && (
-        <div className={`alert ${result.failed ? "bad" : "ok"}`}>
-          완료: 옮김·복사 {fmtCount(result.done)}개 · 함께 옮긴 xmp/aae 등 {fmtCount(result.sidecars ?? 0)}개
-          {result.removed ? ` · 사본 정리 ${fmtCount(result.removed)}개 (${fmtBytes(result.removed_bytes)})` : ""}
-          {result.failed ? ` · 실패 ${result.failed}개` : ""} — 「작업 기록」에서 되돌릴 수 있습니다.
-          {result.errors?.length > 0 && <details><summary>오류 보기</summary><pre>{result.errors.join("\n")}</pre></details>}
-        </div>
-      )}
+      {result && <RunResult label={result.label} rep={result.rep} drive={drive} />}
 
       <div className="btn-row">
         <button className="btn primary" disabled={!!running} onClick={() => preview()}>
@@ -188,99 +226,304 @@ export default function LibraryPlan() {
 
       {s && plan && (
         <div className="plan">
-          <div className="plan-stats">
-            <div className="stat"><b>{fmtCount(s.moves)}</b><span>{drive} 안에서 옮김</span></div>
-            <div className="stat"><b>{fmtCount(s.copies)}</b><span>다른 드라이브에서 복사 ({fmtBytes(s.copy_bytes)})</span></div>
-            <div className="stat"><b>{fmtCount(s.remove)}</b><span>{drive} 사본 정리 ({fmtBytes(s.remove_bytes)})</span></div>
-            <div className="stat"><b>{fmtCount(s.leave)}</b><span>다른 드라이브 사본 그대로</span></div>
-            <div className="stat"><b>{fmtCount(s.in_place)}</b><span>이미 제자리</span></div>
-            <div className="stat"><b>{fmtCount(s.events)}</b><span>이벤트 폴더</span></div>
-            <div className="stat"><b>{fmtCount(s.paired)}</b><span>RAW·Live Photo·편집본 짝</span></div>
-            <div className="stat"><b>{fmtCount(s.received)}</b><span>받은 사진</span></div>
-            <div className="stat"><b>{fmtCount(s.big_videos)}</b><span>큰 동영상</span></div>
-            <div className="stat"><b>{fmtCount(s.uncertain_dates)}</b><span>날짜 확인 필요</span></div>
-            {s.skip_offline > 0 && <div className="stat warn"><b>{fmtCount(s.skip_offline)}</b><span>드라이브 연결 안 됨</span></div>}
-          </div>
+          <SpaceBar space={space} drive={drive} year={cur} purge={!quarantineOnly} />
           {s.leftover_files > 0 && (
-            <div className="alert">사진·동영상이 아닌 파일 {fmtCount(s.leftover_files)}개(문서 등)는 원래 폴더에 그대로 남습니다.</div>
+            <div className="muted small">사진·동영상이 아닌 파일 {fmtCount(s.leftover_files)}개(문서 등)는 원래 폴더에 그대로 남습니다.</div>
           )}
+          {s.skip_offline > 0 && <div className="alert">연결되지 않은 드라이브의 파일 {fmtCount(s.skip_offline)}개는 이번 계획에서 빠졌습니다.</div>}
 
-          <div className="lib-tree">
-            {sections.map((sec) => (
-              <div key={sec.key} className="lib-sec">
-                <button className="lib-sec-head" onClick={() => toggle(sec.key)}>
-                  <span>{open_.has(sec.key) ? "▾" : "▸"}</span>
-                  <b>{AREAS[sec.key] ?? sec.key}</b>
-                  <span className="muted small">{fmtCount(sec.count)}개{sec.todo ? ` · 옮길 것 ${fmtCount(sec.todo)}` : " · 정리됨"}</span>
-                </button>
-                {open_.has(sec.key) && sec.nodes.map((n) => {
-                  const rest = n.group.split("/").slice(1).join("/") || "(바로 아래)";
-                  const isEvent = n.tag === "event" && n.from_dir;
-                  return (
-                    <div key={n.group} className={`lib-node ${n.moves + n.copies === 0 ? "done" : ""}`}>
-                      <div className="lib-node-main">
-                        {renaming?.node.group === n.group ? (
-                          <span className="inline-form">
-                            <input autoFocus value={renaming.name} onChange={(e) => setRenaming({ node: n, name: e.target.value })}
-                              onKeyDown={(e) => { if (e.key === "Enter") saveRule(n, "event", renaming.name.trim() || null); if (e.key === "Escape") setRenaming(null); }} />
-                            <button className="btn small primary" onClick={() => saveRule(n, "event", renaming.name.trim() || null)}>저장</button>
-                          </span>
-                        ) : (
-                          <span className="mono">{rest}</span>
-                        )}
-                        {n.tag && <span className="pill">{TAGS[n.tag] ?? n.tag}</span>}
-                        <span className="muted small">
-                          {fmtCount(n.count)}개
-                          {n.moves ? ` · 옮김 ${fmtCount(n.moves)}` : ""}{n.copies ? ` · 복사 ${fmtCount(n.copies)}` : ""}{n.in_place ? ` · 제자리 ${fmtCount(n.in_place)}` : ""}
-                        </span>
-                        <span className="spacer" />
-                        {isEvent && (
-                          <>
-                            <button className="btn small ghost" onClick={() => setRenaming({ node: n, name: n.event ?? "" })}>이름 바꾸기</button>
-                            <button className="btn small ghost" onClick={() => saveRule(n, "loose")} title="이벤트로 묶지 않고 날짜별 낱장으로">낱장으로</button>
-                            <button className="btn small ghost" onClick={() => saveRule(n, "skip")} title="이 폴더는 옮기지 않음">빼기</button>
-                          </>
-                        )}
-                        {n.moves + n.copies > 0 && (
-                          <button className="btn small" disabled={!!running} onClick={() => run([n.group])}>이 폴더만 먼저</button>
-                        )}
-                      </div>
-                      {n.sources.length > 0 && (
-                        <div className="muted small mono lib-src" title={n.sources.map(([p, c]) => `${p} (${c})`).join("\n")}>
-                          ← {n.sources[0][0]}{n.sources.length > 1 ? ` 외 ${n.sources.length - 1}곳` : ""}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
+          <div className="year-layout">
+            <div className="year-list">
+              <div className="year-list-head">
+                <b>한 해씩 정리</b>
+                <span className="muted small">{todoYears ? `남은 해 ${todoYears}` : "모두 끝남"}</span>
+                <span className="spacer" />
+                <div className="seg">
+                  <button className={!byCopies ? "on" : ""} onClick={() => setByCopies(false)}>연도순</button>
+                  <button className={byCopies ? "on" : ""} onClick={() => setByCopies(true)} title="지울 사본이 많은 해부터 — 공간을 빨리 확보">사본 많은 해부터</button>
+                </div>
               </div>
-            ))}
+              {shownYears.map((y) => (
+                <button key={y.key} className={`year-row ${y.key === year ? "on" : ""} ${y.done ? "done" : ""}`} onClick={() => setYear(y.key)}>
+                  <span className="year-name">{y.done ? "✓ " : ""}{y.label}</span>
+                  <span className="muted small">
+                    원본 {fmtCount(y.keep)} ({fmtBytes(y.keep_bytes)})
+                    {y.remove ? <> · <span className="bad-text">사본 {fmtCount(y.remove)} ({fmtBytes(y.remove_bytes)})</span></> : null}
+                    {y.moves ? ` · 옮김 ${fmtCount(y.moves)}` : ""}
+                    {y.copies ? ` · 복사 ${fmtCount(y.copies)}` : ""}
+                    {y.done ? " · 정리됨" : ""}
+                  </span>
+                </button>
+              ))}
+            </div>
+
+            {cur && (
+              <YearDetail
+                key={`${plan.id}:${cur.key}`}
+                planId={plan.id}
+                y={cur}
+                nodes={yearNodes}
+                drive={drive}
+                running={!!running}
+                renaming={renaming}
+                setRenaming={setRenaming}
+                saveRule={saveRule}
+                runFolder={runFolder}
+                quarantineOnly={quarantineOnly}
+                setQuarantineOnly={setQuarantineOnly}
+                push={() => pushYear(cur)}
+              />
+            )}
           </div>
 
-          {removes.length > 0 && (
-            <details className="lib-removes">
-              <summary>정리될 {drive} 사본 {fmtCount(s.remove)}개 보기 (남는 쪽은 라이브러리로 옮겨짐)</summary>
-              <ul className="mono small">
-                {removes.map((r) => <li key={r.file_id}>{r.src}{r.tag === "version" ? " (축소본·재압축본)" : ""}</li>)}
-              </ul>
-              {s.remove > removes.length && <div className="muted small">처음 {removes.length}개만 표시합니다.</div>}
-            </details>
-          )}
           {rules.length > 0 && (
             <div className="muted small">
               폴더 고침 {rules.length}개 기억 중 ·{" "}
               <button className="link" onClick={async () => { setRules([]); await api.setLibraryRules([]); preview(); }}>모두 지우기</button>
             </div>
           )}
-
-          <div className="btn-row">
-            <button className="btn primary" disabled={!!running || s.moves + s.copies + s.remove === 0} onClick={() => run()}>
-              실행: 옮김 {fmtCount(s.moves)} · 복사 {fmtCount(s.copies)}{s.remove ? ` · 사본 정리 ${fmtCount(s.remove)}` : ""}
-            </button>
-            <span className="muted small">멈추고 싶으면 아래 진행 막대의 「취소」 — 끝난 것까지는 그대로 남고, 다시 미리보기하면 남은 것만 나옵니다.</span>
-          </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function RunResult({ label, rep, drive }: { label: string; rep: ExecReport; drive: string }) {
+  const bad = rep.failed > 0 || rep.purge_kept > 0;
+  return (
+    <div className={`alert ${bad ? "bad" : "ok"}`}>
+      <b>{label ? `${label} 끝남` : "끝남"}</b> — 옮김·복사 {fmtCount(rep.done)}개
+      {rep.purged ? ` · ${drive} 사본 ${fmtCount(rep.purged)}개 삭제 (${fmtBytes(rep.purged_bytes)} 확보)` : ""}
+      {rep.removed - rep.purged - rep.purge_kept - rep.versions > 0 ? ` · 사본 ${fmtCount(rep.removed - rep.purged - rep.purge_kept - rep.versions)}개 격리함으로` : ""}
+      {rep.versions ? ` · 축소본 ${fmtCount(rep.versions)}개 격리함으로 (작업 기록에서 확인 후 비우기)` : ""}
+      {rep.remove_skipped ? ` · 보호된 사본 ${fmtCount(rep.remove_skipped)}개 남김(♥·원본 지정 등)` : ""}
+      {rep.purge_kept ? ` · 내용이 달라 ${fmtCount(rep.purge_kept)}개는 지우지 않고 격리함에 둠` : ""}
+      {rep.space_skipped ? ` · 공간이 모자라 ${fmtCount(rep.space_skipped)}개 (${fmtBytes(rep.space_skipped_bytes)})는 아직 복사 안 함 — 다른 해를 정리한 뒤 다시 실행하세요` : ""}
+      {rep.failed ? ` · 실패 ${fmtCount(rep.failed)}개` : ""}
+      {rep.cancelled ? " · 중간에 멈춤 (다시 실행하면 남은 것만)" : ""}
+      <div className="muted small">옮긴 것은 「작업 기록」에서 되돌릴 수 있습니다.</div>
+      {rep.errors?.length > 0 && <details><summary>자세히 ({rep.errors.length})</summary><pre>{rep.errors.join("\n")}</pre></details>}
+    </div>
+  );
+}
+
+function SpaceBar({ space, drive, year, purge }: { space: DiskSpace | null; drive: string; year: YearBucket | null; purge: boolean }) {
+  if (!space || space.total <= 0) return null;
+  const used = space.total - space.free;
+  const gain = year && purge ? year.remove_bytes : 0;
+  const cost = year ? year.copy_bytes : 0;
+  const after = space.free + gain - cost;
+  const short = year && cost > 0 && cost > space.free + gain - space.reserve;
+  return (
+    <div className="space-bar">
+      <div className="space-line">
+        <b>{drive} 남은 공간 {fmtBytes(space.free)}</b>
+        <span className="muted small">전체 {fmtBytes(space.total)} · 항상 {fmtBytes(space.reserve)}는 비워 둠</span>
+      </div>
+      <div className="space-track"><div style={{ width: `${Math.min(100, (used / space.total) * 100)}%` }} /></div>
+      {year && !year.done && (gain > 0 || cost > 0) && (
+        <div className="small">
+          {year.label}: {gain > 0 && <span className="ok-text">사본 삭제 +{fmtBytes(gain)}</span>}
+          {gain > 0 && cost > 0 && " · "}
+          {cost > 0 && <span>복사 −{fmtBytes(cost)}</span>} → 끝나면 약 <b>{fmtBytes(Math.max(0, after))}</b>
+          {short && <span className="bad-text"> · 공간이 모자라 일부만 복사됩니다 (나머지는 다음에)</span>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+type Tab = "where" | "copies" | "keep";
+
+function YearDetail(props: {
+  planId: string; y: YearBucket; nodes: TreeNode[]; drive: string; running: boolean;
+  renaming: { node: TreeNode; name: string } | null; setRenaming: (r: { node: TreeNode; name: string } | null) => void;
+  saveRule: (n: TreeNode, kind: FolderRule["kind"], name?: string | null) => void; runFolder: (group: string) => void;
+  quarantineOnly: boolean; setQuarantineOnly: (v: boolean) => void; push: () => void;
+}) {
+  const { planId, y, nodes, drive, running, renaming, setRenaming, saveRule, runFolder } = props;
+  const [tab, setTab] = useState<Tab>("where");
+  const work = y.moves + y.copies + y.remove + y.versions;
+  return (
+    <div className="year-detail">
+      <div className="year-detail-head">
+        <h3>{y.label}</h3>
+        <span className="muted small">
+          남는 원본 {fmtCount(y.keep)}개 ({fmtBytes(y.keep_bytes)})
+          {y.in_place ? ` · 이미 제자리 ${fmtCount(y.in_place)}` : ""}
+        </span>
+      </div>
+      <div className="seg">
+        <button className={tab === "where" ? "on" : ""} onClick={() => setTab("where")}>옮길 곳 ({fmtCount(nodes.length)}개 폴더)</button>
+        <button className={tab === "copies" ? "on" : ""} onClick={() => setTab("copies")}>지울 사본 ({fmtCount(y.remove + y.versions)})</button>
+        <button className={tab === "keep" ? "on" : ""} onClick={() => setTab("keep")}>살릴 원본 ({fmtCount(y.keep)})</button>
+      </div>
+
+      {tab === "where" && (
+        <div className="lib-tree">
+          {nodes.length === 0 && <div className="muted small">이 해에는 옮길 폴더가 없습니다.</div>}
+          {nodes.map((n) => {
+            const isEvent = n.tag === "event" && n.from_dir;
+            return (
+              <div key={n.group} className={`lib-node ${n.moves + n.copies === 0 ? "done" : ""}`}>
+                <div className="lib-node-main">
+                  {renaming?.node.group === n.group ? (
+                    <span className="inline-form">
+                      <input autoFocus value={renaming.name} onChange={(e) => setRenaming({ node: n, name: e.target.value })}
+                        onKeyDown={(e) => { if (e.key === "Enter") saveRule(n, "event", renaming.name.trim() || null); if (e.key === "Escape") setRenaming(null); }} />
+                      <button className="btn small primary" onClick={() => saveRule(n, "event", renaming.name.trim() || null)}>저장</button>
+                    </span>
+                  ) : (
+                    <span className="mono">{n.group}</span>
+                  )}
+                  {n.tag && <span className="pill">{TAGS[n.tag] ?? n.tag}</span>}
+                  <span className="muted small">
+                    {fmtCount(n.count)}개
+                    {n.moves ? ` · 옮김 ${fmtCount(n.moves)}` : ""}{n.copies ? ` · 복사 ${fmtCount(n.copies)}` : ""}{n.in_place ? ` · 제자리 ${fmtCount(n.in_place)}` : ""}
+                  </span>
+                  <span className="spacer" />
+                  {isEvent && (
+                    <>
+                      <button className="btn small ghost" onClick={() => setRenaming({ node: n, name: n.event ?? "" })}>이름 바꾸기</button>
+                      <button className="btn small ghost" onClick={() => saveRule(n, "loose")} title="이벤트로 묶지 않고 날짜별 낱장으로">낱장으로</button>
+                      <button className="btn small ghost" onClick={() => saveRule(n, "skip")} title="이 폴더는 옮기지 않음">빼기</button>
+                    </>
+                  )}
+                  {n.moves + n.copies > 0 && (
+                    <button className="btn small" disabled={running} onClick={() => runFolder(n.group)}>이 폴더만 먼저</button>
+                  )}
+                </div>
+                {n.sources.length > 0 && (
+                  <div className="muted small mono lib-src" title={n.sources.map(([p, c]) => `${p} (${c})`).join("\n")}>
+                    ← {n.sources[0][0]}{n.sources.length > 1 ? ` 외 ${n.sources.length - 1}곳` : ""}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+      {tab === "copies" && <CopiesTab planId={planId} year={y.key} drive={drive} />}
+      {tab === "keep" && <KeepTab planId={planId} year={y.key} total={y.keep} />}
+
+      <div className="year-push">
+        {y.done ? (
+          <span className="ok-text">✓ {y.label}은(는) 정리가 끝났습니다.</span>
+        ) : (
+          <>
+            <button className="btn primary" disabled={running || work === 0} onClick={props.push}>
+              {y.label} Push — 정리{y.remove ? "하고 사본 지우기" : "하기"}
+            </button>
+            {y.remove > 0 && (
+              <label className="check-row small">
+                <input type="checkbox" checked={props.quarantineOnly} onChange={(e) => props.setQuarantineOnly(e.target.checked)} />
+                사본은 지우지 말고 격리함에만 두기 (공간이 생기지 않음)
+              </label>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function CopiesTab({ planId, year, drive }: { planId: string; year: string; drive: string }) {
+  const [folders, setFolders] = useState<CopyFolder[] | null>(null);
+  const [openDir, setOpenDir] = useState<string | null>(null);
+  const [pairs, setPairs] = useState<CopyPair[]>([]);
+  const [kept, setKept] = useState<Set<number>>(new Set());
+  useEffect(() => {
+    api.yearCopies(planId, year).then(setFolders).catch(() => setFolders([]));
+  }, [planId, year]);
+  const openFolder = async (dir: string) => {
+    if (openDir === dir) return setOpenDir(null);
+    setOpenDir(dir);
+    setPairs(await api.yearCopyPairs(planId, year, dir, 0, 60).catch(() => []));
+  };
+  const more = async (dir: string) => setPairs([...pairs, ...(await api.yearCopyPairs(planId, year, dir, pairs.length, 60).catch(() => []))]);
+  const keep = async (id: number) => {
+    await api.setOriginal(id).catch(() => {});
+    setKept(new Set(kept).add(id));
+  };
+  if (!folders) return <div className="muted small">불러오는 중…</div>;
+  if (folders.length === 0) return <div className="muted small">이 해에는 지울 사본이 없습니다.</div>;
+  return (
+    <div className="copy-folders">
+      <div className="muted small">
+        {drive} 안에서 원본과 내용이 똑같은 사본입니다. 원래 있던 폴더별로 묶었습니다. 지우기 직전에 원본과 내용을 끝까지 비교하고, 하나라도 다르면 지우지 않습니다.
+      </div>
+      {folders.map((f) => (
+        <div key={f.dir} className="lib-sec">
+          <button className="lib-sec-head" onClick={() => openFolder(f.dir)}>
+            <span>{openDir === f.dir ? "▾" : "▸"}</span>
+            <span className="mono grow ellipsis" title={f.dir}><bdi>{f.dir}</bdi></span>
+            <span className="muted small nowrap">
+              {fmtCount(f.count)}개 · {fmtBytes(f.bytes)}{f.versions ? ` (축소본 ${fmtCount(f.versions)})` : ""}
+            </span>
+          </button>
+          <div className="muted small copy-kept-in">
+            원본은 → {f.kept_in.map(([g, c]) => `${g} (${fmtCount(c)})`).join(", ")}
+          </div>
+          {openDir === f.dir && (
+            <div className="copy-pairs">
+              {pairs.map((p) => (
+                <div key={p.file_id} className={`copy-pair ${kept.has(p.file_id) ? "kept" : ""}`}>
+                  <figure>
+                    <img src={thumbUrl(p.kept_id)} loading="lazy" alt="" />
+                    <figcaption className="ok-text">남길 원본</figcaption>
+                  </figure>
+                  <figure>
+                    <img src={thumbUrl(p.file_id)} loading="lazy" alt="" />
+                    <figcaption className="bad-text">{kept.has(p.file_id) ? "남김" : p.tag === "version" ? "축소본 (격리)" : "지울 사본"}</figcaption>
+                  </figure>
+                  <div className="copy-paths small">
+                    <div className="mono" title={p.src}><span className="muted">사본</span> {tail(p.src)} <span className="muted">({fmtBytes(p.size)})</span></div>
+                    <div className="mono" title={p.kept_src}><span className="muted">원본</span> {tail(p.kept_src)}</div>
+                    {p.kept_dst !== p.kept_src && <div className="mono" title={p.kept_dst}><span className="muted">→ 갈 곳</span> {tail(p.kept_dst, 4)}</div>}
+                  </div>
+                  {!kept.has(p.file_id) && (
+                    <button className="btn small ghost" onClick={() => keep(p.file_id)} title="이 사본도 원본으로 지정해 지우지 않음">이건 남기기</button>
+                  )}
+                </div>
+              ))}
+              {pairs.length < f.count && <button className="btn small" onClick={() => more(f.dir)}>더 보기 ({fmtCount(f.count - pairs.length)}개 남음)</button>}
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function KeepTab({ planId, year, total }: { planId: string; year: string; total: number }) {
+  const [items, setItems] = useState<KeepItem[] | null>(null);
+  useEffect(() => {
+    api.yearKeep(planId, year, 0, 240).then(setItems).catch(() => setItems([]));
+  }, [planId, year]);
+  const more = async () => setItems([...(items ?? []), ...(await api.yearKeep(planId, year, items?.length ?? 0, 240).catch(() => []))]);
+  const groups = useMemo(() => {
+    const m = new Map<string, KeepItem[]>();
+    for (const it of items ?? []) (m.get(it.group) ?? m.set(it.group, []).get(it.group)!).push(it);
+    return [...m.entries()];
+  }, [items]);
+  if (!items) return <div className="muted small">불러오는 중…</div>;
+  return (
+    <div className="keep-tab">
+      {groups.map(([g, its]) => (
+        <div key={g} className="keep-group">
+          <div className="mono small keep-group-head">{g}</div>
+          <div className="keep-grid">
+            {its.map((it) => (
+              <div key={it.file_id} className="keep-tile" title={it.copies ? `사본 ${it.copies}개 정리` : ""}>
+                <img src={thumbUrl(it.file_id)} loading="lazy" alt="" />
+                {it.copies > 0 && <span className="keep-badge">사본 {it.copies}</span>}
+                {it.action === "copy" && <span className="keep-badge copyin">복사</span>}
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+      {items.length < total && <button className="btn small" onClick={more}>더 보기 ({fmtCount(total - items.length)}개 남음)</button>}
     </div>
   );
 }

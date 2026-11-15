@@ -1045,17 +1045,68 @@ fn plan_items(state: State<AppState>, plan_id: String, action: Option<String>, o
 }
 
 #[tauri::command]
-fn start_execute(app: AppHandle, state: State<AppState>, plan_id: String, groups: Option<Vec<String>>) -> CmdResult<()> {
+fn start_execute(
+    app: AppHandle,
+    state: State<AppState>,
+    plan_id: String,
+    groups: Option<Vec<String>>,
+    year: Option<String>,
+    purge: Option<bool>,
+) -> CmdResult<()> {
     let plan = state.plans.lock().unwrap().get(&plan_id).cloned().ok_or("계획이 만료되었습니다. 다시 미리보기를 실행하세요")?;
     spawn_job(&app, &state, "organize:run", move |st, progress| {
-        // Only some folders ("try one first"): the plan is kept for the rest (re-plan after).
-        let r = match &groups {
-            Some(g) => organizer::execute(&st.db, &organizer::subset(&plan, g), &st.stop, progress)?,
-            None => organizer::execute(&st.db, &plan, &st.stop, progress)?,
+        // Only some folders ("try one first") or one year: re-plan afterwards for the rest.
+        let xo = organizer::ExecOptions { purge: purge.unwrap_or(false), label: year.as_deref().map(organizer::year_label) };
+        let part = match (&groups, &year) {
+            (Some(g), _) => organizer::subset(&plan, g),
+            (None, Some(y)) => organizer::subset_year(&plan, y),
+            (None, None) => (*plan).clone(),
         };
+        let r = organizer::execute_with(&st.db, &part, &xo, &st.stop, progress)?;
         st.plans.lock().unwrap().remove(&plan.id);
         Ok(r)
     })
+}
+
+fn with_plan<T>(state: &State<AppState>, plan_id: &str, f: impl FnOnce(&Plan) -> T) -> CmdResult<T> {
+    let plans = state.plans.lock().unwrap();
+    let plan = plans.get(plan_id).ok_or("계획이 만료되었습니다. 다시 미리보기를 실행하세요")?;
+    Ok(f(plan))
+}
+
+/// The library plan by year ("한 해씩").
+#[tauri::command]
+fn library_years(state: State<AppState>, plan_id: String) -> CmdResult<Vec<organizer::YearBucket>> {
+    with_plan(&state, &plan_id, organizer::year_buckets)
+}
+
+#[tauri::command]
+fn year_copies(state: State<AppState>, plan_id: String, year: String) -> CmdResult<Vec<organizer::CopyFolder>> {
+    with_plan(&state, &plan_id, |p| organizer::year_copies(p, &year))
+}
+
+#[tauri::command]
+fn year_copy_pairs(state: State<AppState>, plan_id: String, year: String, dir: String, offset: usize, limit: usize) -> CmdResult<Vec<organizer::CopyPair>> {
+    with_plan(&state, &plan_id, |p| organizer::year_copy_pairs(p, &year, &dir, offset, limit))
+}
+
+#[tauri::command]
+fn year_keep(state: State<AppState>, plan_id: String, year: String, offset: usize, limit: usize) -> CmdResult<Vec<organizer::KeepItem>> {
+    with_plan(&state, &plan_id, |p| organizer::year_keep(p, &year, offset, limit))
+}
+
+#[derive(Serialize)]
+struct DiskSpace {
+    free: u64,
+    total: u64,
+    /// Always left free on the library drive.
+    reserve: u64,
+}
+
+#[tauri::command]
+fn disk_space(path: String) -> CmdResult<Option<DiskSpace>> {
+    Ok(media_core::volumes::disk_space(Path::new(&path))
+        .map(|(free, total)| DiskSpace { free, total, reserve: media_core::volumes::space_reserve(total) }))
 }
 
 /// The library plan as destination folders.
@@ -1327,6 +1378,11 @@ pub fn run() {
             start_undo,
             start_delete,
             start_purge,
+            library_years,
+            year_copies,
+            year_copy_pairs,
+            year_keep,
+            disk_space,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Media Organizer");

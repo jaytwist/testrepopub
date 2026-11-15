@@ -158,7 +158,12 @@ pub fn event_name(folder: &str) -> Option<String> {
     if rest.is_empty() || rest.chars().all(|c| c.is_ascii_digit() || " -_.".contains(c)) {
         return None;
     }
-    if GENERIC.contains(&rest.to_lowercase().as_str()) {
+    let lower = rest.to_lowercase();
+    if GENERIC.contains(&lower.as_str()) {
+        return None;
+    }
+    // "옛날 백업", "Photos backup 2", "사진 복사본": a backup of something, not an event.
+    if ["백업", "backup", "사본", "복사본", "copy", "copies"].iter().any(|w| lower.contains(w)) {
         return None;
     }
     Some(safe_name(rest))
@@ -603,6 +608,9 @@ mod tests {
         assert_eq!(event_name("2019년 5월 12일 생일").as_deref(), Some("생일"));
         assert_eq!(folder_month("2024년 6월 Honolulu 여행"), Some((2024, 6)));
         assert_eq!(folder_month("제주도"), None);
+        assert_eq!(event_name("옛날 백업"), None);
+        assert_eq!(event_name("Photos Backup 2"), None);
+        assert_eq!(event_name("사진 복사본"), None);
         assert_eq!(safe_name("a:b?c."), "a_b_c");
         assert_eq!(safe_name("CON"), "CON_");
         assert_eq!(safe_name(&"가".repeat(80)).chars().count(), 60);

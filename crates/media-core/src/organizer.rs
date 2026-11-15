@@ -362,6 +362,12 @@ pub fn plan(db: &Db, opts: &OrganizeOptions, stop: &StopFlag, progress: Progress
     } else {
         HashMap::new()
     };
+    // Copies the user protected (♥, original, keep folder) stay where they are: not counted as
+    // work, so a year with only those left shows as done.
+    let protected: HashSet<i64> = {
+        let rm: Vec<i64> = placements.iter().filter(|(_, p)| p.act == crate::library::Act::Remove).map(|(id, _)| *id).collect();
+        if rm.is_empty() { HashSet::new() } else { crate::protect::check(&conn, &rm)?.into_iter().map(|b| b.id).collect() }
+    };
     let mut events: HashSet<String> = HashSet::new();
     let mut from_dirs: HashSet<PathBuf> = HashSet::new();
     let mut items = Vec::with_capacity(ids.len());
@@ -399,7 +405,7 @@ pub fn plan(db: &Db, opts: &OrganizeOptions, stop: &StopFlag, progress: Progress
         if library {
             let Some(p) = place else { continue };
             if matches!(p.act, crate::library::Act::Leave | crate::library::Act::Remove) {
-                let remove = p.act == crate::library::Act::Remove;
+                let remove = p.act == crate::library::Act::Remove && !protected.contains(id);
                 if remove {
                     summary.remove += 1;
                     summary.remove_bytes += f.size;
@@ -415,7 +421,7 @@ pub fn plan(db: &Db, opts: &OrganizeOptions, stop: &StopFlag, progress: Progress
                     cross_volume: false,
                     size: f.size,
                     group: String::new(),
-                    tag: p.tag.into(),
+                    tag: if p.act == crate::library::Act::Remove && !remove { "protected".into() } else { p.tag.into() },
                     event: None,
                     from: p.from_dir.clone(),
                     kept: p.kept,
@@ -640,6 +646,10 @@ pub fn subset(plan: &Plan, groups: &[String]) -> Plan {
     let mut items: Vec<PlanItem> = plan.items.iter().filter(|i| matches!(i.action, Action::Move | Action::Copy) && want.contains(i.group.as_str())).cloned().collect();
     let moved: HashSet<i64> = items.iter().map(|i| i.file_id).collect();
     items.extend(plan.items.iter().filter(|i| i.action == Action::Remove && i.kept.is_some_and(|k| moved.contains(&k))).cloned());
+    part_of(plan, items)
+}
+
+fn part_of(plan: &Plan, items: Vec<PlanItem>) -> Plan {
     let mut summary = PlanSummary::default();
     for it in &items {
         match it.action {
@@ -648,11 +658,253 @@ pub fn subset(plan: &Plan, groups: &[String]) -> Plan {
                 summary.copies += 1;
                 summary.copy_bytes += it.size;
             }
-            Action::Remove => summary.remove += 1,
+            Action::Remove => {
+                summary.remove += 1;
+                summary.remove_bytes += it.size;
+            }
             _ => {}
         }
     }
     Plan { id: plan.id.clone(), options: plan.options.clone(), items, summary }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Year by year ("한 해씩"): the library plan split by the year a file lands in
+// ---------------------------------------------------------------------------------------------
+
+/// The year a library folder belongs to: `2015/…`, `받은 사진/2015/…`, `큰 동영상/2015/…` → "2015";
+/// before 2010 → "before2010"; `_날짜확인필요` → "undated".
+pub fn year_key(group: &str) -> String {
+    let mut segs = group.split('/');
+    let mut s = segs.next().unwrap_or("");
+    if s == "받은 사진" || s == "큰 동영상" {
+        s = segs.next().unwrap_or("");
+    }
+    match s.parse::<i32>() {
+        Ok(y) if s.len() == 4 && y < 2010 => "before2010".into(),
+        Ok(_) if s.len() == 4 => s.to_string(),
+        _ => "undated".into(),
+    }
+}
+
+pub fn year_label(key: &str) -> String {
+    match key {
+        "before2010" => "2010년 이전".into(),
+        "undated" => "날짜 모름".into(),
+        y => format!("{y}년"),
+    }
+}
+
+fn year_rank(key: &str) -> (u8, String) {
+    match key {
+        "before2010" => (0, String::new()),
+        "undated" => (2, String::new()),
+        y => (1, y.to_string()),
+    }
+}
+
+/// Year of each planned file: files landing in the library by their folder, copies to remove by
+/// the file kept instead (so a copy shows up with its original, wherever it lies now).
+fn item_years(plan: &Plan) -> HashMap<i64, String> {
+    let mut years: HashMap<i64, String> = plan
+        .items
+        .iter()
+        .filter(|i| matches!(i.action, Action::Move | Action::Copy | Action::InPlace | Action::SkipDuplicate))
+        .map(|i| (i.file_id, year_key(&i.group)))
+        .collect();
+    for it in plan.items.iter().filter(|i| i.action == Action::Remove) {
+        let y = it.kept.and_then(|k| years.get(&k).cloned()).unwrap_or_else(|| "undated".into());
+        years.insert(it.file_id, y);
+    }
+    years
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct YearBucket {
+    pub key: String,
+    pub label: String,
+    /// Files the library keeps for this year (moved, copied in, or already in place).
+    pub keep: u64,
+    pub keep_bytes: i64,
+    pub moves: u64,
+    pub copies: u64,
+    pub copy_bytes: i64,
+    pub in_place: u64,
+    /// Identical copies on the library drive, deleted after a byte-for-byte check.
+    pub remove: u64,
+    pub remove_bytes: i64,
+    /// Resized / recompressed versions: quarantined for a look (not deleted right away).
+    pub versions: u64,
+    pub versions_bytes: i64,
+    /// Nothing left to do this year.
+    pub done: bool,
+}
+
+pub fn year_buckets(plan: &Plan) -> Vec<YearBucket> {
+    let years = item_years(plan);
+    let mut out: HashMap<String, YearBucket> = HashMap::new();
+    for it in &plan.items {
+        let Some(y) = years.get(&it.file_id) else { continue };
+        let b = out.entry(y.clone()).or_insert_with(|| YearBucket { key: y.clone(), label: year_label(y), ..Default::default() });
+        match it.action {
+            Action::Move | Action::Copy | Action::InPlace | Action::SkipDuplicate => {
+                b.keep += 1;
+                b.keep_bytes += it.size;
+                match it.action {
+                    Action::Move => b.moves += 1,
+                    Action::Copy => {
+                        b.copies += 1;
+                        b.copy_bytes += it.size;
+                    }
+                    _ => b.in_place += 1,
+                }
+            }
+            Action::Remove if it.tag == "version" => {
+                b.versions += 1;
+                b.versions_bytes += it.size;
+            }
+            Action::Remove => {
+                b.remove += 1;
+                b.remove_bytes += it.size;
+            }
+            _ => {}
+        }
+    }
+    let mut v: Vec<YearBucket> = out
+        .into_values()
+        .map(|mut b| {
+            b.done = b.moves + b.copies + b.remove + b.versions == 0;
+            b
+        })
+        .collect();
+    v.sort_by_key(|b| year_rank(&b.key));
+    v
+}
+
+/// One year of the plan: what lands in that year's folders and the copies of those files.
+pub fn subset_year(plan: &Plan, key: &str) -> Plan {
+    let years = item_years(plan);
+    let items: Vec<PlanItem> = plan
+        .items
+        .iter()
+        .filter(|i| matches!(i.action, Action::Move | Action::Copy | Action::Remove) && years.get(&i.file_id).is_some_and(|y| y == key))
+        .cloned()
+        .collect();
+    part_of(plan, items)
+}
+
+/// Copies to remove in one year, by the folder they are in now.
+#[derive(Clone, Debug, Serialize)]
+pub struct CopyFolder {
+    pub dir: String,
+    pub count: u64,
+    pub bytes: i64,
+    pub versions: u64,
+    /// Library folders their originals go to (most first, at most 3).
+    pub kept_in: Vec<(String, u64)>,
+}
+
+/// A copy and the original kept instead.
+#[derive(Clone, Debug, Serialize)]
+pub struct CopyPair {
+    pub file_id: i64,
+    pub src: String,
+    pub size: i64,
+    /// "copy" (identical) or "version" (resized / recompressed).
+    pub tag: String,
+    pub kept_id: i64,
+    /// Where the original is now, and where it goes in the library.
+    pub kept_src: String,
+    pub kept_dst: String,
+}
+
+fn parent_of(p: &str) -> String {
+    Path::new(p).parent().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+pub fn year_copies(plan: &Plan, key: &str) -> Vec<CopyFolder> {
+    let part = subset_year(plan, key);
+    let groups: HashMap<i64, &str> = plan.items.iter().map(|i| (i.file_id, i.group.as_str())).collect();
+    let mut by_dir: HashMap<String, (CopyFolder, HashMap<String, u64>)> = HashMap::new();
+    for it in part.items.iter().filter(|i| i.action == Action::Remove) {
+        let dir = parent_of(&it.src);
+        let e = by_dir
+            .entry(dir.clone())
+            .or_insert_with(|| (CopyFolder { dir, count: 0, bytes: 0, versions: 0, kept_in: Vec::new() }, HashMap::new()));
+        e.0.count += 1;
+        e.0.bytes += it.size;
+        if it.tag == "version" {
+            e.0.versions += 1;
+        }
+        if let Some(g) = it.kept.and_then(|k| groups.get(&k)) {
+            *e.1.entry(g.to_string()).or_default() += 1;
+        }
+    }
+    let mut out: Vec<CopyFolder> = by_dir
+        .into_values()
+        .map(|(mut f, kept)| {
+            let mut k: Vec<(String, u64)> = kept.into_iter().collect();
+            k.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            k.truncate(3);
+            f.kept_in = k;
+            f
+        })
+        .collect();
+    out.sort_by(|a, b| b.bytes.cmp(&a.bytes).then(a.dir.cmp(&b.dir)));
+    out
+}
+
+pub fn year_copy_pairs(plan: &Plan, key: &str, dir: &str, offset: usize, limit: usize) -> Vec<CopyPair> {
+    let part = subset_year(plan, key);
+    let by_id: HashMap<i64, &PlanItem> = plan.items.iter().map(|i| (i.file_id, i)).collect();
+    part.items
+        .iter()
+        .filter(|i| i.action == Action::Remove && parent_of(&i.src) == dir)
+        .skip(offset)
+        .take(limit)
+        .filter_map(|i| {
+            let k = by_id.get(&i.kept?)?;
+            Some(CopyPair {
+                file_id: i.file_id,
+                src: i.src.clone(),
+                size: i.size,
+                tag: i.tag.clone(),
+                kept_id: k.file_id,
+                kept_src: k.src.clone(),
+                kept_dst: if k.dst.is_empty() { k.src.clone() } else { k.dst.clone() },
+            })
+        })
+        .collect()
+}
+
+/// Files the library keeps for one year, by library folder (for the thumbnails), with how many
+/// copies of each go.
+#[derive(Clone, Debug, Serialize)]
+pub struct KeepItem {
+    pub file_id: i64,
+    pub group: String,
+    pub action: Action,
+    pub copies: u32,
+}
+
+pub fn year_keep(plan: &Plan, key: &str, offset: usize, limit: usize) -> Vec<KeepItem> {
+    let mut copies: HashMap<i64, u32> = HashMap::new();
+    for it in plan.items.iter().filter(|i| i.action == Action::Remove) {
+        if let Some(k) = it.kept {
+            *copies.entry(k).or_default() += 1;
+        }
+    }
+    let mut v: Vec<&PlanItem> = plan
+        .items
+        .iter()
+        .filter(|i| matches!(i.action, Action::Move | Action::Copy | Action::InPlace | Action::SkipDuplicate) && year_key(&i.group) == key)
+        .collect();
+    v.sort_by(|a, b| a.group.cmp(&b.group).then(a.dst.cmp(&b.dst)));
+    v.into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|i| KeepItem { file_id: i.file_id, group: i.group.clone(), action: i.action, copies: copies.get(&i.file_id).copied().unwrap_or(0) })
+        .collect()
 }
 
 impl FileRow {
@@ -675,15 +927,58 @@ pub struct ExecReport {
     pub bytes: i64,
     /// Sidecar files (.xmp / .aae / .thm / .json) moved or copied with their photo.
     pub sidecars: u64,
-    /// Library: copies on the library drive quarantined, and ones kept (twin not in place, or protected).
+    /// Library: copies on the library drive taken away (quarantined), and ones kept (twin not in
+    /// place, or protected).
     pub removed: u64,
     pub removed_bytes: i64,
     pub remove_skipped: u64,
+    /// History entries of the copies (identical, deleted when `purge`) and of the resized /
+    /// recompressed versions (quarantined for a look). Empty when there were none.
+    pub copies_batch: String,
+    pub versions_batch: String,
+    pub versions: u64,
+    /// Identical copies deleted for good after a byte-for-byte check, and ones left in the
+    /// quarantine because the check failed.
+    pub purged: u64,
+    pub purged_bytes: i64,
+    pub purge_kept: u64,
+    /// Copies from other drives not made for lack of room (planning again lists them).
+    pub space_skipped: u64,
+    pub space_skipped_bytes: i64,
     pub errors: Vec<String>,
     pub cancelled: bool,
 }
 
+fn human_bytes(b: i64) -> String {
+    let b = b.max(0) as f64;
+    if b >= 1e9 {
+        format!("{:.1} GB", b / 1e9)
+    } else if b >= 1e6 {
+        format!("{:.0} MB", b / 1e6)
+    } else {
+        format!("{:.0} KB", b / 1e3)
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ExecOptions {
+    /// Delete identical copies for good (after comparing each with its kept twin), so the room
+    /// is free right away.
+    pub purge: bool,
+    /// Names the history entries ("2015년").
+    pub label: Option<String>,
+}
+
 pub fn execute(db: &Db, plan: &Plan, stop: &StopFlag, progress: ProgressFn) -> Result<ExecReport> {
+    execute_with(db, plan, &ExecOptions::default(), stop, progress)
+}
+
+/// Run a plan. Library plans go in this order, so the room copies need is made first:
+/// 1. copies on the library drive are taken away (their own history entry; deleted for good
+///    after a byte check when `purge`), 2. files on the library drive are moved (renames: no
+///    room needed), 3. files only on other drives are copied in, as far as the room goes.
+pub fn execute_with(db: &Db, plan: &Plan, xo: &ExecOptions, stop: &StopFlag, progress: ProgressFn) -> Result<ExecReport> {
     let conn = db.conn()?;
     volumes::refresh(&conn)?;
     std::fs::create_dir_all(plan.options.target_dir.trim())?;
@@ -693,40 +988,127 @@ pub fn execute(db: &Db, plan: &Plan, stop: &StopFlag, progress: ProgressFn) -> R
     let tvol = volumes::identify(&target)?;
     let tvol_id = volumes::upsert(&conn, &tvol)?;
 
-    let work: Vec<&PlanItem> = plan.items.iter().filter(|i| matches!(i.action, Action::Move | Action::Copy)).collect();
-    // Copies from other drives need room on the library drive (with a little margin).
-    if plan.summary.copy_bytes > 0 {
-        if let Some(free) = volumes::free_space(&target) {
-            let need = plan.summary.copy_bytes as u64 + 512 * 1024 * 1024;
-            if free < need {
-                bail!(
-                    "공간이 부족합니다: 복사할 {:.1} GB, 남은 공간 {:.1} GB",
-                    plan.summary.copy_bytes as f64 / 1e9,
-                    free as f64 / 1e9
-                );
-            }
-        }
-    }
+    // Moves first (renames on the library drive), then copies from other drives.
+    let mut work: Vec<&PlanItem> = plan.items.iter().filter(|i| matches!(i.action, Action::Move | Action::Copy)).collect();
+    work.sort_by_key(|i| i.action == Action::Copy);
     let library = plan.options.layout == "library";
+    let prefix = xo.label.as_deref().map(|l| format!("{l} ")).unwrap_or_default();
     let what = if library {
-        let n = |a: Action| plan.items.iter().filter(|i| i.action == a).count();
-        let parts: Vec<String> = [("이동", n(Action::Move)), ("복사", n(Action::Copy)), ("사본 정리", n(Action::Remove))]
+        let n = |a: Action| work.iter().filter(|i| i.action == a).count();
+        let parts: Vec<String> = [("이동", n(Action::Move)), ("복사", n(Action::Copy))]
             .iter()
             .filter(|(_, c)| *c > 0)
             .map(|(w, c)| format!("{w} {c}"))
             .collect();
-        format!("라이브러리로 모으기 → {} ({})", target.display(), parts.join(" · "))
+        format!("{prefix}라이브러리로 모으기 → {} ({})", target.display(), parts.join(" · "))
     } else {
         let verb = if plan.options.mode == Mode::Move { "이동" } else { "복사" };
         format!("{} → {} ({}개 {verb})", plan.options.template, target.display(), work.len())
     };
-    let batch = journal::new_batch(&conn, "organize", &what)?;
-    let mut rep = ExecReport { batch_id: batch.clone(), ..Default::default() };
-    // Folder listings for finding sidecars (one read per source folder).
-    let mut listings: HashMap<PathBuf, Vec<String>> = HashMap::new();
+    let mut rep = ExecReport::default();
     let mut touched_dirs: HashSet<PathBuf> = HashSet::new();
     let source_roots: Vec<PathBuf> = db::list_sources(&conn)?.into_iter().map(|s| PathBuf::from(s.abs_path)).collect();
+
+    // 1. Copies on the library drive, while their kept twin is surely in place (before anything
+    //    moves). Protected files (♥, original, keep folders) stay.
+    let removes: Vec<&PlanItem> = plan.items.iter().filter(|i| i.action == Action::Remove).collect();
+    if !removes.is_empty() {
+        let ids: Vec<i64> = removes.iter().map(|i| i.file_id).collect();
+        let protected: HashSet<i64> = crate::protect::check(&conn, &ids)?.into_iter().map(|b| b.id).collect();
+        let copies_batch = journal::new_batch(&conn, "copies", &format!("{prefix}사본 정리"))?;
+        let versions_batch = journal::new_batch(&conn, "copies", &format!("{prefix}축소본 격리 (확인 후 비우기)"))?;
+        let (mut copy_n, mut copy_bytes, mut ver_n, mut ver_bytes) = (0u64, 0i64, 0u64, 0i64);
+        let total = removes.len() as u64;
+        for (i, it) in removes.into_iter().enumerate() {
+            if stop.is_stopped() {
+                rep.cancelled = true;
+                break;
+            }
+            if i % 20 == 0 {
+                progress(Progress::new("organize:run", "copies", i as u64, total, it.src.clone()));
+            }
+            let kept_ok = it
+                .kept
+                .and_then(|k| db::get_file(&conn, k).ok().flatten())
+                .is_some_and(|k| !k.missing && !k.quarantined && k.abs_path().is_file());
+            if !kept_ok || protected.contains(&it.file_id) {
+                rep.remove_skipped += 1;
+                continue;
+            }
+            let Some(f) = db::get_file(&conn, it.file_id)? else { continue };
+            if f.quarantined || f.missing || !f.online {
+                continue;
+            }
+            let version = it.tag == "version";
+            let res = match (version, it.kept) {
+                (false, Some(k)) => journal::quarantine_copy(&conn, &copies_batch, &f, k),
+                _ => journal::quarantine(&conn, &versions_batch, &f),
+            };
+            match res {
+                Ok(()) => {
+                    rep.removed += 1;
+                    rep.removed_bytes += f.size;
+                    if version {
+                        ver_n += 1;
+                        ver_bytes += f.size;
+                    } else {
+                        copy_n += 1;
+                        copy_bytes += f.size;
+                    }
+                    if let Some(p) = f.abs_path().parent() {
+                        touched_dirs.insert(p.to_path_buf());
+                    }
+                }
+                Err(e) => {
+                    if rep.errors.len() < 200 {
+                        rep.errors.push(format!("{}: {e}", it.src));
+                    }
+                }
+            }
+        }
+        rep.versions = ver_n;
+        for (b, n, bytes, name) in [(&copies_batch, copy_n, copy_bytes, "사본 정리"), (&versions_batch, ver_n, ver_bytes, "축소본 격리 (확인 후 비우기)")] {
+            journal::finish_batch(&conn, b)?;
+            if n == 0 {
+                conn.execute("DELETE FROM batches WHERE id = ?", [b])?;
+            } else {
+                conn.execute(
+                    "UPDATE batches SET description = ? WHERE id = ?",
+                    rusqlite::params![format!("{prefix}{name} {n}개 ({})", human_bytes(bytes)), b],
+                )?;
+            }
+        }
+        if copy_n > 0 {
+            rep.copies_batch = copies_batch.clone();
+        }
+        if ver_n > 0 {
+            rep.versions_batch = versions_batch;
+        }
+        // Deleted for good, each after a byte-for-byte comparison with the file kept instead.
+        if xo.purge && copy_n > 0 && !rep.cancelled {
+            let pr = journal::purge_batch_with(&conn, &copies_batch, stop, &|p: Progress| {
+                progress(Progress::new("organize:run", "verify", p.done, p.total, p.message.clone()))
+            })?;
+            rep.purged = pr.deleted;
+            rep.purged_bytes = pr.bytes;
+            rep.purge_kept = pr.kept + pr.failed;
+            rep.cancelled |= pr.cancelled;
+            for e in pr.errors {
+                if rep.errors.len() < 200 {
+                    rep.errors.push(e);
+                }
+            }
+        }
+    }
+
+    let batch = journal::new_batch(&conn, "organize", &what)?;
+    rep.batch_id = batch.clone();
+    // Folder listings for finding sidecars (one read per source folder).
+    let mut listings: HashMap<PathBuf, Vec<String>> = HashMap::new();
     let total = work.len() as u64;
+    // Room for copies from other drives: measured once they start (after the copies above were
+    // deleted), always leaving a reserve free.
+    let mut room: Option<i64> = None;
 
     // Index updates are committed every few hundred files instead of one by one (much faster on
     // big libraries). A crash loses at most that many index updates; the next scan recognises
@@ -742,6 +1124,18 @@ pub fn execute(db: &Db, plan: &Plan, stop: &StopFlag, progress: ProgressFn) -> R
         }
         if i > 0 && i % 200 == 0 {
             conn.execute_batch("COMMIT; BEGIN")?;
+        }
+        if it.action == Action::Copy {
+            let left = room.get_or_insert_with(|| match volumes::disk_space(&target) {
+                Some((free, total)) => free as i64 - volumes::space_reserve(total) as i64,
+                None => i64::MAX,
+            });
+            if it.size > *left {
+                rep.space_skipped += 1;
+                rep.space_skipped_bytes += it.size;
+                continue;
+            }
+            *left -= it.size;
         }
         let res: Result<()> = (|| {
             let Some(f) = db::get_file(&conn, it.file_id)? else { bail!("인덱스에서 사라짐") };
@@ -804,41 +1198,6 @@ pub fn execute(db: &Db, plan: &Plan, stop: &StopFlag, progress: ProgressFn) -> R
         }
     }
     conn.execute_batch("COMMIT")?;
-    // Copies on the library drive: removed (quarantined, in this same undoable batch) once the
-    // kept twin is really in place. Protected files (♥, original, keep folders) stay.
-    let removes: Vec<&PlanItem> = plan.items.iter().filter(|i| i.action == Action::Remove).collect();
-    if !removes.is_empty() && !rep.cancelled {
-        let ids: Vec<i64> = removes.iter().map(|i| i.file_id).collect();
-        let protected: HashSet<i64> = crate::protect::check(&conn, &ids)?.into_iter().map(|b| b.id).collect();
-        for it in removes {
-            let kept_ok = it
-                .kept
-                .and_then(|k| db::get_file(&conn, k).ok().flatten())
-                .is_some_and(|k| !k.missing && !k.quarantined && k.abs_path().is_file());
-            if !kept_ok || protected.contains(&it.file_id) {
-                rep.remove_skipped += 1;
-                continue;
-            }
-            let Some(f) = db::get_file(&conn, it.file_id)? else { continue };
-            if f.quarantined || f.missing || !f.online {
-                continue;
-            }
-            match journal::quarantine(&conn, &batch, &f) {
-                Ok(()) => {
-                    rep.removed += 1;
-                    rep.removed_bytes += f.size;
-                    if let Some(p) = f.abs_path().parent() {
-                        touched_dirs.insert(p.to_path_buf());
-                    }
-                }
-                Err(e) => {
-                    if rep.errors.len() < 200 {
-                        rep.errors.push(format!("{}: {e}", it.src));
-                    }
-                }
-            }
-        }
-    }
     if plan.options.remove_empty_dirs {
         for d in touched_dirs {
             // Never remove a source root itself or anything above it.
@@ -848,6 +1207,9 @@ pub fn execute(db: &Db, plan: &Plan, stop: &StopFlag, progress: ProgressFn) -> R
         }
     }
     journal::finish_batch(&conn, &batch)?;
+    if work.is_empty() {
+        conn.execute("DELETE FROM batches WHERE id = ? AND op_count = 0", [&batch])?;
+    }
     progress(Progress::new("organize:run", "done", total, total, ""));
     Ok(rep)
 }

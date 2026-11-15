@@ -121,6 +121,9 @@ fn library_layout_end_to_end() {
     let undo = journal::undo_batch(&conn, &rep.batch_id).unwrap();
     assert_eq!(undo.failed, 0, "{undo:?}");
     assert!(e.join("옛날/2023-12-28 유럽 여행/파리/a1.jpg").is_file());
+    // Copies taken away have their own history entry.
+    let undo = journal::undo_batch(&conn, &rep.copies_batch).unwrap();
+    assert_eq!(undo.failed, 0, "{undo:?}");
     assert!(e.join("옛날/backup/a1 copy.jpg").is_file());
     assert!(e.join("DCIM/100CANON/IMG_1.xmp").is_file());
     assert!(!lib.join("2022/2022-02/c_only.jpg").exists());

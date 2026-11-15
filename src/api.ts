@@ -162,6 +162,20 @@ export interface TreeNode {
   group: string; event: string | null; tag: string; count: number; bytes: number; moves: number; copies: number; in_place: number;
   vol: number; from_dir: string; sources: [string, number][];
 }
+/** One year of the library plan ("한 해씩"). */
+export interface YearBucket {
+  key: string; label: string; keep: number; keep_bytes: number; moves: number; copies: number; copy_bytes: number;
+  in_place: number; remove: number; remove_bytes: number; versions: number; versions_bytes: number; done: boolean;
+}
+export interface CopyFolder { dir: string; count: number; bytes: number; versions: number; kept_in: [string, number][] }
+export interface CopyPair { file_id: number; src: string; size: number; tag: string; kept_id: number; kept_src: string; kept_dst: string }
+export interface KeepItem { file_id: number; group: string; action: PlanItem["action"]; copies: number }
+export interface DiskSpace { free: number; total: number; reserve: number }
+export interface ExecReport {
+  batch_id: string; done: number; failed: number; bytes: number; sidecars: number; removed: number; removed_bytes: number;
+  remove_skipped: number; copies_batch: string; versions_batch: string; versions: number; purged: number; purged_bytes: number;
+  purge_kept: number; space_skipped: number; space_skipped_bytes: number; errors: string[]; cancelled: boolean;
+}
 export interface FolderRule { volume_id: number; rel_dir: string; kind: "event" | "loose" | "skip"; name: string | null }
 export interface PlanView { id: string; summary: PlanSummary; options: OrganizeOptions }
 export interface PlanItem {
@@ -274,7 +288,14 @@ export const api = {
   planItems: (planId: string, action: string | null, offset: number, limit: number) =>
     invoke<PlanItem[]>("plan_items", { planId, action, offset, limit }),
   /** Run a plan; `groups` runs only those destination folders (try one first). */
-  startExecute: (planId: string, groups?: string[]) => invoke<void>("start_execute", { planId, groups: groups ?? null }),
+  startExecute: (planId: string, groups?: string[], year?: string, purge?: boolean) =>
+    invoke<void>("start_execute", { planId, groups: groups ?? null, year: year ?? null, purge: purge ?? null }),
+  libraryYears: (planId: string) => invoke<YearBucket[]>("library_years", { planId }),
+  yearCopies: (planId: string, year: string) => invoke<CopyFolder[]>("year_copies", { planId, year }),
+  yearCopyPairs: (planId: string, year: string, dir: string, offset: number, limit: number) =>
+    invoke<CopyPair[]>("year_copy_pairs", { planId, year, dir, offset, limit }),
+  yearKeep: (planId: string, year: string, offset: number, limit: number) => invoke<KeepItem[]>("year_keep", { planId, year, offset, limit }),
+  diskSpace: (path: string) => invoke<DiskSpace | null>("disk_space", { path }),
   planTree: (planId: string) => invoke<TreeNode[]>("plan_tree", { planId }),
   getLibraryRules: () => invoke<FolderRule[]>("get_library_rules"),
   setLibraryRules: (rules: FolderRule[]) => invoke<void>("set_library_rules", { rules }),

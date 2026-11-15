@@ -540,3 +540,46 @@ kbd { font: 11px/1 ui-monospace, Consolas, monospace; border: 1px solid var(--li
 .lib-node-main .spacer { flex: 1; }
 .lib-src { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .lib-removes ul { max-height: 240px; overflow: auto; margin: 6px 0; }
+
+/* Library, one year at a time */
+.ok-text { color: var(--ok); }
+.bad-text { color: var(--bad); }
+.ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.nowrap { white-space: nowrap; }
+.space-bar { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); padding: 10px 14px; margin-bottom: 12px; display: flex; flex-direction: column; gap: 6px; }
+.space-line { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.space-track { height: 8px; border-radius: 4px; background: var(--panel-2); overflow: hidden; }
+.space-track > div { height: 100%; background: var(--accent); }
+.year-layout { display: grid; grid-template-columns: minmax(220px, 280px) 1fr; gap: 14px; align-items: start; margin: 10px 0; }
+@media (max-width: 900px) { .year-layout { grid-template-columns: 1fr; } }
+.year-list { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); display: flex; flex-direction: column; overflow: hidden; position: sticky; top: 8px; max-height: calc(100vh - 40px); overflow-y: auto; }
+.year-list-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 10px 12px; border-bottom: 1px solid var(--line); }
+.year-list-head .spacer { flex: 1; }
+.year-list-head .seg button { padding: 3px 8px; font-size: 12px; }
+.year-row { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 8px 12px; border: 0; border-bottom: 1px solid var(--line); background: transparent; color: inherit; cursor: pointer; text-align: left; }
+.year-row:hover { background: var(--panel-2); }
+.year-row.on { background: var(--accent-soft); }
+.year-row.done .year-name { color: var(--ok); }
+.year-name { font-weight: 600; }
+.year-detail { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.year-detail-head { display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; }
+.year-detail-head h3 { margin: 0; }
+.year-detail .lib-node { padding-left: 12px; }
+.year-push { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; border-top: 1px solid var(--line); padding-top: 10px; position: sticky; bottom: 0; background: var(--panel); }
+.copy-folders { display: flex; flex-direction: column; gap: 6px; }
+.copy-kept-in { padding: 0 12px 8px 34px; }
+.copy-pairs { display: flex; flex-direction: column; gap: 6px; padding: 0 12px 10px; }
+.copy-pair { display: grid; grid-template-columns: 84px 84px 1fr auto; gap: 10px; align-items: center; border-top: 1px solid var(--line); padding-top: 6px; }
+.copy-pair.kept { opacity: 0.6; }
+.copy-pair figure { margin: 0; display: flex; flex-direction: column; align-items: center; gap: 2px; font-size: 11px; }
+.copy-pair img { width: 84px; height: 64px; object-fit: cover; border-radius: 6px; background: var(--panel-2); }
+.copy-paths { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.copy-paths > div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 640px) { .copy-pair { grid-template-columns: 64px 64px 1fr; } .copy-pair img { width: 64px; height: 48px; } .copy-pair > button { grid-column: 1 / -1; justify-self: start; } }
+.keep-tab { display: flex; flex-direction: column; gap: 10px; }
+.keep-group-head { margin-bottom: 4px; }
+.keep-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 4px; }
+.keep-tile { position: relative; aspect-ratio: 4 / 3; border-radius: 6px; overflow: hidden; background: var(--panel-2); }
+.keep-tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.keep-badge { position: absolute; left: 4px; bottom: 4px; font-size: 10px; padding: 1px 5px; border-radius: 4px; background: var(--bad); color: #fff; }
+.keep-badge.copyin { left: auto; right: 4px; background: var(--accent); }

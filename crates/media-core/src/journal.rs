@@ -192,6 +192,16 @@ pub fn move_sidecar(conn: &Connection, batch: &str, file_id: i64, src: &Path, ds
 
 /// Soft-delete one indexed file into its volume's quarantine folder.
 pub fn quarantine(conn: &Connection, batch: &str, file: &db::FileRow) -> Result<()> {
+    quarantine_rec(conn, batch, file, None)
+}
+
+/// Quarantine a copy whose identical twin `twin` stays. The twin is remembered so that emptying
+/// the quarantine deletes the copy only after comparing it with the twin byte for byte.
+pub fn quarantine_copy(conn: &Connection, batch: &str, file: &db::FileRow, twin: i64) -> Result<()> {
+    quarantine_rec(conn, batch, file, Some(twin))
+}
+
+fn quarantine_rec(conn: &Connection, batch: &str, file: &db::FileRow, twin: Option<i64>) -> Result<()> {
     if !file.online {
         bail!("드라이브가 연결되어 있지 않습니다: {}", file.name);
     }
@@ -206,8 +216,41 @@ pub fn quarantine(conn: &Connection, batch: &str, file: &db::FileRow) -> Result<
     }
     fs::rename(&src, &dst).with_context(|| format!("quarantine {}", src.display()))?;
     conn.execute("UPDATE files SET quarantined = 1 WHERE id = ?", [file.id])?;
-    record(conn, batch, "quarantine", file.id, &src, &dst, file.volume_id, &file.rel_path, file.volume_id, &file.rel_path, None)?;
+    record(conn, batch, "quarantine", file.id, &src, &dst, file.volume_id, &file.rel_path, file.volume_id, &file.rel_path, twin)?;
     Ok(())
+}
+
+/// Whether two files hold the same bytes (compared block by block, stopping at the first
+/// difference).
+pub fn same_content(a: &Path, b: &Path) -> Result<bool> {
+    let (ma, mb) = (fs::metadata(a)?, fs::metadata(b)?);
+    if ma.len() != mb.len() {
+        return Ok(false);
+    }
+    let (mut fa, mut fb) = (fs::File::open(a)?, fs::File::open(b)?);
+    let (mut ba, mut bb) = (vec![0u8; 1 << 20], vec![0u8; 1 << 20]);
+    loop {
+        let n = read_full(&mut fa, &mut ba)?;
+        let m = read_full(&mut fb, &mut bb)?;
+        if n != m || ba[..n] != bb[..m] {
+            return Ok(false);
+        }
+        if n == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+fn read_full(f: &mut fs::File, buf: &mut [u8]) -> Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = f.read(&mut buf[filled..])?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    Ok(filled)
 }
 
 /// Move an indexed file to `dst` (absolute) and update its index row.
@@ -415,19 +458,65 @@ pub fn undo_batch(conn: &Connection, batch_id: &str) -> Result<UndoReport> {
 
 /// Permanently delete quarantined files of a batch. This is the only irreversible action.
 pub fn purge_batch(conn: &Connection, batch_id: &str) -> Result<UndoReport> {
-    let entries: Vec<(i64, i64, String)> = {
-        let mut st = conn.prepare("SELECT id, file_id, dst_abs FROM journal WHERE batch_id = ? AND op = 'quarantine' AND undone = 0")?;
-        let rows = st.query_map([batch_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+    let r = purge_batch_with(conn, batch_id, &crate::StopFlag::new(), &|_| {})?;
+    let mut errors = r.errors;
+    if r.kept > 0 {
+        errors.insert(0, format!("원본과 내용이 달라(또는 원본이 없어) {}개는 격리함에 남겨 두었습니다", r.kept));
+    }
+    Ok(UndoReport { restored: r.deleted, failed: r.failed + r.kept, errors })
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct PurgeReport {
+    pub deleted: u64,
+    pub bytes: i64,
+    /// Copies left in the quarantine: their twin is gone or not byte-identical.
+    pub kept: u64,
+    pub failed: u64,
+    pub errors: Vec<String>,
+    pub cancelled: bool,
+}
+
+/// Permanently delete a batch's quarantined files. A copy quarantined with its twin
+/// (`quarantine_copy`) is deleted only if the twin is still there with exactly the same bytes.
+/// Deleted entries leave the journal's undo list; the batch counts as emptied once nothing is left.
+pub fn purge_batch_with(conn: &Connection, batch_id: &str, stop: &crate::StopFlag, progress: crate::ProgressFn) -> Result<PurgeReport> {
+    let entries: Vec<(i64, i64, String, Option<i64>)> = {
+        let mut st = conn.prepare("SELECT id, file_id, dst_abs, new_file_id FROM journal WHERE batch_id = ? AND op = 'quarantine' AND undone = 0")?;
+        let rows = st.query_map([batch_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<_>>()?;
         rows
     };
-    let mut rep = UndoReport::default();
-    for (_jid, file_id, dst) in entries {
+    let mut rep = PurgeReport::default();
+    let total = entries.len() as u64;
+    for (i, (jid, file_id, dst, twin)) in entries.into_iter().enumerate() {
+        if stop.is_stopped() {
+            rep.cancelled = true;
+            break;
+        }
+        progress(crate::Progress::new("purge", "verify", i as u64, total, dst.clone()));
         let p = PathBuf::from(&dst);
+        if let Some(twin) = twin {
+            let twin_path = db::get_file(conn, twin)?.filter(|f| !f.quarantined && !f.missing && f.online).map(|f| f.abs_path());
+            let same = match &twin_path {
+                Some(tp) if p.exists() => same_content(&p, tp).unwrap_or(false),
+                _ => false,
+            };
+            if !same {
+                rep.kept += 1;
+                if rep.errors.len() < 200 {
+                    rep.errors.push(format!("{}: 원본과 내용이 같은지 확인하지 못해 남겨 둠", dst));
+                }
+                continue;
+            }
+        }
+        let size = fs::metadata(&p).map(|m| m.len() as i64).unwrap_or(0);
         let r = if p.exists() { fs::remove_file(&p).map_err(anyhow::Error::from) } else { Ok(()) };
         match r {
             Ok(()) => {
                 conn.execute("DELETE FROM files WHERE id = ? AND quarantined = 1", [file_id])?;
-                rep.restored += 1;
+                conn.execute("UPDATE journal SET op = 'purged', undone = 1 WHERE id = ?", [jid])?;
+                rep.deleted += 1;
+                rep.bytes += size;
                 if let Some(qroot) = p.ancestors().find(|a| a.file_name().map(|n| n == batch_id).unwrap_or(false)) {
                     prune_empty_dirs(p.parent().unwrap_or(qroot), qroot.parent().unwrap_or(qroot));
                 }
@@ -438,7 +527,8 @@ pub fn purge_batch(conn: &Connection, batch_id: &str) -> Result<UndoReport> {
             }
         }
     }
-    if rep.failed == 0 {
+    let left: i64 = conn.query_row("SELECT COUNT(*) FROM journal WHERE batch_id = ? AND undone = 0", [batch_id], |r| r.get(0))?;
+    if left == 0 {
         conn.execute("UPDATE batches SET state = 'purged' WHERE id = ?", [batch_id])?;
     }
     Ok(rep)

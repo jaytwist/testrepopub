@@ -102,12 +102,12 @@ mod platform {
         identify_root(&root_str)
     }
 
-    pub fn free_space(path: &Path) -> Option<u64> {
+    pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
         use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
         let w = wide(path.as_os_str());
-        let mut free: u64 = 0;
-        unsafe { GetDiskFreeSpaceExW(PCWSTR(w.as_ptr()), Some(&mut free), None, None) }.ok()?;
-        Some(free)
+        let (mut free, mut total): (u64, u64) = (0, 0);
+        unsafe { GetDiskFreeSpaceExW(PCWSTR(w.as_ptr()), Some(&mut free), Some(&mut total), None) }.ok()?;
+        Some((free, total))
     }
 
     /// NTFS / ReFS update a folder's time when an entry is added, removed or renamed; FAT and
@@ -210,11 +210,12 @@ mod platform {
         true
     }
 
-    pub fn free_space(path: &Path) -> Option<u64> {
+    pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
         use std::os::unix::ffi::OsStrExt;
         let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
         let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
-        (unsafe { libc::statvfs(c.as_ptr(), &mut s) } == 0).then(|| s.f_bavail as u64 * s.f_frsize as u64)
+        (unsafe { libc::statvfs(c.as_ptr(), &mut s) } == 0)
+            .then(|| (s.f_bavail as u64 * s.f_frsize as u64, s.f_blocks as u64 * s.f_frsize as u64))
     }
 }
 
@@ -226,7 +227,26 @@ pub fn identify(path: &Path) -> Result<VolumeInfo> {
 /// `refresh` instead re-identifies each known mount path.
 /// Free bytes on the drive holding `path`, if the system says.
 pub fn free_space(path: &Path) -> Option<u64> {
-    platform::free_space(&existing_ancestor_of(path))
+    disk_space(path).map(|(free, _)| free)
+}
+
+/// (free, total) bytes on the drive holding `path`. `MO_FREE_SPACE` (bytes) pretends the drive
+/// has that much free, for tests.
+pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
+    let real = platform::disk_space(&existing_ancestor_of(path));
+    match std::env::var("MO_FREE_SPACE").ok().and_then(|v| v.parse::<u64>().ok()) {
+        Some(free) => Some((free, real.map(|r| r.1).unwrap_or(free).max(free))),
+        None => real,
+    }
+}
+
+/// Room always left free on the library drive: 1 % of the drive, at least 1 GB and at most 20 GB
+/// (a nearly full NTFS drive gets slow). `MO_SPACE_RESERVE` (bytes) overrides it, for tests.
+pub fn space_reserve(total: u64) -> u64 {
+    if let Some(r) = std::env::var("MO_SPACE_RESERVE").ok().and_then(|v| v.parse::<u64>().ok()) {
+        return r;
+    }
+    (total / 100).clamp(1u64 << 30, 20u64 << 30)
 }
 
 fn existing_ancestor_of(path: &Path) -> PathBuf {
