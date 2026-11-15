@@ -206,7 +206,7 @@ export interface FolderProps { other_files: number; other_bytes: number; example
 export interface CopyFolderReport {
   batch_id: string; folders: number; partial: number; skipped: number; skipped_why: string[]; files: number; bytes: number; purged: boolean;
   different: number; other_deleted: number; left: number; left_examples: string[]; unique_left: number; labels_moved: number;
-  failed: number; errors: string[]; cancelled: boolean;
+  failed: number; errors: string[]; cancelled: boolean; quick: boolean;
 }
 export interface ExecReport {
   batch_id: string; done: number; failed: number; bytes: number; sidecars: number; removed: number; removed_bytes: number;
@@ -224,8 +224,14 @@ export interface PlanItem {
 }
 export interface BatchRow {
   id: string; kind: string; description: string; created_at: number; op_count: number; state: string; bytes: number;
+  /** Files still waiting in the quarantine. */
+  waiting: number;
 }
-export interface Progress { job: string; stage: string; done: number; total: number; message: string }
+export interface Progress {
+  job: string; stage: string; done: number; total: number; message: string;
+  /** Work measured in bytes: how far, how fast (bytes per second), and the time left once known. */
+  bytes_done?: number; bytes_total?: number; rate?: number; eta_secs?: number;
+}
 export interface JobDone { job: string; ok: boolean; error: string | null; result: any }
 export interface UpdateInfo { current: string; available: boolean; version: string | null; notes: string | null; date: string | null }
 export interface UpdateProgress { downloaded: number; total: number | null }
@@ -352,7 +358,8 @@ export const api = {
     invoke<void>("start_library_delete", { planId, groups, keepProtected }),
   /** `near`: how alike "almost the same" folders must be (0.95 = 95 %). */
   copyFolders: (near?: number) => invoke<CopyFolders>("copy_folders", { near }),
-  startRemoveCopyFolders: (picks: CopyFolderPick[], purge: boolean) => invoke<void>("start_remove_copy_folders", { picks, purge }),
+  /** `quick`: compare parts of each file with its twin instead of all of it (faster, sees less). */
+  startRemoveCopyFolders: (picks: CopyFolderPick[], purge: boolean, quick = false) => invoke<void>("start_remove_copy_folders", { picks, purge, quick }),
   openFolder: (path: string) => invoke<void>("open_folder", { path }),
   folderFiles: (folder: FolderRef) => invoke<FolderFiles[]>("folder_files", { folder }),
   folderCompare: (keep: FolderRef, copy: FolderRef) => invoke<FolderCompare>("folder_compare", { keep, copy }),

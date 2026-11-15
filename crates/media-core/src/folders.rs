@@ -759,6 +759,16 @@ pub struct FolderRemoveReport {
     pub failed: u64,
     pub errors: Vec<String>,
     pub cancelled: bool,
+    /// Deleted after the quick check (parts of each file compared) instead of the full one.
+    pub quick: bool,
+}
+
+/// How the copies go: `purge` deletes them once compared with their twins (else they wait in
+/// the quarantine); `quick` compares parts of each file instead of all of it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RemoveOptions {
+    pub purge: bool,
+    pub quick: bool,
 }
 
 fn clean(r: &FolderRef) -> FolderRef {
@@ -769,6 +779,11 @@ fn clean(r: &FolderRef) -> FolderRef {
 /// before (a folder that changed since it was listed is skipped). With `purge` the files are
 /// deleted once compared byte for byte with their twin; without it they wait in the quarantine.
 pub fn remove(db: &Db, picks: &[Pick], purge: bool, stop: &StopFlag, progress: ProgressFn) -> Result<FolderRemoveReport> {
+    remove_with(db, picks, &RemoveOptions { purge, quick: false }, stop, progress)
+}
+
+pub fn remove_with(db: &Db, picks: &[Pick], opts: &RemoveOptions, stop: &StopFlag, progress: ProgressFn) -> Result<FolderRemoveReport> {
+    let (purge, quick) = (opts.purge, opts.purge && opts.quick);
     let conn = db.conn()?;
     volumes::refresh(&conn)?;
     let vols = load(&conn)?;
@@ -781,13 +796,16 @@ pub fn remove(db: &Db, picks: &[Pick], purge: bool, stop: &StopFlag, progress: P
     let total: u64 = picks.iter().map(|p| vols.iter().find(|v| v.id == p.copy.volume_id).map_or(0, |v| v.subtree(&p.copy.rel_dir).len() as u64)).sum();
 
     let near = picks.iter().filter(|p| p.partial).count();
-    let label = |n: u64| match near {
-        0 => format!("100% 복사 폴더 {n}개 정리"),
-        m if m == picks.len() => format!("거의 같은 폴더 {n}개에서 겹치는 사진 정리"),
-        m => format!("복사 폴더 {n}개 정리 (거의 같은 폴더 {m}개 포함)"),
+    let label = |n: u64| {
+        let what = match near {
+            0 => format!("100% 복사 폴더 {n}개 정리"),
+            m if m == picks.len() => format!("거의 같은 폴더 {n}개에서 겹치는 사진 정리"),
+            m => format!("복사 폴더 {n}개 정리 (거의 같은 폴더 {m}개 포함)"),
+        };
+        if quick { format!("{what} · 빠른 확인으로 지움") } else { what }
     };
     let batch = journal::new_batch(&conn, "copies", &label(picks.len() as u64))?;
-    let mut rep = FolderRemoveReport { batch_id: batch.clone(), purged: purge, ..Default::default() };
+    let mut rep = FolderRemoveReport { batch_id: batch.clone(), purged: purge, quick, ..Default::default() };
     let mut run = Run { conn: &conn, vols: &vols, rules: &rules, lib_vol, batch: &batch, purge, stop, progress, gone: HashSet::new(), done: 0, total };
     for p in &picks {
         if stop.is_stopped() {
@@ -814,7 +832,7 @@ pub fn remove(db: &Db, picks: &[Pick], purge: bool, stop: &StopFlag, progress: P
         conn.execute("DELETE FROM batches WHERE id = ? AND op_count = 0", [&batch])?;
         rep.batch_id.clear();
     } else if purge && !rep.cancelled {
-        let p = journal::purge_batch_with(&conn, &batch, stop, progress)?;
+        let p = journal::purge_batch_opts(&conn, &batch, quick, stop, progress)?;
         rep.bytes = p.bytes;
         rep.different = p.kept;
         rep.failed += p.failed;

@@ -1272,9 +1272,10 @@ fn folder_props(state: State<'_, AppState>, folder: media_core::folders::FolderR
 
 /// Remove the chosen copy folders (each file compared with its twin before it is deleted).
 #[tauri::command]
-fn start_remove_copy_folders(app: AppHandle, state: State<AppState>, picks: Vec<media_core::folders::Pick>, purge: bool) -> CmdResult<()> {
+fn start_remove_copy_folders(app: AppHandle, state: State<AppState>, picks: Vec<media_core::folders::Pick>, purge: bool, quick: Option<bool>) -> CmdResult<()> {
+    let opts = media_core::folders::RemoveOptions { purge, quick: quick.unwrap_or(false) };
     spawn_job(&app, &state, "cleanup:folders", move |st, progress| {
-        let r = media_core::folders::remove(&st.db, &picks, purge, &st.stop, progress)?;
+        let r = media_core::folders::remove_with(&st.db, &picks, &opts, &st.stop, progress)?;
         // Plans made before no longer match what is on the drive.
         st.plans.locked().clear();
         Ok(r)
@@ -1383,9 +1384,9 @@ fn protect_check(state: State<AppState>, ids: Vec<i64>) -> CmdResult<Vec<media_c
 
 #[tauri::command]
 fn start_purge(app: AppHandle, state: State<AppState>, batch_id: String) -> CmdResult<()> {
-    spawn_job(&app, &state, "purge", move |st, _| {
+    spawn_job(&app, &state, "purge", move |st, progress| {
         let conn = st.db.conn()?;
-        journal::purge_batch(&conn, &batch_id)
+        journal::purge_batch_progress(&conn, &batch_id, &st.stop, progress)
     })
 }
 

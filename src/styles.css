@@ -348,6 +348,7 @@ label.cf-tag { cursor: pointer; }
 .cf-tabs { margin: 4px 0 10px; }
 .cf-tabs .fp-tab { font-size: 14px; padding: 7px 14px; font-weight: 600; }
 .cf-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; position: sticky; bottom: 0; z-index: 5; background: var(--panel); padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 -4px 14px rgba(0, 0, 0, 0.08); }
+.cf-opts { display: grid; gap: 4px; }
 .cf-confirm { width: min(820px, calc(100vw - 32px)); }
 .cf-confirm-list { display: grid; gap: 8px; max-height: 46vh; overflow-y: auto; border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
 .btn.danger-fill { background: var(--bad); border-color: var(--bad); color: #fff; }

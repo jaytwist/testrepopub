@@ -27,7 +27,8 @@ export default function History() {
 
   const purge = async (b: BatchRow) => {
     const ok = await confirm(
-      `격리함의 파일 ${fmtCount(b.op_count)}개(${fmtBytes(b.bytes)})를 영구 삭제합니다.\n\n이 작업은 되돌릴 수 없습니다.`,
+      `격리함의 파일 ${fmtCount(b.waiting)}개(${fmtBytes(b.bytes)})를 영구 삭제합니다.\n\n` +
+        "원본이 있는 사본은 원본과 끝까지 비교한 뒤 지웁니다(진행 중 남은 시간이 표시되고, 멈췄다가 다시 누르면 이어집니다). 이 작업은 되돌릴 수 없습니다.",
       { title: "격리함 비우기", kind: "error" },
     );
     if (!ok) return;
@@ -65,12 +66,19 @@ export default function History() {
             <tr key={b.id}>
               <td className="muted small">{new Date(b.created_at * 1000).toLocaleString("ko-KR")}</td>
               <td>{b.kind === "organize" ? "⇲ " : "🗑 "}{b.description}</td>
-              <td>{fmtCount(b.op_count)}개 · {fmtBytes(b.bytes)}</td>
+              <td>
+                {fmtCount(b.op_count)}개 · {fmtBytes(b.bytes)}
+                {b.state === "done" && b.waiting > 0 && b.waiting < b.op_count && <div className="small warn-text">격리함에 {fmtCount(b.waiting)}개 남음</div>}
+              </td>
               <td><span className={`pill ${b.state === "done" ? "ok" : ""}`}>{STATE_NAMES[b.state] ?? b.state}</span></td>
               <td className="right">
                 <button className="btn small" disabled={!!running || b.state !== "done"} onClick={() => undo(b)}>되돌리기</button>
-                {(b.kind === "dedupe" || b.kind === "delete") && (
-                  <button className="btn small danger" disabled={!!running || b.state !== "done"} onClick={() => purge(b)}>격리함 비우기</button>
+                {/* Anything that left files in the quarantine can be emptied: deletions, and copies
+                    whose run was stopped before they were compared and deleted. */}
+                {(b.kind === "dedupe" || b.kind === "delete" || (b.kind === "copies" && b.waiting > 0)) && (
+                  <button className="btn small danger" disabled={!!running || b.state !== "done" || b.waiting === 0} onClick={() => purge(b)}>
+                    {b.kind === "copies" ? "이어서 지우기" : "격리함 비우기"}
+                  </button>
                 )}
               </td>
             </tr>

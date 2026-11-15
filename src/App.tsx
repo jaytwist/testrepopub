@@ -61,6 +61,7 @@ const STAGE_NAMES: Record<string, string> = {
   quarantine: "격리함으로 옮기는 중",
   move: "복사 폴더에서 꺼내는 중",
   verify: "원본과 끝까지 비교하며 지우는 중",
+  verify_quick: "원본과 일부만 비교하며 지우는 중 (빠른 확인)",
   done: "마무리 중",
 };
 
@@ -292,7 +293,11 @@ export default function App() {
     return () => clearTimeout(t);
   }, [toast]);
 
-  const pct = progress && progress.total > 0 ? Math.min(100, (progress.done / progress.total) * 100) : null;
+  // Work that reads files fills the bar by bytes (a few large videos are most of the time).
+  const byBytes = progress?.bytes_total ? progress : null;
+  const pct = byBytes
+    ? Math.min(100, ((byBytes.bytes_done ?? 0) / byBytes.bytes_total!) * 100)
+    : progress && progress.total > 0 ? Math.min(100, (progress.done / progress.total) * 100) : null;
 
   /** A short job can finish before its caller marks it running (the done event arrives first):
    *  confirm with the backend so the bar never stays on a job that already ended. */
@@ -427,6 +432,13 @@ export default function App() {
                 <span className="muted"> · {fmtCount(progress.done)} / {fmtCount(progress.total)}</span>
               )}
               {progress && progress.total === 0 && progress.done > 0 && <span className="muted"> · {fmtCount(progress.done)}개 발견</span>}
+              {byBytes && (
+                <span className="muted">
+                  {" "}· {fmtBytes(byBytes.bytes_done ?? 0)} / {fmtBytes(byBytes.bytes_total!)}
+                  {byBytes.rate ? ` · ${fmtBytes(byBytes.rate)}/초` : ""}
+                  {byBytes.eta_secs != null ? <b> · {fmtEta(byBytes.eta_secs)} 남음</b> : " · 남은 시간 계산 중"}
+                </span>
+              )}
               {progress?.message && <span className="jobbar-msg">{progress.message}</span>}
             </div>
             <div className="bar"><div className={`bar-fill ${pct == null ? "indeterminate" : ""}`} style={{ width: pct == null ? "30%" : `${pct}%` }} /></div>

@@ -65,11 +65,35 @@ pub struct Progress {
     pub done: u64,
     pub total: u64,
     pub message: String,
+    /// For work measured in bytes (reading files): how far it is, how fast it goes (bytes per
+    /// second) and how long it has left, once that can be told.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_done: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_total: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eta_secs: Option<u64>,
 }
 
 impl Progress {
     pub fn new(job: &str, stage: &str, done: u64, total: u64, message: impl Into<String>) -> Self {
-        Self { job: job.into(), stage: stage.into(), done, total, message: message.into() }
+        Self { job: job.into(), stage: stage.into(), done, total, message: message.into(), bytes_done: None, bytes_total: None, rate: None, eta_secs: None }
+    }
+
+    /// Add the bytes read so far of the bytes to read, and the time the work has taken: speed
+    /// and time left follow (not in the first seconds, when they would be guesses).
+    pub fn with_bytes(mut self, done: u64, total: u64, elapsed: std::time::Duration) -> Self {
+        self.bytes_done = Some(done);
+        self.bytes_total = Some(total);
+        let secs = elapsed.as_secs_f64();
+        if secs >= 10.0 && done > 0 {
+            let rate = done as f64 / secs;
+            self.rate = Some(rate as u64);
+            self.eta_secs = Some((total.saturating_sub(done) as f64 / rate).ceil() as u64);
+        }
+        self
     }
 }
 

@@ -56,6 +56,8 @@ export default function CopyFolders({ onTotals }: { onTotals?: (exact: number, n
   const [props, setProps] = useState<Record<string, FolderProps>>({});
   const [confirming, setConfirming] = useState(false);
   const [keepInQuarantine, setKeepInQuarantine] = useState(false);
+  /** Compare parts of each file with its twin instead of all of it: faster, and blind between the parts. */
+  const [quick, setQuick] = useState(false);
   const [result, setResult] = useState<CopyFolderReport | null>(null);
 
   const load = useCallback(() => {
@@ -134,12 +136,16 @@ export default function CopyFolders({ onTotals }: { onTotals?: (exact: number, n
     }
   };
 
+  // Folders a recovery tool made: where files that only start the same are a real thing.
+  const recovered = [...new Set([...exactGoing.flatMap((x) => [x.f.abs_path, x.r.keep.abs_path]), ...nearGoing.flatMap((r) => [r.copy.abs_path, r.keep.abs_path])].filter((p) => /recover|복구|rescue/i.test(p)))];
+  const quickOn = quick && !keepInQuarantine;
+
   const run = async () => {
     setConfirming(false);
     setErr(null);
     setResult(null);
     try {
-      await api.startRemoveCopyFolders(picks, !keepInQuarantine);
+      await api.startRemoveCopyFolders(picks, !keepInQuarantine, quickOn);
       setRunning("cleanup:folders");
     } catch (e) {
       setErr(String(e));
@@ -344,11 +350,23 @@ export default function CopyFolders({ onTotals }: { onTotals?: (exact: number, n
             </>
           )}
 
+          {quickOn && recovered.length > 0 && (
+            <div className="alert warn small">
+              <b>빠른 확인을 권하지 않는 폴더가 선택되어 있습니다.</b> 복구 프로그램이 만든 폴더의 파일은 앞부분만 같고 뒤가 깨진 경우가 있어, 일부만 비교하면 놓칠 수 있습니다:
+              <div className="cf-left">{recovered.slice(0, 4).map((p) => <div key={p}>{p}</div>)}{recovered.length > 4 && <div>외 {fmtCount(recovered.length - 4)}개</div>}</div>
+            </div>
+          )}
           {(exact.length > 0 || near.length > 0) && <div className="cf-foot">
+            <div className="cf-opts">
             <label className="small">
               <input type="checkbox" checked={keepInQuarantine} onChange={(e) => setKeepInQuarantine(e.target.checked)} /> 지우지 말고 격리함에만 두기{" "}
               <span className="muted">(되돌릴 수 있지만 공간은 생기지 않음)</span>
             </label>
+            <label className="small" title="큰 파일은 처음·끝과 32MB마다 1MB씩만 원본과 비교합니다. 4MB 이하 파일은 그대로 전부 비교합니다.">
+              <input type="checkbox" checked={quickOn} disabled={keepInQuarantine} onChange={(e) => setQuick(e.target.checked)} /> 빠른 확인{" "}
+              <span className="muted">(파일의 일부만 비교 — 더 빠르지만 비교하지 않은 곳이 다른 파일은 걸러내지 못함)</span>
+            </label>
+            </div>
             <span className="cf-btns">
               {picks.length === 0
                 ? <span className="muted small">지울 복사본을 체크하세요</span>
@@ -371,8 +389,18 @@ export default function CopyFolders({ onTotals }: { onTotals?: (exact: number, n
             <div className="small muted">
               {keepInQuarantine
                 ? "「작업 기록」에서 되돌릴 수 있지만, 격리함을 비울 때까지 공간은 생기지 않습니다."
-                : "파일마다 원본 폴더의 짝과 끝까지 비교해 같은 것만 지웁니다. 지운 것은 되돌릴 수 없습니다. 복사본에만 있는 파일은 지우지 않습니다."}
+                : quickOn
+                  ? "파일마다 원본 폴더의 짝과 일부(처음·끝·중간 여러 곳)를 비교해 같은 것만 지웁니다. 비교하지 않은 곳만 다른 파일은 같다고 보고 지웁니다. 지운 것은 되돌릴 수 없습니다."
+                  : "파일마다 원본 폴더의 짝과 끝까지 비교해 같은 것만 지웁니다. 지운 것은 되돌릴 수 없습니다. 복사본에만 있는 파일은 지우지 않습니다."}
             </div>
+            {!keepInQuarantine && (
+              <div className="small muted">
+                {quickOn
+                  ? `${fmtBytes(goingBytes)} 중 일부만 읽습니다. 진행 중에 남은 시간이 표시됩니다.`
+                  : `${fmtBytes(goingBytes)}를 원본과 비교하므로 그 두 배를 읽습니다. 디스크에 따라 수십 분에서 몇 시간이 걸리며, 진행 중에 속도와 남은 시간이 표시됩니다. 중간에 멈춰도 「작업 기록」의 「이어서 지우기」로 마저 지울 수 있습니다.`}
+              </div>
+            )}
+            {quickOn && recovered.length > 0 && <div className="alert warn small"><b>복구 폴더가 포함되어 있습니다.</b> 이 폴더들은 「빠른 확인」을 끄고 지우시길 권합니다.</div>}
             <div className="cf-confirm-list small">
               {exactGoing.map(({ r, f }) => (
                 <div key={dirKey(f)}>
@@ -408,7 +436,8 @@ function Result({ r, onClose }: { r: CopyFolderReport; onClose: () => void }) {
           폴더 {fmtCount(r.folders + r.partial)}개 정리 · 사진·영상 {fmtCount(r.files)}개 ·{" "}
           {r.purged ? `${fmtBytes(r.bytes)} 확보` : `${fmtBytes(r.bytes)} 격리함으로 옮김`}
         </b>
-        {r.cancelled && " (중간에 멈춤 — 옮긴 파일은 격리함에 있으며 「작업 기록」에서 되돌리거나 비울 수 있습니다)"}
+        {r.quick && " · 빠른 확인(파일의 일부만 비교)으로 지움"}
+        {r.cancelled && " (중간에 멈춤 — 남은 파일은 격리함에 있습니다. 「작업 기록」에서 「이어서 지우기」를 누르면 남은 것을 마저 지우고, 「되돌리기」로 제자리에 돌려놓을 수 있습니다)"}
       </div>
       <ul className="small">
         {r.folders > 0 && <li>복사 폴더 {fmtCount(r.folders)}개는 폴더째 없어졌습니다.</li>}

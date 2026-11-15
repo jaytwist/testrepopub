@@ -240,25 +240,137 @@ fn quarantine_rec(conn: &Connection, batch: &str, file: &db::FileRow, twin: Opti
     Ok(())
 }
 
-/// Whether two files hold the same bytes (compared block by block, stopping at the first
-/// difference).
-pub fn same_content(a: &Path, b: &Path) -> Result<bool> {
-    let (ma, mb) = (fs::metadata(a)?, fs::metadata(b)?);
-    if ma.len() != mb.len() {
-        return Ok(false);
+/// How much of one file is read at a stretch before turning to the other. Two files on one
+/// hard disk are far apart: reading them a megabyte at a time in turns keeps the head
+/// travelling; longer stretches let it read. (Not longer than this: measured in memory, the
+/// comparison itself slows down as the stretch outgrows the processor's cache — 16 MiB still
+/// compares well over a gigabyte a second, and leaves a hard disk one move per 130 ms of reading.)
+const RUN: usize = 16 << 20;
+/// "Quick check": files up to this size are still compared whole; of larger ones the first and
+/// the last `BLOCK` and one `BLOCK` in every `STRIPE` are compared.
+const QUICK_WHOLE: u64 = 4 << 20;
+const BLOCK: u64 = 1 << 20;
+const STRIPE: u64 = 32 << 20;
+
+/// Compares files byte for byte, reusing its two buffers from file to file.
+pub struct Comparer {
+    a: Vec<u8>,
+    b: Vec<u8>,
+    run: usize,
+}
+
+impl Default for Comparer {
+    fn default() -> Self {
+        Self::new()
     }
-    let (mut fa, mut fb) = (fs::File::open(a)?, fs::File::open(b)?);
-    let (mut ba, mut bb) = (vec![0u8; 1 << 20], vec![0u8; 1 << 20]);
-    loop {
-        let n = read_full(&mut fa, &mut ba)?;
-        let m = read_full(&mut fb, &mut bb)?;
-        if n != m || ba[..n] != bb[..m] {
+}
+
+impl Comparer {
+    pub fn new() -> Self {
+        Self::with_run(RUN)
+    }
+
+    /// With another stretch length (tests use a small one to cross its boundaries).
+    pub fn with_run(run: usize) -> Self {
+        Self { a: Vec::new(), b: Vec::new(), run: run.max(1) }
+    }
+
+    fn buffers(&mut self, n: usize) {
+        if self.a.len() < n {
+            self.a.resize(n, 0);
+            self.b.resize(n, 0);
+        }
+    }
+
+    /// Whether the two files hold the same bytes, all of them.
+    pub fn same(&mut self, a: &Path, b: &Path) -> Result<bool> {
+        let (la, lb) = (fs::metadata(a)?.len(), fs::metadata(b)?.len());
+        if la != lb {
             return Ok(false);
         }
-        if n == 0 {
-            return Ok(true);
+        self.buffers(la.min(self.run as u64) as usize);
+        let (mut fa, mut fb) = (open_sequential(a)?, open_sequential(b)?);
+        let mut left = la;
+        while left > 0 {
+            let want = left.min(self.run as u64) as usize;
+            let x = read_full(&mut fa, &mut self.a[..want])?;
+            let y = read_full(&mut fb, &mut self.b[..want])?;
+            if x != want || y != want || self.a[..want] != self.b[..want] {
+                return Ok(false);
+            }
+            left -= want as u64;
         }
+        Ok(true)
     }
+
+    /// The quick check: whether the two files have the same size and the same bytes in the
+    /// parts `sample_blocks` names. A file that differs only between those parts passes — that
+    /// is the price of not reading it all.
+    pub fn same_sampled(&mut self, a: &Path, b: &Path) -> Result<bool> {
+        use std::io::{Seek, SeekFrom};
+        let (la, lb) = (fs::metadata(a)?.len(), fs::metadata(b)?.len());
+        if la != lb {
+            return Ok(false);
+        }
+        if la <= QUICK_WHOLE {
+            return self.same(a, b);
+        }
+        self.buffers(BLOCK as usize);
+        let (mut fa, mut fb) = (fs::File::open(a)?, fs::File::open(b)?);
+        for (at, len) in sample_blocks(la) {
+            fa.seek(SeekFrom::Start(at))?;
+            fb.seek(SeekFrom::Start(at))?;
+            let x = read_full(&mut fa, &mut self.a[..len])?;
+            let y = read_full(&mut fb, &mut self.b[..len])?;
+            if x != len || y != len || self.a[..len] != self.b[..len] {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// The parts of a file of `len` bytes the quick check reads: (offset, length), in order. The
+/// places inside the stripes follow from the length alone — the same for a file and its copy.
+pub fn sample_blocks(len: u64) -> Vec<(u64, usize)> {
+    if len <= QUICK_WHOLE {
+        return vec![(0, len as usize)];
+    }
+    let mut at: Vec<u64> = vec![0, len - BLOCK];
+    let mut seed = len ^ 0x9E37_79B9_7F4A_7C15;
+    let mut stripe = 0;
+    while stripe * STRIPE < len {
+        // splitmix64: a different, fixed place in each stripe
+        seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = seed;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        let start = stripe * STRIPE;
+        let room = (len - start).min(STRIPE).saturating_sub(BLOCK);
+        at.push((start + if room == 0 { 0 } else { z % room }).min(len - BLOCK));
+        stripe += 1;
+    }
+    at.sort_unstable();
+    at.dedup();
+    at.into_iter().map(|o| (o, BLOCK as usize)).collect()
+}
+
+/// Open for reading from start to end (Windows then reads ahead in larger steps).
+fn open_sequential(p: &Path) -> std::io::Result<fs::File> {
+    let mut o = fs::OpenOptions::new();
+    o.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        o.custom_flags(0x0800_0000); // FILE_FLAG_SEQUENTIAL_SCAN
+    }
+    o.open(p)
+}
+
+/// Whether two files hold the same bytes (all of them; see `Comparer`).
+pub fn same_content(a: &Path, b: &Path) -> Result<bool> {
+    Comparer::new().same(a, b)
 }
 
 fn read_full(f: &mut fs::File, buf: &mut [u8]) -> Result<usize> {
@@ -324,12 +436,15 @@ pub struct BatchRow {
     pub op_count: i64,
     pub state: String,
     pub bytes: i64,
+    /// Files of this batch still waiting in the quarantine (not put back, not deleted).
+    pub waiting: i64,
 }
 
 pub fn list_batches(conn: &Connection) -> Result<Vec<BatchRow>> {
     let mut st = conn.prepare(
         "SELECT b.id, b.kind, b.description, b.created_at, b.op_count, b.state,
-                COALESCE((SELECT SUM(f.size) FROM journal j JOIN files f ON f.id = COALESCE(j.new_file_id, j.file_id) WHERE j.batch_id = b.id AND j.undone = 0), 0)
+                COALESCE((SELECT SUM(f.size) FROM journal j JOIN files f ON f.id = COALESCE(j.new_file_id, j.file_id) WHERE j.batch_id = b.id AND j.undone = 0), 0),
+                (SELECT COUNT(*) FROM journal j WHERE j.batch_id = b.id AND j.op = 'quarantine' AND j.undone = 0)
          FROM batches b ORDER BY b.created_at DESC, b.id DESC",
     )?;
     let rows = st
@@ -342,6 +457,7 @@ pub fn list_batches(conn: &Connection) -> Result<Vec<BatchRow>> {
                 op_count: r.get(4)?,
                 state: r.get(5)?,
                 bytes: r.get(6)?,
+                waiting: r.get(7)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -488,10 +604,19 @@ pub fn undo_batch(conn: &Connection, batch_id: &str) -> Result<UndoReport> {
 
 /// Permanently delete quarantined files of a batch. This is the only irreversible action.
 pub fn purge_batch(conn: &Connection, batch_id: &str) -> Result<UndoReport> {
-    let r = purge_batch_with(conn, batch_id, &crate::StopFlag::new(), &|_| {})?;
+    purge_batch_progress(conn, batch_id, &crate::StopFlag::new(), &|_| {})
+}
+
+/// `purge_batch` as a job: reports how far it is and can be stopped. What it had not reached
+/// stays in the quarantine; running it again goes on from there.
+pub fn purge_batch_progress(conn: &Connection, batch_id: &str, stop: &crate::StopFlag, progress: crate::ProgressFn) -> Result<UndoReport> {
+    let r = purge_batch_with(conn, batch_id, stop, progress)?;
     let mut errors = r.errors;
     if r.kept > 0 {
         errors.insert(0, format!("원본과 내용이 달라(또는 원본이 없어) {}개는 격리함에 남겨 두었습니다", r.kept));
+    }
+    if r.cancelled {
+        errors.insert(0, "중간에 멈췄습니다. 다시 누르면 남은 것부터 이어서 지웁니다".into());
     }
     Ok(UndoReport { restored: r.deleted, failed: r.failed + r.kept, errors })
 }
@@ -505,30 +630,52 @@ pub struct PurgeReport {
     pub failed: u64,
     pub errors: Vec<String>,
     pub cancelled: bool,
+    /// Compared by the quick check (parts of each file) instead of all of it.
+    pub quick: bool,
 }
 
 /// Permanently delete a batch's quarantined files. A copy quarantined with its twin
 /// (`quarantine_copy`) is deleted only if the twin is still there with exactly the same bytes.
 /// Deleted entries leave the journal's undo list; the batch counts as emptied once nothing is left.
 pub fn purge_batch_with(conn: &Connection, batch_id: &str, stop: &crate::StopFlag, progress: crate::ProgressFn) -> Result<PurgeReport> {
-    let entries: Vec<(i64, i64, String, Option<i64>)> = {
-        let mut st = conn.prepare("SELECT id, file_id, dst_abs, new_file_id FROM journal WHERE batch_id = ? AND op = 'quarantine' AND undone = 0")?;
-        let rows = st.query_map([batch_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<_>>()?;
+    purge_batch_opts(conn, batch_id, false, stop, progress)
+}
+
+/// `purge_batch_with`; with `quick` the copy and its twin are compared in parts only
+/// (`Comparer::same_sampled`): much less to read, and a difference between the parts is not seen.
+pub fn purge_batch_opts(conn: &Connection, batch_id: &str, quick: bool, stop: &crate::StopFlag, progress: crate::ProgressFn) -> Result<PurgeReport> {
+    let entries: Vec<(i64, i64, String, Option<i64>, i64)> = {
+        let mut st = conn.prepare(
+            "SELECT j.id, j.file_id, j.dst_abs, j.new_file_id, COALESCE(f.size, 0) FROM journal j LEFT JOIN files f ON f.id = j.file_id
+             WHERE j.batch_id = ? AND j.op = 'quarantine' AND j.undone = 0",
+        )?;
+        let rows = st.query_map([batch_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.collect::<rusqlite::Result<_>>()?;
         rows
     };
-    let mut rep = PurgeReport::default();
+    let mut rep = PurgeReport { quick, ..Default::default() };
     let total = entries.len() as u64;
-    for (i, (jid, file_id, dst, twin)) in entries.into_iter().enumerate() {
+    let bytes_total: u64 = entries.iter().map(|e| e.4.max(0) as u64).sum();
+    let (mut bytes_done, started) = (0u64, std::time::Instant::now());
+    let stage = if quick { "verify_quick" } else { "verify" };
+    let mut cmp = Comparer::new();
+    for (i, (jid, file_id, dst, twin, indexed_size)) in entries.into_iter().enumerate() {
         if stop.is_stopped() {
             rep.cancelled = true;
             break;
         }
-        progress(crate::Progress::new("purge", "verify", i as u64, total, dst.clone()));
+        progress(crate::Progress::new("purge", stage, i as u64, total, dst.clone()).with_bytes(bytes_done, bytes_total, started.elapsed()));
+        bytes_done += indexed_size.max(0) as u64;
+        // Debug builds only: a slow disk on demand (`MO_SLOW_COMPARE_MS` per file), to see the
+        // progress a real run of hours shows.
+        #[cfg(debug_assertions)]
+        if let Some(ms) = std::env::var("MO_SLOW_COMPARE_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
         let p = PathBuf::from(&dst);
         if let Some(twin) = twin {
             let twin_path = db::get_file(conn, twin)?.filter(|f| !f.quarantined && !f.missing && f.online).map(|f| f.abs_path());
             let same = match &twin_path {
-                Some(tp) if p.exists() => same_content(&p, tp).unwrap_or(false),
+                Some(tp) if p.exists() => if quick { cmp.same_sampled(&p, tp) } else { cmp.same(&p, tp) }.unwrap_or(false),
                 _ => false,
             };
             if !same {
@@ -556,6 +703,9 @@ pub fn purge_batch_with(conn: &Connection, batch_id: &str, stop: &crate::StopFla
                 rep.errors.push(e.to_string());
             }
         }
+    }
+    if !rep.cancelled {
+        progress(crate::Progress::new("purge", stage, total, total, "").with_bytes(bytes_total, bytes_total, started.elapsed()));
     }
     let left: i64 = conn.query_row("SELECT COUNT(*) FROM journal WHERE batch_id = ? AND undone = 0", [batch_id], |r| r.get(0))?;
     if left == 0 {
