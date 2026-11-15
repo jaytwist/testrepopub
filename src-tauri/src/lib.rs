@@ -1242,6 +1242,32 @@ fn start_library_delete(app: AppHandle, state: State<AppState>, plan_id: String,
     })
 }
 
+/// Folders copied whole, on the library drive ("100% 복사 폴더"): reads the index only.
+#[tauri::command(async)]
+fn copy_folders(state: State<'_, AppState>) -> CmdResult<media_core::folders::Found> {
+    let conn = state.db.conn().map_err(err)?;
+    media_core::folders::find(&conn).map_err(err)
+}
+
+/// Remove the chosen copy folders (each file compared with its twin before it is deleted).
+#[tauri::command]
+fn start_remove_copy_folders(app: AppHandle, state: State<AppState>, picks: Vec<media_core::folders::Pick>, purge: bool) -> CmdResult<()> {
+    spawn_job(&app, &state, "cleanup:folders", move |st, progress| {
+        let r = media_core::folders::remove(&st.db, &picks, purge, &st.stop, progress)?;
+        // Plans made before no longer match what is on the drive.
+        st.plans.locked().clear();
+        Ok(r)
+    })
+}
+
+#[tauri::command]
+fn open_folder(app: AppHandle, path: String) -> CmdResult<()> {
+    if !Path::new(&path).is_dir() {
+        return Err("폴더를 찾을 수 없습니다".into());
+    }
+    app.opener().open_path(path, None::<&str>).map_err(err)
+}
+
 /// The files that are the same photo as this one: where the original is and what the others are.
 #[tauri::command]
 fn file_family(state: State<AppState>, id: i64) -> CmdResult<Option<media_core::identity::Family>> {
@@ -1552,6 +1578,9 @@ pub fn run() {
             clear_library_excluded,
             library_delete_preview,
             start_library_delete,
+            copy_folders,
+            start_remove_copy_folders,
+            open_folder,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Media Organizer");

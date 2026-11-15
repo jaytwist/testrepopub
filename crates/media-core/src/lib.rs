@@ -11,6 +11,7 @@ pub mod cleanup;
 pub mod compare;
 pub mod dedupe;
 pub mod faces;
+pub mod folders;
 pub mod identity;
 pub mod importer;
 pub mod journal;

@@ -59,6 +59,8 @@ const STAGE_NAMES: Record<string, string> = {
   plan: "정리 계획 만드는 중",
   run: "파일 이동 중",
   quarantine: "격리함으로 옮기는 중",
+  move: "복사 폴더에서 꺼내는 중",
+  verify: "원본과 끝까지 비교하며 지우는 중",
   done: "마무리 중",
 };
 
@@ -86,6 +88,10 @@ function doneText(d: JobDone): string {
     return parts.join(" · ") + " — 「작업 기록」에서 되돌릴 수 있습니다";
   }
   if (d.job === "import:preview") return "SD 카드를 확인했습니다";
+  if (d.job === "cleanup:folders") {
+    const n = (r.folders ?? 0) + (r.partial ?? 0);
+    return `복사 폴더 ${fmtCount(n)}개를 정리했습니다 (${fmtBytes(r.bytes ?? 0)})`;
+  }
   if (d.job === "scan" && Array.isArray(d.result?.scan)) {
     const s = (d.result.scan as Record<string, number>[]).reduce(
       (a, x) => ({

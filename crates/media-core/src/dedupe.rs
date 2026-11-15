@@ -381,7 +381,13 @@ impl DupRules {
 
     /// 0 = in a keep folder, 1 = no rule, 2 = in a drop folder.
     fn class(&self, f: &FileRow) -> u8 {
-        let p = norm_path(&f.abs_path().to_string_lossy());
+        self.class_of_path(&f.abs_path().to_string_lossy())
+    }
+
+    /// The same for any path (a file or a folder): 0 = in a keep folder, 1 = no rule, 2 = in a
+    /// drop folder.
+    pub fn class_of_path(&self, abs: &str) -> u8 {
+        let p = norm_path(abs);
         let inside = |dirs: &[String]| {
             dirs.iter().map(|d| norm_path(d)).any(|d| !d.is_empty() && (p == d || p.starts_with(&format!("{d}/"))))
         };

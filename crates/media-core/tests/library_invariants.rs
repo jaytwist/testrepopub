@@ -1,7 +1,7 @@
 //! Whatever the order of operations, organizing never loses a photo:
 //! random libraries (copies, renamed copies, undated files, photos only on another drive) go
 //! through random sequences of plan / push one year (deleting copies or not) / run everything /
-//! undo / rescan. After every step:
+//! remove whole-folder copies / undo / rescan. After every step:
 //! 1. every content that existed at the start still exists somewhere (copies may go, the last
 //!    one of a content never does);
 //! 2. the other drive is exactly as it was;
@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use media_core::folders::{self as copy_folders, FolderRef, Pick};
 use media_core::journal;
 use media_core::library::LibraryOptions;
 use media_core::organizer::{self, ExecOptions, OrganizeOptions};
@@ -104,6 +105,20 @@ fn run(seed: u64) {
             }
         }
     }
+    // Whole folders copied as they are (a file inside renamed now and then).
+    for n in 0..2 {
+        let name = folders[rng.below(folders.len())];
+        let (src, dst) = (e.join(name), e.join(format!("복사/{n}/{} - 복사본", name.rsplit('/').next().unwrap())));
+        if src.is_dir() {
+            fs::create_dir_all(&dst).unwrap();
+            for f in files_under(&src) {
+                let to = dst.join(f.strip_prefix(&src).unwrap());
+                fs::create_dir_all(to.parent().unwrap()).unwrap();
+                let to = if rng.chance(15) { to.with_file_name(format!("r{}", to.file_name().unwrap().to_string_lossy())) } else { to };
+                fs::copy(&f, &to).unwrap();
+            }
+        }
+    }
     fs::write(e.join("옛날/유럽 여행/notes.txt"), "not a photo").ok();
 
     let db = Db::open(tmp.path().join("app/library.db")).unwrap();
@@ -123,6 +138,9 @@ fn run(seed: u64) {
         library: LibraryOptions::default(),
         ..Default::default()
     };
+
+    // The library location is a saved setting in the app (what tells the drives apart).
+    media_core::importer::ImportSettings { target_dir: opts.target_dir.clone(), ..Default::default() }.save(&conn).unwrap();
 
     // What was done so far (shown when a check fails), and the batches made, in order.
     let log: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
@@ -144,7 +162,7 @@ fn run(seed: u64) {
     };
 
     for round in 0..10 {
-        match rng.below(5) {
+        match rng.below(6) {
             // Push one year that has work, deleting its copies for good or not.
             0 | 1 => {
                 let plan = organizer::plan(&db, &opts, &stop, &quiet).unwrap();
@@ -176,6 +194,26 @@ fn run(seed: u64) {
                     let r = journal::undo_batch(&conn, b);
                     check(&format!("round {round}: undo {} -> {:?}", state[b].1, r.map(|u| (u.restored, u.failed))));
                 }
+            }
+            // Remove whole-folder copies: the suggested ones, or keeping a copy instead.
+            4 => {
+                let found = copy_folders::find(&conn).unwrap();
+                let r = |f: &copy_folders::FolderInfo| FolderRef { volume_id: f.volume_id, rel_dir: f.rel_dir.clone() };
+                let mut picks: Vec<Pick> = Vec::new();
+                for s in &found.sets {
+                    if rng.chance(30) {
+                        // The first copy stays; the suggested folder and the other copies go.
+                        picks.push(Pick { keep: r(&s.copies[0]), copy: r(&s.keep) });
+                        picks.extend(s.copies[1..].iter().map(|c| Pick { keep: r(&s.copies[0]), copy: r(c) }));
+                    } else {
+                        picks.extend(s.copies.iter().map(|c| Pick { keep: r(&s.keep), copy: r(c) }));
+                    }
+                }
+                let purge = rng.chance(60);
+                let rep = copy_folders::remove(&db, &picks, purge, &stop, &quiet).unwrap();
+                assert_eq!(rep.failed, 0, "seed {seed} round {round} copy folders: {:?} after:\n  {}", rep.errors, log.borrow().join("\n  "));
+                made_batches.extend(Some(rep.batch_id.clone()).filter(|b| !b.is_empty()));
+                check(&format!("round {round}: remove {} copy folders (purge {purge}) -> {} files, {} skipped", picks.len(), rep.files, rep.skipped));
             }
             _ => {
                 scan();

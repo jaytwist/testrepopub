@@ -5,6 +5,7 @@ import {
   type CleanupSummary, type DupSummary, type FileFilter, type GroupBy, type TriageKind,
 } from "../api";
 import { useJob, useNav } from "../App";
+import CopyFolders from "../components/CopyFolders";
 import Triage from "../components/Triage";
 
 type Tier = "safe" | "quick" | "check";
@@ -50,6 +51,7 @@ export default function Cleanup() {
   const [freed, setFreed] = useState(0);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  const [folderBytes, setFolderBytes] = useState(0);
   const [triage, setTriage] = useState<{ kind: TriageKind; variant?: "safe" | "edited"; title: string } | null>(null);
 
   const load = useCallback(() => {
@@ -181,8 +183,9 @@ export default function Cleanup() {
         <div className="cleanup-hero card">
           <div>
             <div className="muted small">정리하면 확보할 수 있는 공간</div>
-            <div className="hero-num">{fmtBytes(s.total_bytes)}</div>
+            <div className="hero-num">{fmtBytes(s.total_bytes + folderBytes)}</div>
             <div className="hero-tiers small">
+              {folderBytes > 0 && <span className="t-first">100% 복사 폴더 {fmtBytes(folderBytes)}</span>}
               <span className="t-safe">안전 {fmtBytes(tierBytes("safe"))}</span>
               <span className="t-quick">빠르게 볼 것 {fmtBytes(tierBytes("quick"))}</span>
               <span className="t-check">확인 필요 {fmtBytes(tierBytes("check"))}</span>
@@ -201,6 +204,8 @@ export default function Cleanup() {
           </div>
         </div>
       )}
+
+      <CopyFolders onTotals={setFolderBytes} />
 
       {TIERS.map((t) => {
         const list = cards.filter((c) => c.tier === t.id);

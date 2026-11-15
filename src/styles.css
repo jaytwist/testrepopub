@@ -321,6 +321,27 @@ kbd { font: 11px/1 ui-monospace, Consolas, monospace; border: 1px solid var(--li
 .tier-quick .tier-title::before { background: var(--accent); }
 .tier-check .tier-title::before { background: #d97706; }
 .tier-note { margin: 0 0 8px; }
+.tier-first .tier-title::before { background: #7c3aed; }
+.hero-tiers .t-first { color: #7c3aed; font-weight: 600; }
+.cf-card { gap: 10px; }
+.cf-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.cf-list { display: flex; flex-direction: column; gap: 8px; max-height: 520px; overflow-y: auto; }
+.cf-set { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.cf-row { display: grid; grid-template-columns: 76px minmax(0, 1fr) auto; grid-template-areas: "tag path btns" "tag meta btns"; column-gap: 10px; align-items: center; padding: 6px 10px; }
+.cf-row + .cf-row { border-top: 1px solid var(--line); }
+.cf-row.keep { background: var(--ok-soft); }
+.cf-row.stay { opacity: 0.7; }
+.cf-tag { grid-area: tag; font-size: 12px; font-weight: 600; display: flex; align-items: center; gap: 4px; white-space: nowrap; }
+.cf-tag.keep { color: var(--ok); }
+.cf-tag.go { color: var(--bad); }
+.cf-path { grid-area: path; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; unicode-bidi: plaintext; }
+.cf-meta { grid-area: meta; }
+.cf-btns { grid-area: btns; display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.cf-photos { display: flex; align-items: center; gap: 6px; padding: 8px 10px; border-top: 1px solid var(--line); overflow-x: auto; }
+.cf-photos img { width: 88px; height: 88px; object-fit: cover; border-radius: 6px; background: var(--panel-2); flex: none; }
+.cf-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; position: sticky; bottom: 0; background: var(--panel); padding-top: 8px; border-top: 1px solid var(--line); }
+.cf-result ul { margin: 6px 0; padding-left: 18px; }
+.cf-left { font-size: 11px; word-break: break-all; }
 .hero-tiers { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 4px; }
 .hero-tiers .t-safe { color: var(--ok); }
 .hero-tiers .t-quick { color: var(--accent); }

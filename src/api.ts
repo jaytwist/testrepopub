@@ -182,6 +182,20 @@ export interface DiskSpace { free: number; total: number; reserve: number }
 export interface Merge { from: string; into: string }
 export interface FolderDeletePreview { count: number; bytes: number; not_copied: number; protected: Blocked[] }
 export interface FolderDeleteReport { batch_id: string; deleted: number; bytes: number; kept_protected: number; not_copied: number; failed: number; errors: string[] }
+export interface CopyFolderInfo {
+  volume_id: number; rel_dir: string; abs_path: string; created: number | null; modified: number | null;
+  keep_rule: boolean; filed: boolean; names: string;
+}
+export interface CopyFolderSet {
+  keep: CopyFolderInfo; keep_why: "keep_rule" | "filed" | "oldest" | ""; copies: CopyFolderInfo[];
+  files: number; bytes: number; sample: number[];
+}
+export interface CopyFolders { sets: CopyFolderSet[]; unread: number; drive: string | null }
+export interface CopyFolderPick { keep: { volume_id: number; rel_dir: string }; copy: { volume_id: number; rel_dir: string } }
+export interface CopyFolderReport {
+  batch_id: string; folders: number; partial: number; skipped: number; skipped_why: string[]; files: number; bytes: number; purged: boolean;
+  different: number; other_deleted: number; left: number; left_examples: string[]; labels_moved: number; failed: number; errors: string[]; cancelled: boolean;
+}
 export interface ExecReport {
   batch_id: string; done: number; failed: number; bytes: number; sidecars: number; removed: number; removed_bytes: number;
   remove_skipped: number; copies_batch: string; versions_batch: string; versions: number; purged: number; purged_bytes: number;
@@ -324,6 +338,9 @@ export const api = {
   libraryDeletePreview: (planId: string, groups: string[]) => invoke<FolderDeletePreview>("library_delete_preview", { planId, groups }),
   startLibraryDelete: (planId: string, groups: string[], keepProtected: boolean) =>
     invoke<void>("start_library_delete", { planId, groups, keepProtected }),
+  copyFolders: () => invoke<CopyFolders>("copy_folders"),
+  startRemoveCopyFolders: (picks: CopyFolderPick[], purge: boolean) => invoke<void>("start_remove_copy_folders", { picks, purge }),
+  openFolder: (path: string) => invoke<void>("open_folder", { path }),
   planTree: (planId: string) => invoke<TreeNode[]>("plan_tree", { planId }),
   getLibraryRules: () => invoke<FolderRule[]>("get_library_rules"),
   setLibraryRules: (rules: FolderRule[]) => invoke<void>("set_library_rules", { rules }),

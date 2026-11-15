@@ -81,7 +81,27 @@ fn library_plan_many_files() {
         }
         tx.commit().unwrap();
     }
-    println!("{n} index rows written in {:.2?}", t.elapsed());
+    // Whole-folder copies: every 2010 event folder once more under 통복사 (the folders exist on
+    // disk, empty: only their dates are read).
+    let copied = conn
+        .execute(
+            "INSERT INTO files(volume_id, rel_path, name, ext, kind, size, mtime, taken_at, date_source, prehash)
+             SELECT volume_id, '통복사/' || rel_path, name, ext, kind, size, mtime, taken_at, date_source, prehash
+             FROM files WHERE volume_id = ?1 AND rel_path LIKE '옛날/2010-%'",
+            params![ve],
+        )
+        .unwrap();
+    {
+        let mut st = conn.prepare("SELECT DISTINCT rtrim(rel_path, replace(rel_path, '/', '')) FROM files WHERE volume_id = ?1 AND rel_path LIKE '%옛날/2010-%'").unwrap();
+        for d in st.query_map(params![ve], |r| r.get::<_, String>(0)).unwrap() {
+            std::fs::create_dir_all(e.join(d.unwrap())).unwrap();
+        }
+    }
+    println!("{n} index rows written in {:.2?} (+{copied} in copied folders)", t.elapsed());
+    let t = Instant::now();
+    let found = media_core::folders::find(&conn).unwrap();
+    println!("copy folders: {} sets, {} files in copies, found in {:.2?}", found.sets.len(), found.sets.iter().map(|s| s.files * s.copies.len() as u64).sum::<u64>(), t.elapsed());
+    assert!(!found.sets.is_empty());
     let opts = OrganizeOptions {
         target_dir: e.join("사진").to_string_lossy().into_owned(),
         layout: "library".into(),
