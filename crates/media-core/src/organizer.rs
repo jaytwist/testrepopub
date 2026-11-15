@@ -98,6 +98,8 @@ pub struct PlanItem {
     pub event: Option<String>,
     pub from: String,
     pub kept: Option<i64>,
+    /// The file's drive (with `from`, identifies the source folder for folder rules).
+    pub vol: i64,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -384,7 +386,12 @@ pub fn plan(db: &Db, opts: &OrganizeOptions, stop: &StopFlag, progress: Progress
         summary.total += 1;
         let src = f.abs_path();
         let uncertain = meta::confidence(&f.date_source) == "low";
-        if uncertain {
+        // Library: what lands in 「_날짜확인필요」 (an undated scan in a dated event folder does not).
+        let to_check = match placements.get(id) {
+            Some(p) if library => matches!(p.act, crate::library::Act::Move | crate::library::Act::Copy) && p.rel_dir.split('/').any(|s| s == "_날짜확인필요"),
+            _ => uncertain,
+        };
+        if to_check {
             summary.uncertain_dates += 1;
         }
         let ctx = TemplateCtx { file: &f, labels, trip: trips.get(id).map(String::as_str), person: persons.get(id).map(String::as_str) };
@@ -412,6 +419,7 @@ pub fn plan(db: &Db, opts: &OrganizeOptions, stop: &StopFlag, progress: Progress
                     event: None,
                     from: p.from_dir.clone(),
                     kept: p.kept,
+                    vol: f.volume_id,
                 });
                 continue;
             }
@@ -440,6 +448,7 @@ pub fn plan(db: &Db, opts: &OrganizeOptions, stop: &StopFlag, progress: Progress
             event: place.and_then(|p| p.event.clone()),
             from: place.map(|p| p.from_dir.clone()).unwrap_or_default(),
             kept: None,
+            vol: f.volume_id,
         };
         if !f.online {
             item.action = Action::SkipOffline;
@@ -551,6 +560,101 @@ pub fn plan(db: &Db, opts: &OrganizeOptions, stop: &StopFlag, progress: Progress
     Ok(Plan { id: uuid::Uuid::new_v4().simple().to_string(), options: opts.clone(), items, summary })
 }
 
+/// One destination folder of a library plan, for the preview tree.
+#[derive(Clone, Debug, Serialize)]
+pub struct TreeNode {
+    /// Folder inside the library (`2024/2024-06/하와이 여행`).
+    pub group: String,
+    pub event: Option<String>,
+    pub tag: String,
+    pub count: u64,
+    pub bytes: i64,
+    pub moves: u64,
+    pub copies: u64,
+    pub in_place: u64,
+    /// The event's source folder (drive + volume-relative path) for renaming / skipping it.
+    pub vol: i64,
+    pub from_dir: String,
+    /// Where its files come from now (folder, count), most first.
+    pub sources: Vec<(String, u64)>,
+}
+
+/// The plan as destination folders (files that land in the library), sorted by path.
+pub fn plan_tree(plan: &Plan) -> Vec<TreeNode> {
+    let mut nodes: HashMap<String, TreeNode> = HashMap::new();
+    let mut srcs: HashMap<String, HashMap<String, u64>> = HashMap::new();
+    for it in plan.items.iter().filter(|i| matches!(i.action, Action::Move | Action::Copy | Action::InPlace | Action::SkipDuplicate)) {
+        let n = nodes.entry(it.group.clone()).or_insert_with(|| TreeNode {
+            group: it.group.clone(),
+            event: it.event.clone(),
+            tag: it.tag.clone(),
+            count: 0,
+            bytes: 0,
+            moves: 0,
+            copies: 0,
+            in_place: 0,
+            vol: it.vol,
+            from_dir: it.from.clone(),
+            sources: Vec::new(),
+        });
+        // The folder's own kind: a RAW / Live Photo / edited version only travels with its photo.
+        let follower = |t: &str| matches!(t, "raw" | "live" | "edited" | "");
+        if follower(&n.tag) && !follower(&it.tag) {
+            n.tag = it.tag.clone();
+        }
+        if n.event.is_none() && it.event.is_some() {
+            n.event = it.event.clone();
+            n.from_dir = it.from.clone();
+            n.vol = it.vol;
+        }
+        n.count += 1;
+        n.bytes += it.size;
+        match it.action {
+            Action::Move => n.moves += 1,
+            Action::Copy => n.copies += 1,
+            _ => n.in_place += 1,
+        }
+        if matches!(it.action, Action::Move | Action::Copy) {
+            let from = Path::new(&it.src).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+            *srcs.entry(it.group.clone()).or_default().entry(from).or_default() += 1;
+        }
+    }
+    let mut out: Vec<TreeNode> = nodes
+        .into_values()
+        .map(|mut n| {
+            let mut s: Vec<(String, u64)> = srcs.remove(&n.group).unwrap_or_default().into_iter().collect();
+            s.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            s.truncate(5);
+            n.sources = s;
+            n
+        })
+        .collect();
+    out.sort_by(|a, b| a.group.cmp(&b.group));
+    out
+}
+
+/// Only the given destination folders of a plan (to try one folder first), with the copies on
+/// the library drive whose kept twin is among them.
+pub fn subset(plan: &Plan, groups: &[String]) -> Plan {
+    let want: HashSet<&str> = groups.iter().map(String::as_str).collect();
+    let mut items: Vec<PlanItem> = plan.items.iter().filter(|i| matches!(i.action, Action::Move | Action::Copy) && want.contains(i.group.as_str())).cloned().collect();
+    let moved: HashSet<i64> = items.iter().map(|i| i.file_id).collect();
+    items.extend(plan.items.iter().filter(|i| i.action == Action::Remove && i.kept.is_some_and(|k| moved.contains(&k))).cloned());
+    let mut summary = PlanSummary::default();
+    for it in &items {
+        match it.action {
+            Action::Move => summary.moves += 1,
+            Action::Copy => {
+                summary.copies += 1;
+                summary.copy_bytes += it.size;
+            }
+            Action::Remove => summary.remove += 1,
+            _ => {}
+        }
+    }
+    Plan { id: plan.id.clone(), options: plan.options.clone(), items, summary }
+}
+
 impl FileRow {
     fn volume_id_uid_differs(&self, conn: &rusqlite::Connection, uid: &str) -> bool {
         conn.query_row("SELECT uid FROM volumes WHERE id = ?", [self.volume_id], |r| r.get::<_, String>(0))
@@ -605,8 +709,13 @@ pub fn execute(db: &Db, plan: &Plan, stop: &StopFlag, progress: ProgressFn) -> R
     }
     let library = plan.options.layout == "library";
     let what = if library {
-        let s = &plan.summary;
-        format!("라이브러리로 모으기 → {} (이동 {} · 복사 {} · 사본 정리 {})", target.display(), s.moves, s.copies, s.remove)
+        let n = |a: Action| plan.items.iter().filter(|i| i.action == a).count();
+        let parts: Vec<String> = [("이동", n(Action::Move)), ("복사", n(Action::Copy)), ("사본 정리", n(Action::Remove))]
+            .iter()
+            .filter(|(_, c)| *c > 0)
+            .map(|(w, c)| format!("{w} {c}"))
+            .collect();
+        format!("라이브러리로 모으기 → {} ({})", target.display(), parts.join(" · "))
     } else {
         let verb = if plan.options.mode == Mode::Move { "이동" } else { "복사" };
         format!("{} → {} ({}개 {verb})", plan.options.template, target.display(), work.len())

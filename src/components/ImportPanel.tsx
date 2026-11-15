@@ -3,12 +3,6 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { api, fmtBytes, fmtCount, type Card, type ImportPreview, type ImportSettings } from "../api";
 import { useJob } from "../App";
 
-const STRUCTURES: { label: string; template: string; example: string }[] = [
-  { label: "연도 / 연-월", template: "{year}/{year}-{month}", example: "2026/2026-11/IMG_0001.JPG" },
-  { label: "연-월", template: "{year}-{month}", example: "2026-11/IMG_0001.JPG" },
-  { label: "연도 / 날짜", template: "{year}/{date}", example: "2026/2026-11-08/IMG_0001.JPG" },
-  { label: "그대로 한 폴더", template: "", example: "IMG_0001.JPG" },
-];
 
 /**
  * Import from a camera card: only photos not already on another drive are copied into the backup
@@ -93,7 +87,6 @@ export default function ImportPanel({ card, onClose }: { card: Card; onClose: ()
     onClose();
   };
 
-  const structure = STRUCTURES.find((s) => s.template === settings?.template);
 
   return (
     <div className="send-back" onClick={cancel}>
@@ -112,17 +105,10 @@ export default function ImportPanel({ card, onClose }: { card: Card; onClose: ()
           <b className="mono path-tail" title={settings?.target_dir}><bdi>{settings?.target_dir || "아직 고르지 않음"}</bdi></b>
           <button className="btn small" onClick={pickTarget}>바꾸기</button>
         </div>
-        <div className="import-row">
-          <span className="muted">폴더 구조</span>
-          <div className="seg">
-            {STRUCTURES.map((s) => (
-              <button key={s.label} className={settings?.template === s.template ? "on" : ""} onClick={() => settings && save({ ...settings, template: s.template })}>
-                {s.label}
-              </button>
-            ))}
-          </div>
+        <div className="muted small">
+          라이브러리와 같은 구조로 들어갑니다: <span className="mono">연도/연-월</span>, 여행이면 여행 폴더, RAW는 <span className="mono">RAW</span> 하위 폴더,
+          xmp·aae 같은 딸린 파일도 함께.
         </div>
-        {structure && <div className="muted small mono">예: {settings?.target_dir || "…"}/{structure.example}</div>}
 
         <div className="import-result">
           {phase === "checking" && <span className="muted">카드의 사진을 확인하는 중…</span>}

@@ -3,6 +3,7 @@ import { open, confirm } from "@tauri-apps/plugin-dialog";
 import { api, fmtBytes, fmtCount, type FileFilter, type FilteredStats, type OrganizeOptions, type PlanItem, type PlanView } from "../api";
 import { useJob } from "../App";
 import FilterBar from "../components/FilterBar";
+import LibraryPlan from "../components/LibraryPlan";
 
 const PRESETS = [
   { tpl: "{year}/{year}-{month}", name: "연도 / 연-월", example: "2019/2019-05/IMG_0001.jpg" },
@@ -35,6 +36,11 @@ export default function Organize({ preset }: { preset?: { key: number; filter: F
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<any>(null);
   const [target, setTarget] = useState<FilteredStats | null>(null);
+  /** "library" (recommended: year / month / event) unless opened with a specific structure. */
+  const [mode, setMode] = useState<"library" | "template">(preset?.template || preset?.filter ? "template" : "library");
+  useEffect(() => {
+    if (preset) setMode("template");
+  }, [preset?.key]);
 
   useEffect(() => {
     api.filteredStats(opts.filter).then(setTarget).catch(() => setTarget(null));
@@ -113,14 +119,30 @@ export default function Organize({ preset }: { preset?: { key: number; filter: F
       ]
     : [];
 
+  const header = (
+    <header className="page-head">
+      <div>
+        <h1>한 곳으로 정리</h1>
+        <div className="muted">흩어진 사진·동영상을 하나의 폴더에 모읍니다. 먼저 미리보기로 결과를 확인한 뒤 실행하세요.</div>
+      </div>
+      <div className="seg">
+        <button className={mode === "library" ? "on" : ""} onClick={() => setMode("library")}>라이브러리로 모으기 (추천)</button>
+        <button className={mode === "template" ? "on" : ""} onClick={() => setMode("template")}>구조 직접 정하기</button>
+      </div>
+    </header>
+  );
+  if (mode === "library") {
+    return (
+      <div className="page">
+        {header}
+        <LibraryPlan />
+      </div>
+    );
+  }
+
   return (
     <div className="page">
-      <header className="page-head">
-        <div>
-          <h1>한 곳으로 정리</h1>
-          <div className="muted">흩어진 사진·동영상을 하나의 폴더에 날짜별로 모읍니다. 먼저 미리보기로 결과를 확인한 뒤 실행하세요.</div>
-        </div>
-      </header>
+      {header}
       {error && <div className="alert bad">{error}</div>}
       {result && (
         <div className={`alert ${result.failed ? "bad" : "ok"}`}>

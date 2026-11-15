@@ -1045,13 +1045,38 @@ fn plan_items(state: State<AppState>, plan_id: String, action: Option<String>, o
 }
 
 #[tauri::command]
-fn start_execute(app: AppHandle, state: State<AppState>, plan_id: String) -> CmdResult<()> {
+fn start_execute(app: AppHandle, state: State<AppState>, plan_id: String, groups: Option<Vec<String>>) -> CmdResult<()> {
     let plan = state.plans.lock().unwrap().get(&plan_id).cloned().ok_or("계획이 만료되었습니다. 다시 미리보기를 실행하세요")?;
     spawn_job(&app, &state, "organize:run", move |st, progress| {
-        let r = organizer::execute(&st.db, &plan, &st.stop, progress)?;
+        // Only some folders ("try one first"): the plan is kept for the rest (re-plan after).
+        let r = match &groups {
+            Some(g) => organizer::execute(&st.db, &organizer::subset(&plan, g), &st.stop, progress)?,
+            None => organizer::execute(&st.db, &plan, &st.stop, progress)?,
+        };
         st.plans.lock().unwrap().remove(&plan.id);
         Ok(r)
     })
+}
+
+/// The library plan as destination folders.
+#[tauri::command]
+fn plan_tree(state: State<AppState>, plan_id: String) -> CmdResult<Vec<organizer::TreeNode>> {
+    let plans = state.plans.lock().unwrap();
+    let plan = plans.get(&plan_id).ok_or("계획이 만료되었습니다. 다시 미리보기를 실행하세요")?;
+    Ok(organizer::plan_tree(plan))
+}
+
+#[tauri::command]
+fn get_library_rules(state: State<AppState>) -> CmdResult<Vec<media_core::library::FolderRule>> {
+    let conn = state.db.conn().map_err(err)?;
+    media_core::library::load_rules(&conn).map_err(err)
+}
+
+/// Remember a correction for a source folder (event name, not an event, leave it out).
+#[tauri::command]
+fn set_library_rules(state: State<AppState>, rules: Vec<media_core::library::FolderRule>) -> CmdResult<()> {
+    let conn = state.db.conn().map_err(err)?;
+    media_core::library::save_rules(&conn, &rules).map_err(err)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1239,6 +1264,9 @@ pub fn run() {
             merge_people,
             reject_faces,
             protect_check,
+            plan_tree,
+            get_library_rules,
+            set_library_rules,
             list_cards,
             get_import_settings,
             set_import_settings,

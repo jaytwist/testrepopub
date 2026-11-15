@@ -110,6 +110,8 @@ const GENERIC: &[&str] = &[
     "export", "exports", "edited", "edit", "보정", "편집", "takeout", "google photos", "google 포토", "icloud photos", "icloud", "onedrive",
     "dropbox", "google drive", "desktop", "바탕 화면", "documents", "문서", "users", "user", "home", "media", "files", "data", "temp", "tmp",
     "받은 사진", "큰 동영상", "_날짜확인필요", "기타", "etc", "misc", "all", "sdcard", "internal storage", "phone", "iphone", "android",
+    "폰사진", "폰 사진", "휴대폰", "휴대폰 사진", "핸드폰", "핸드폰 사진", "스마트폰", "카메라", "캠코더", "camcorder", "phone photos", "mobile",
+    "사진 백업", "옛날사진", "옛날 사진", "old photos", "정리", "미정리", "정리 안 됨", "unsorted", "inbox", "import", "imports", "가져오기",
 ];
 
 /// Leading date (and an optional range) in a folder name: `2015-08-14 제주도`, `20150814_제주`,
@@ -120,13 +122,31 @@ static RE_LEAD_DATE: Lazy<Regex> = Lazy::new(|| {
     )
     .unwrap()
 });
+/// `2024년 6월 (12일)` written the Korean way, turned into `2024-06(-12)`.
+static RE_KO_DATE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^\s*((?:19|20)\d{2})\s*년\s*(\d{1,2})\s*월(?:\s*(\d{1,2})\s*일)?").unwrap());
+
+fn normalize_date(s: &str) -> String {
+    match RE_KO_DATE.captures(s) {
+        Some(c) => {
+            let m: u32 = c[2].parse().unwrap_or(0);
+            let head = match c.get(3).and_then(|d| d.as_str().parse::<u32>().ok()) {
+                Some(d) => format!("{}-{m:02}-{d:02}", &c[1]),
+                None => format!("{}-{m:02}", &c[1]),
+            };
+            format!("{head}{}", &s[c.get(0).map(|m| m.end()).unwrap_or(0)..])
+        }
+        None => s.to_string(),
+    }
+}
+
 static RE_CAMERA_DIR: Lazy<Regex> = Lazy::new(|| Regex::new(r"^\d{3}[A-Z0-9_]{5}$").unwrap());
 static RE_PHOTOS_FROM: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)^photos from \d{4}$").unwrap());
 
 /// The event name a folder stands for, or None when the name says nothing (camera / app /
 /// generic folders, dates alone, numbers).
 pub fn event_name(folder: &str) -> Option<String> {
-    let f = folder.trim();
+    let normalized = normalize_date(folder);
+    let f = normalized.trim();
     if f.is_empty() || RE_CAMERA_DIR.is_match(f) || RE_PHOTOS_FROM.is_match(f) || GENERIC.contains(&f.to_lowercase().as_str()) {
         return None;
     }
@@ -146,7 +166,8 @@ pub fn event_name(folder: &str) -> Option<String> {
 
 /// (year, month) written at the start of a folder name, if any.
 pub fn folder_month(folder: &str) -> Option<(i32, u32)> {
-    let c = RE_LEAD_DATE.captures(folder)?;
+    let folder = normalize_date(folder);
+    let c = RE_LEAD_DATE.captures(&folder)?;
     let y: i32 = c.get(1)?.as_str().parse().ok()?;
     let m: u32 = c.get(2)?.as_str().parse().ok()?;
     Some((y, m))
@@ -297,11 +318,19 @@ pub fn layout(conn: &Connection, lib_vol: i64, ids: &[i64], opts: &LibraryOption
             "SELECT m.group_id, m.file_id, m.variant FROM dup_members m JOIN dup_groups g ON g.id = m.group_id
              WHERE g.kind = 'similar_image' AND g.resolved = 0 ORDER BY m.group_id, m.rank",
         )?;
+        // A member whose content is kept elsewhere (a copy already in the library) stands for that
+        // copy, so an edited version still finds its original after the original was copied in.
+        let stand_in: HashMap<i64, i64> =
+            act.iter().filter_map(|(id, (a, kept, _))| matches!(a, Act::Leave | Act::Remove).then_some(()).and(kept.map(|k| (*id, k)))).collect();
         let mut by_group: HashMap<i64, Vec<(i64, Option<String>)>> = HashMap::new();
         for r in st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<String>>(2)?)))? {
             let (g, id, v) = r?;
             if wanted.contains(&id) {
-                by_group.entry(g).or_default().push((id, v));
+                let id = stand_in.get(&id).copied().unwrap_or(id);
+                let members = by_group.entry(g).or_default();
+                if !members.iter().any(|(m, _)| *m == id) {
+                    members.push((id, v));
+                }
             }
         }
         for members in by_group.values() {
@@ -380,10 +409,19 @@ pub fn layout(conn: &Connection, lib_vol: i64, ids: &[i64], opts: &LibraryOption
             format!("{root}/{p}")
         }
     };
+    // Undated files (scans) count with the date written on their folder, so a folder holding
+    // "2009-07 제주도" and "2023-12 유럽" is not taken for one event.
+    let mid_month = |(y, m): (i32, u32)| meta::to_ts(chrono::NaiveDate::from_ymd_opt(y, m, 15).and_then(|d| d.and_hms_opt(0, 0, 0)).unwrap_or_default());
     for f in &files {
-        let (Some(t), true) = (f.taken, f.trusted) else { continue };
         let root = root_of(f);
         let segs = segs_of(f, &root);
+        let t = match (f.taken, f.trusted) {
+            (Some(t), true) => t,
+            _ => match segs.iter().rev().find_map(|s| folder_month(s)) {
+                Some(ym) => mid_month(ym),
+                None => continue,
+            },
+        };
         for i in 0..segs.len() {
             let e = span.entry((f.vol, path_at(&root, &segs, i))).or_insert((t, t));
             e.0 = e.0.min(t);
@@ -465,9 +503,11 @@ pub fn layout(conn: &Connection, lib_vol: i64, ids: &[i64], opts: &LibraryOption
         let (rel_dir, tag, event, from_dir) = if let Some((k, name, sp)) = chosen {
             // Month: the date written on the folder when it agrees with the photos, else the first photo.
             let first = sp.map(|s| s.0);
-            let month = match (folder_month(&segs[k]), first) {
+            // The folder's own date, else a date-only folder above it (`2009/2009-07/제주도` already in the library).
+            let written = (0..=k).rev().find_map(|j| folder_month(&segs[j]));
+            let month = match (written, first) {
                 (Some((y, m)), Some(t)) => {
-                    let named = meta::to_ts(chrono::NaiveDate::from_ymd_opt(y, m, 15).and_then(|d| d.and_hms_opt(0, 0, 0)).unwrap_or_default());
+                    let named = mid_month((y, m));
                     if (named - t).abs() <= 31 * 86_400 {
                         Some(format!("{y:04}/{y:04}-{m:02}"))
                     } else {
@@ -500,7 +540,8 @@ pub fn layout(conn: &Connection, lib_vol: i64, ids: &[i64], opts: &LibraryOption
                 .optional()?;
             match month {
                 None => {
-                    let parent = segs.last().map(|s| safe_name(s)).unwrap_or_else(|| "기타".into());
+                    // Named like an event folder ("2024 People" → "People"), so planning again keeps it.
+                    let parent = segs.last().map(|s| event_name(s).unwrap_or_else(|| safe_name(s))).unwrap_or_else(|| "기타".into());
                     (format!("{prefix}_날짜확인필요/{parent}"), "undated", None, f.dir().to_string())
                 }
                 Some(m) if received => (format!("받은 사진/{m}"), "received", None, f.dir().to_string()),
@@ -508,7 +549,8 @@ pub fn layout(conn: &Connection, lib_vol: i64, ids: &[i64], opts: &LibraryOption
                 Some(m) => match trip {
                     Some((title, start)) => {
                         let tm = month_dir(start).unwrap_or(m);
-                        let t = safe_name(&title);
+                        // "2024년 6월 Honolulu 여행" → "Honolulu 여행": the month folder says when.
+                        let t = event_name(&title).unwrap_or_else(|| safe_name(&title));
                         (format!("{prefix}{tm}/{t}"), "trip", Some(t), f.dir().to_string())
                     }
                     None => (format!("{prefix}{m}"), "loose", None, f.dir().to_string()),
@@ -557,6 +599,9 @@ mod tests {
             assert_eq!(event_name(generic), None, "{generic}");
         }
         assert_eq!(folder_month("2015-08-14 제주도"), Some((2015, 8)));
+        assert_eq!(event_name("2024년 6월 Honolulu 여행").as_deref(), Some("Honolulu 여행"));
+        assert_eq!(event_name("2019년 5월 12일 생일").as_deref(), Some("생일"));
+        assert_eq!(folder_month("2024년 6월 Honolulu 여행"), Some((2024, 6)));
         assert_eq!(folder_month("제주도"), None);
         assert_eq!(safe_name("a:b?c."), "a_b_c");
         assert_eq!(safe_name("CON"), "CON_");

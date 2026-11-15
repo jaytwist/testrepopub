@@ -528,3 +528,15 @@ kbd { font: 11px/1 ui-monospace, Consolas, monospace; border: 1px solid var(--li
 .import-row .seg { grid-column: 2 / span 2; flex-wrap: wrap; }
 .import-result { min-height: 24px; font-size: 15px; }
 .card-toast { top: 112px; }
+
+/* Library plan (라이브러리로 모으기) */
+.library-plan .col { display: flex; flex-direction: column; gap: 4px; }
+.lib-tree { display: flex; flex-direction: column; gap: 4px; margin: 10px 0; }
+.lib-sec { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+.lib-sec-head { display: flex; gap: 10px; align-items: center; width: 100%; padding: 8px 12px; border: 0; background: transparent; color: inherit; cursor: pointer; text-align: left; font-size: 14px; }
+.lib-node { padding: 6px 12px 6px 34px; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 2px; }
+.lib-node.done { opacity: 0.6; }
+.lib-node-main { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.lib-node-main .spacer { flex: 1; }
+.lib-src { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lib-removes ul { max-height: 240px; overflow: auto; margin: 6px 0; }

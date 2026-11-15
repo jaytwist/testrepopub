@@ -144,19 +144,31 @@ export interface FileDetail {
 export interface DupMember { file: FileRow; keep: boolean; variant: VariantKind | null }
 export interface DupGroup { id: number; kind: string; members: DupMember[]; reclaimable_bytes: number }
 export interface DupSummary { kind: string; groups: number; files: number; drop_files: number; reclaimable_bytes: number }
+export interface LibraryOptions { big_video_bytes: number; event_span_days: number; remove_copies: boolean; remove_smaller_versions: boolean }
 export interface OrganizeOptions {
   target_dir: string; template: string; rename: "keep" | "date_prefix"; mode: "move" | "copy";
   filter: FileFilter; uncertain_folder: string | null; remove_empty_dirs: boolean;
+  /** "template" or "library" (year / year-month / event from existing folder names). */
+  layout?: "template" | "library"; library?: LibraryOptions;
 }
 export interface PlanSummary {
   total: number; moves: number; copies: number; in_place: number; skip_duplicate: number; skip_offline: number;
   renamed: number; cross_volume: number; bytes: number; uncertain_dates: number; folders: number;
+  leave: number; remove: number; remove_bytes: number; copy_bytes: number; big_videos: number; received: number;
+  paired: number; events: number; leftover_files: number;
 }
+/** One destination folder of a library plan. */
+export interface TreeNode {
+  group: string; event: string | null; tag: string; count: number; bytes: number; moves: number; copies: number; in_place: number;
+  vol: number; from_dir: string; sources: [string, number][];
+}
+export interface FolderRule { volume_id: number; rel_dir: string; kind: "event" | "loose" | "skip"; name: string | null }
 export interface PlanView { id: string; summary: PlanSummary; options: OrganizeOptions }
 export interface PlanItem {
   file_id: number; src: string; dst: string;
-  action: "move" | "copy" | "in_place" | "skip_duplicate" | "skip_offline";
+  action: "move" | "copy" | "in_place" | "skip_duplicate" | "skip_offline" | "leave" | "remove";
   renamed: boolean; cross_volume: boolean; size: number;
+  group: string; tag: string; event: string | null; from: string; kept: number | null; vol: number;
 }
 export interface BatchRow {
   id: string; kind: string; description: string; created_at: number; op_count: number; state: string; bytes: number;
@@ -261,7 +273,11 @@ export const api = {
   startPlan: (options: OrganizeOptions) => invoke<void>("start_plan", { options }),
   planItems: (planId: string, action: string | null, offset: number, limit: number) =>
     invoke<PlanItem[]>("plan_items", { planId, action, offset, limit }),
-  startExecute: (planId: string) => invoke<void>("start_execute", { planId }),
+  /** Run a plan; `groups` runs only those destination folders (try one first). */
+  startExecute: (planId: string, groups?: string[]) => invoke<void>("start_execute", { planId, groups: groups ?? null }),
+  planTree: (planId: string) => invoke<TreeNode[]>("plan_tree", { planId }),
+  getLibraryRules: () => invoke<FolderRule[]>("get_library_rules"),
+  setLibraryRules: (rules: FolderRule[]) => invoke<void>("set_library_rules", { rules }),
 
   batches: () => invoke<BatchRow[]>("batches"),
   startUndo: (batchId: string) => invoke<void>("start_undo", { batchId }),

@@ -33,6 +33,8 @@ fn library_layout_end_to_end() {
     fs::copy(e.join("옛날/2023-12-28 유럽 여행/파리/a1.jpg"), e.join("옛날/backup/a1 copy.jpg")).unwrap();
     fs::create_dir_all(c.join("Pictures")).unwrap();
     fs::copy(e.join("옛날/2023-12-28 유럽 여행/파리/a1.jpg"), c.join("Pictures/a1.jpg")).unwrap();
+    // Undated scans in a dated event folder: the folder's month, kept on re-plan.
+    write_png(&e.join("옛날/2009-07 제주도/scan.png"), &picture(13, 900, 700));
     // A collection over years: sorted by date, not an event.
     jpeg(&e.join("Family/f1.jpg"), 3, "2019:03:01 10:00:00");
     jpeg(&e.join("Family/f2.jpg"), 4, "2021:07:01 10:00:00");
@@ -81,6 +83,7 @@ fn library_layout_end_to_end() {
 
     assert_eq!(dst("파리/a1.jpg"), "2023/2023-12/유럽 여행/파리/a1.jpg", "event kept whole, folder date wins");
     assert_eq!(dst("로마/a2.jpg"), "2023/2023-12/유럽 여행/로마/a2.jpg");
+    assert_eq!(dst("2009-07 제주도/scan.png"), "2009/2009-07/제주도/scan.png", "undated scan follows its folder's date");
     assert_eq!(by_src("backup/a1 copy.jpg").action, Action::Remove, "copy on E removed");
     assert_eq!(by_src("diskC/Pictures/a1.jpg").action, Action::Leave, "copy on C left alone");
     assert_eq!(dst("Family/f1.jpg"), "2019/2019-03/f1.jpg", "a years-long collection is sorted by date");
