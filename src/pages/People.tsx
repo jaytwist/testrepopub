@@ -195,6 +195,12 @@ export default function People() {
           </span>
           <span>찾은 얼굴 <b>{fmtCount(lane.faces_found)}</b>개</span>
           <span>엔진: {lane.provider === "DirectML" ? "그래픽카드(DirectML)" : lane.provider === "CPU" ? "CPU" : lane.faces_available ? "아직 시작 전" : "AI 파일 없음"}</span>
+          {lane.timed_files > 0 && (
+            <span className="muted" title="이번에 앱을 켠 뒤 분석한 사진 기준. 느릴 때 어느 쪽이 오래 걸리는지 알려 줍니다.">
+              사진 한 장: 읽기 {lane.read_ms}ms · 얼굴 {lane.faces_ms}ms
+              {lane.reused > 0 && ` · 사본·RAW ${fmtCount(lane.reused)}장은 다시 분석하지 않음`}
+            </span>
+          )}
           {pending > 0 && <span className="muted">인물은 분석 중에도 몇 분마다 나타납니다</span>}
           {lane.last_error && (
             <>

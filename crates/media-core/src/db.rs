@@ -425,6 +425,17 @@ pub struct GridItem {
 pub const SAME_CONTENT_SQL: &str = "g.size = f.size AND (CASE WHEN g.hash IS NOT NULL AND f.hash IS NOT NULL THEN g.hash = f.hash \
     ELSE g.prehash IS NOT NULL AND g.prehash = f.prehash END)";
 
+/// SQL: `f` (a video) is the motion half of a Live Photo — a photo with the same name sits next
+/// to it (IMG_1234.MOV beside IMG_1234.HEIC / .JPG). Looked up through the (volume, path) index.
+pub fn live_photo_video_sql() -> String {
+    let stem = "substr(f.rel_path, 1, length(f.rel_path) - length(f.ext) - 1)";
+    let alts: Vec<String> = ["HEIC", "heic", "JPG", "jpg", "JPEG", "jpeg"].iter().map(|e| format!("{stem} || '.{e}'")).collect();
+    format!(
+        "EXISTS (SELECT 1 FROM files p WHERE p.volume_id = f.volume_id AND p.rel_path IN ({}) AND p.missing = 0 AND p.quarantined = 0)",
+        alts.join(", ")
+    )
+}
+
 /// SQL: a live copy of `f` exists on another drive.
 fn copy_elsewhere_sql() -> String {
     format!(
@@ -621,7 +632,12 @@ impl FileFilter {
             w.push(match k.as_str() {
                 "screenshot" => "EXISTS (SELECT 1 FROM labels l WHERE l.file_id = f.id AND l.label = 'screenshot')".to_string(),
                 "large_video" => format!("f.kind = 'video' AND f.size >= {}", crate::cleanup::LARGE_VIDEO_BYTES),
-                "short_video" => format!("f.kind = 'video' AND f.duration_ms > 0 AND f.duration_ms < {}", crate::cleanup::SHORT_VIDEO_MS),
+                // The motion half of a Live Photo is short on purpose: never an "accidental" video.
+                "short_video" => format!(
+                    "f.kind = 'video' AND f.duration_ms > 0 AND f.duration_ms < {} AND NOT {}",
+                    crate::cleanup::SHORT_VIDEO_MS,
+                    live_photo_video_sql()
+                ),
                 _ => {
                     p.push(Value::Text(k.clone()));
                     "EXISTS (SELECT 1 FROM suggestions s WHERE s.file_id = f.id AND s.kind = ?)".to_string()

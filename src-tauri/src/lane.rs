@@ -33,6 +33,12 @@ pub struct LaneStatus {
     pub faces_available: bool,
     /// Faces found so far (diagnostics on the People screen).
     pub faces_found: i64,
+    /// Since the app started: photos analysed, average ms reading a photo, average ms on faces,
+    /// and results reused from copies / JPGs instead of analysing.
+    pub timed_files: u64,
+    pub read_ms: u64,
+    pub faces_ms: u64,
+    pub reused: u64,
     pub last_error: Option<String>,
 }
 
@@ -133,6 +139,7 @@ impl Lane {
         if let Ok(conn) = st.db.conn() {
             s.faces_found = conn.query_row("SELECT COUNT(*) FROM faces", [], |r| r.get(0)).unwrap_or(0);
         }
+        (s.timed_files, s.read_ms, s.faces_ms, s.reused) = analysis::TIMING.snapshot();
         s
     }
 

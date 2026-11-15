@@ -108,3 +108,86 @@ pub fn similar_to(conn: &Connection, id: i64, limit: usize) -> Result<Vec<i64>> 
     hits.sort();
     Ok(hits.into_iter().take(limit).map(|(_, fid)| fid).collect())
 }
+
+/// Groups of visually similar photos from the fingerprints analysis already stored (64-bit dHash):
+/// nothing is read from disk. Multi-index hashing: the hash is cut into `max_dist + 1` pieces, and
+/// two hashes within `max_dist` bits always share at least one piece exactly, so only photos that
+/// share a piece are compared. Byte-identical files are left to the exact-duplicate search.
+pub fn similar_groups(conn: &Connection, max_dist: u32) -> Result<Vec<Vec<i64>>> {
+    const MAX_ASPECT_DIFF: f64 = 0.03;
+    /// A bucket this large is a degenerate fingerprint (blank / black frames); not worth n².
+    const MAX_BUCKET: usize = 3000;
+    struct P {
+        id: i64,
+        h: u64,
+        aspect: Option<f64>,
+        content: Option<(String, i64)>,
+    }
+    let mut st = conn.prepare(
+        "SELECT a.file_id, a.dhash, f.width, f.height, COALESCE(f.prehash, f.hash), f.size
+         FROM analysis a JOIN files f ON f.id = a.file_id
+         WHERE a.dhash IS NOT NULL AND f.missing = 0 AND f.quarantined = 0 AND f.kind IN ('photo', 'raw')
+         ORDER BY a.file_id",
+    )?;
+    let ps: Vec<P> = st
+        .query_map([], |r| {
+            let (w, h): (Option<i64>, Option<i64>) = (r.get(2)?, r.get(3)?);
+            let aspect = match (w, h) {
+                (Some(w), Some(h)) if w > 0 && h > 0 => Some(w as f64 / h as f64),
+                _ => None,
+            };
+            let key: Option<String> = r.get(4)?;
+            Ok(P { id: r.get(0)?, h: r.get::<_, i64>(1)? as u64, aspect, content: key.map(|k| (k, r.get::<_, i64>(5).unwrap_or(0))) })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+
+    // Union-find over photo indices.
+    let mut parent: Vec<usize> = (0..ps.len()).collect();
+    fn find(p: &mut [usize], mut x: usize) -> usize {
+        while p[x] != x {
+            p[x] = p[p[x]];
+            x = p[x];
+        }
+        x
+    }
+    let pieces = (max_dist + 1).clamp(1, 16) as usize;
+    let width = 64 / pieces as u32;
+    let mask: u64 = if width >= 64 { u64::MAX } else { (1u64 << width) - 1 };
+    for piece in 0..pieces {
+        let shift = piece as u32 * width;
+        let mut buckets: HashMap<u64, Vec<usize>> = HashMap::new();
+        for (i, p) in ps.iter().enumerate() {
+            buckets.entry((p.h >> shift) & mask).or_default().push(i);
+        }
+        for list in buckets.values().filter(|l| l.len() > 1 && l.len() <= MAX_BUCKET) {
+            for (k, &a) in list.iter().enumerate() {
+                for &b in &list[k + 1..] {
+                    let (pa, pb) = (&ps[a], &ps[b]);
+                    if crate::analysis::hamming(pa.h, pb.h) > max_dist {
+                        continue;
+                    }
+                    if let (Some(x), Some(y)) = (pa.aspect, pb.aspect) {
+                        if (x - y).abs() / x > MAX_ASPECT_DIFF {
+                            continue;
+                        }
+                    }
+                    if pa.content.is_some() && pa.content == pb.content {
+                        continue; // byte-identical: an exact duplicate, not a "version"
+                    }
+                    let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+                    if ra != rb {
+                        parent[ra.max(rb)] = ra.min(rb);
+                    }
+                }
+            }
+        }
+    }
+    let mut groups: HashMap<usize, Vec<i64>> = HashMap::new();
+    for i in 0..ps.len() {
+        let r = find(&mut parent, i);
+        groups.entry(r).or_default().push(ps[i].id);
+    }
+    let mut out: Vec<Vec<i64>> = groups.into_values().filter(|g| g.len() > 1).collect();
+    out.sort();
+    Ok(out)
+}

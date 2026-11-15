@@ -2,7 +2,7 @@
 //!
 //! * exact:          computed from our own index (size -> 64 KiB prehash -> full BLAKE3). Hashes are
 //!                   stored back in `files.hash`, so re-runs only hash new/changed files.
-//! * similar_image:  czkawka_core `SimilarImages` (perceptual hash + BK-tree, with its own cache).
+//! * similar_image:  the 64-bit dHash stored by analysis, searched in the database (nothing re-read).
 //! * similar_video:  czkawka_core `SimilarVideos` (needs the bundled ffmpeg on PATH).
 //!
 //! Nothing is deleted here. Groups get a suggested "keep" member; applying a group quarantines
@@ -16,10 +16,6 @@ use std::sync::Once;
 use anyhow::{anyhow, bail, Result};
 use czkawka_core::common::tool_data::CommonData;
 use czkawka_core::common::traits::Search;
-use czkawka_core::re_exported::{FilterType, HashAlg};
-use czkawka_core::tools::similar_images::{
-    return_similarity_from_similarity_preset, GeometricInvariance, SimilarImages, SimilarImagesParameters, SimilarityPreset,
-};
 use czkawka_core::tools::similar_videos::{self as sv, SimilarVideos, SimilarVideosParameters};
 use rayon::prelude::*;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -225,48 +221,30 @@ pub enum Similarity {
     Medium,
 }
 
-/// Visually similar images (resized, recompressed, lightly edited copies).
+/// Visually similar images (resized, recompressed, lightly edited copies), found from the
+/// fingerprints the background analysis already stored: no photo is opened again, so this takes
+/// seconds even for hundreds of thousands of photos. Photos not analysed yet join in later.
 pub fn find_similar_images(db: &Db, similarity: Similarity, stop: &StopFlag, progress: ProgressFn) -> Result<DedupeStats> {
     let mut conn = db.conn()?;
     volumes::refresh(&conn)?;
-    let roots = source_roots(&conn)?;
-    if roots.is_empty() {
-        bail!("연결된 소스 폴더가 없습니다");
-    }
-    let preset = match similarity {
-        Similarity::VeryHigh => SimilarityPreset::VeryHigh,
-        Similarity::High => SimilarityPreset::High,
-        Similarity::Medium => SimilarityPreset::Medium,
+    // Bits (of 64) two versions of one photo may differ by. A messenger copy scores 0–2;
+    // different photos of a similar scene start around 4.
+    let max_dist = match similarity {
+        Similarity::VeryHigh => 1,
+        Similarity::High => 3,
+        Similarity::Medium => 5,
     };
-    let hash_size = 16;
-    let params = SimilarImagesParameters::new(
-        return_similarity_from_similarity_preset(preset, hash_size),
-        hash_size,
-        HashAlg::Gradient,
-        FilterType::Lanczos3,
-        false,
-        false,
-        GeometricInvariance::Off,
-    );
-    let mut finder = SimilarImages::new(params);
-    finder.set_included_paths(roots.clone());
-    finder.set_excluded_paths(quarantine_roots(&roots));
-    finder.set_recursive_search(true);
-    finder.set_use_cache(true);
-    finder.set_minimal_file_size(10 * 1024);
-
-    let results: Vec<Vec<PathBuf>> = std::thread::scope(|s| {
-        let (tx, drain) = forward_progress("dedupe:similar_image", progress);
-        let h = s.spawn(drain);
-        finder.search(stop.inner(), Some(&tx));
-        drop(tx);
-        let _ = h.join();
-        finder.get_similar_images().iter().map(|g| g.iter().map(|e| e.path.clone()).collect()).collect()
-    });
+    progress(Progress::new("dedupe:similar_image", "compare", 0, 1, ""));
+    let ids = crate::compare::similar_groups(&conn, max_dist)?;
     if stop.is_stopped() {
         bail!("cancelled");
     }
-    let groups = map_paths_to_rows(&conn, results)?;
+    let groups: Vec<Vec<FileRow>> = ids
+        .into_iter()
+        .map(|g| g.into_iter().filter_map(|id| crate::db::get_file(&conn, id).ok().flatten()).collect::<Vec<_>>())
+        .filter(|g| g.len() > 1)
+        .collect();
+    progress(Progress::new("dedupe:similar_image", "compare", 1, 1, ""));
     save_groups(&mut conn, DupKind::SimilarImage, groups)
 }
 

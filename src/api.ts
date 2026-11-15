@@ -169,6 +169,7 @@ export interface LaneStatus {
   running: boolean; paused: boolean; reason: "user" | "job" | "battery" | null; done: number; total: number;
   eta_secs: number; current: string; provider: string; pending_online: number; pending_offline: number;
   analyzed: number; faces_available: boolean; faces_found: number; last_error: string | null;
+  timed_files: number; read_ms: number; faces_ms: number; reused: number;
 }
 export interface AnalysisOptions { auto: boolean; people: boolean; gpu: boolean; pause_on_battery: boolean }
 export interface AppInfo { version: string; data_dir: string; cache_dir: string; ffmpeg: boolean; job: string | null }

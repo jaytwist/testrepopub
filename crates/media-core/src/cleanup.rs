@@ -213,8 +213,9 @@ pub fn summary(conn: &Connection) -> Result<CleanupSummary> {
         conn,
         &format!(
             "SELECT COUNT(*), COALESCE(SUM(f.size), 0) FROM files f WHERE {live} AND f.kind = 'video'
-               AND f.duration_ms > 0 AND f.duration_ms < {SHORT_VIDEO_MS}
-               AND NOT EXISTS (SELECT 1 FROM dismissals d WHERE d.file_id = f.id AND d.kind = 'short_video')"
+               AND f.duration_ms > 0 AND f.duration_ms < {SHORT_VIDEO_MS} AND NOT {}
+               AND NOT EXISTS (SELECT 1 FROM dismissals d WHERE d.file_id = f.id AND d.kind = 'short_video')",
+            crate::db::live_photo_video_sql()
         ),
     )?;
     let exact_duplicates = crate::dedupe::summary(conn)?

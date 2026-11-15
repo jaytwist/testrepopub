@@ -173,6 +173,16 @@ fn accidental_short_videos() {
     assert_eq!(cleanup::summary(&conn).unwrap().short_videos.count, 1);
     let ids = db::query_ids(&conn, &db::FileFilter { suggest: Some("short_video".into()), ..Default::default() }).unwrap();
     assert_eq!(ids.len(), 1);
+    // A Live Photo's motion half (IMG_7.MOV next to IMG_7.HEIC) is short on purpose: not suggested.
+    for (name, kind, ext, ms) in [("live/IMG_7.HEIC", "photo", "heic", None), ("live/IMG_7.MOV", "video", "mov", Some(2_000))] {
+        conn.execute(
+            "INSERT INTO files(volume_id, rel_path, name, ext, kind, size, mtime, duration_ms) VALUES (1, ?1, ?1, ?2, ?3, 1000, 0, ?4)",
+            media_core::rusqlite::params![name, ext, kind, ms],
+        )
+        .unwrap();
+    }
+    assert_eq!(cleanup::summary(&conn).unwrap().short_videos.count, 1);
+    assert_eq!(db::query_ids(&conn, &db::FileFilter { suggest: Some("short_video".into()), ..Default::default() }).unwrap().len(), 1);
 }
 
 #[test]

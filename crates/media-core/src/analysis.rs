@@ -197,8 +197,34 @@ pub fn blob_to_embedding(b: &[u8]) -> Vec<f32> {
 // Run
 // ---------------------------------------------------------------------------------------------
 
+/// Where analysis time goes (since the app started), for the diagnostics line: reading and
+/// decoding the photo vs finding and describing faces.
+pub static TIMING: Timing = Timing::new();
+
+pub struct Timing {
+    pub files: AtomicU64,
+    pub decode_us: AtomicU64,
+    pub faces_us: AtomicU64,
+    /// Results taken over from an identical copy or a RAW's JPG instead of analysing again.
+    pub reused: AtomicU64,
+}
+
+impl Timing {
+    const fn new() -> Self {
+        Self { files: AtomicU64::new(0), decode_us: AtomicU64::new(0), faces_us: AtomicU64::new(0), reused: AtomicU64::new(0) }
+    }
+    /// (files analysed, average ms reading, average ms faces, reused)
+    pub fn snapshot(&self) -> (u64, u64, u64, u64) {
+        let n = self.files.load(Ordering::Relaxed);
+        let per = |v: &AtomicU64| if n > 0 { v.load(Ordering::Relaxed) / n / 1000 } else { 0 };
+        (n, per(&self.decode_us), per(&self.faces_us), self.reused.load(Ordering::Relaxed))
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct AnalysisStats {
+    /// Files whose results were reused from an identical copy or the JPG beside a RAW.
+    pub reused: u64,
     pub processed: u64,
     pub failed: u64,
     pub faces: u64,
@@ -254,13 +280,19 @@ struct FileOut {
     faces: Option<Vec<FaceOut>>,
 }
 
-fn analyze_one(f: &FileRow, cache: &ThumbCache, engine: Option<&Mutex<FaceEngine>>) -> Result<FileOut> {
+fn analyze_one(f: &FileRow, cache: &ThumbCache, engine: Option<&Mutex<FaceEngine>>, screenshot: bool) -> Result<FileOut> {
     // Videos: only make sure a thumbnail exists; nothing else to measure.
     if f.kind == "video" {
         cache.ensure_thumb(f)?;
         return Ok(FileOut { id: f.id, sharpness: None, dhash: None, faces: None });
     }
+    let t0 = Instant::now();
     let img = decode(f)?;
+    TIMING.decode_us.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+    TIMING.files.fetch_add(1, Ordering::Relaxed);
+    // Screenshots: nobody to recognise (faces in them are pictures of pictures).
+    let engine = if screenshot { None } else { engine };
+    let t1 = Instant::now();
     if !cache.has_thumb(f) {
         cache.store_thumb(f, &img)?;
     }
@@ -294,8 +326,11 @@ fn analyze_one(f: &FileRow, cache: &ThumbCache, engine: Option<&Mutex<FaceEngine
             }
             Some(out)
         }
+        // A screenshot counts as done for faces (with none), so it is not tried again.
+        None if screenshot => Some(Vec::new()),
         None => None,
     };
+    TIMING.faces_us.fetch_add(t1.elapsed().as_micros() as u64, Ordering::Relaxed);
     Ok(FileOut { id: f.id, sharpness: Some(sharp), dhash: Some(hash), faces })
 }
 
@@ -362,6 +397,58 @@ fn save(conn: &mut Connection, cache: &ThumbCache, outs: Vec<Result<FileOut, (i6
     Ok(())
 }
 
+/// Take over results instead of analysing again, for pending files that have a finished twin:
+/// * an identical file (same size and content fingerprint) — everything is copied, faces too;
+/// * a RAW next to its JPG/HEIC (same name, same folder) — sharpness, fingerprint and thumbnail
+///   come from the JPG; its faces stay with the JPG (one photo, counted once in People).
+/// Returns how many files were settled. Nothing is read from disk.
+pub fn reuse_finished(conn: &mut Connection, faces: bool) -> Result<usize> {
+    let w = pending_where(faces);
+    let ready = format!("a2.version >= {ANALYSIS_VERSION}{}", if faces { format!(" AND a2.face_version >= {FACE_VERSION}") } else { String::new() });
+    let twins: Vec<(i64, i64)> = {
+        let mut st = conn.prepare(&format!(
+            "SELECT f.id, (SELECT g.id FROM files g JOIN analysis a2 ON a2.file_id = g.id
+                            WHERE COALESCE(g.prehash, g.hash) = COALESCE(f.prehash, f.hash) AND g.size = f.size AND g.id != f.id
+                              AND g.missing = 0 AND {ready} LIMIT 1)
+             FROM files f LEFT JOIN analysis a ON a.file_id = f.id
+             WHERE {w} AND COALESCE(f.prehash, f.hash) IS NOT NULL"
+        ))?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get::<_, Option<i64>>(1)?)))?.filter_map(|r| r.ok()).filter_map(|(a, b)| b.map(|b| (a, b))).collect();
+        rows
+    };
+    let stem = "substr(f.rel_path, 1, length(f.rel_path) - length(f.ext) - 1)";
+    let alts: Vec<String> = ["JPG", "jpg", "JPEG", "jpeg", "HEIC", "heic"].iter().map(|e| format!("{stem} || '.{e}'")).collect();
+    let raws: Vec<(i64, i64)> = {
+        let mut st = conn.prepare(&format!(
+            "SELECT f.id, (SELECT g.id FROM files g JOIN analysis a2 ON a2.file_id = g.id
+                            WHERE g.volume_id = f.volume_id AND g.rel_path IN ({}) AND g.missing = 0 AND {ready} LIMIT 1)
+             FROM files f LEFT JOIN analysis a ON a.file_id = f.id
+             WHERE f.kind = 'raw' AND {w}",
+            alts.join(", ")
+        ))?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get::<_, Option<i64>>(1)?)))?.filter_map(|r| r.ok()).filter_map(|(a, b)| b.map(|b| (a, b))).collect();
+        rows
+    };
+    let tx = conn.transaction()?;
+    for (to, from) in &twins {
+        crate::identity::clone_derived(&tx, *from, *to)?;
+    }
+    let mut n = twins.len();
+    let done: std::collections::HashSet<i64> = twins.iter().map(|(t, _)| *t).collect();
+    for (raw, jpg) in raws.iter().filter(|(r, _)| !done.contains(r)) {
+        tx.execute(
+            "INSERT OR REPLACE INTO analysis(file_id, version, sharpness, dhash, face_count, face_version, analyzed_at)
+             SELECT ?2, version, sharpness, dhash, 0, face_version, analyzed_at FROM analysis WHERE file_id = ?1",
+            params![jpg, raw],
+        )?;
+        tx.execute("UPDATE files SET clone_of = ?1 WHERE id = ?2 AND clone_of IS NULL", params![jpg, raw])?;
+        n += 1;
+    }
+    tx.commit()?;
+    TIMING.reused.fetch_add(n as u64, Ordering::Relaxed);
+    Ok(n)
+}
+
 /// Shared pause switch: set by the app while a user job runs or on battery power.
 #[derive(Clone, Default)]
 pub struct PauseFlag(Arc<AtomicBool>);
@@ -402,11 +489,20 @@ pub fn run(
          WHERE v.online = 1 AND {} ORDER BY f.taken_at DESC, f.id DESC LIMIT {CHUNK}",
         pending_where(faces)
     );
+    let mut chunks = 0u64;
     loop {
         if stop.is_stopped() {
             stats.cancelled = true;
             break;
         }
+        // Identical copies and RAWs whose JPG is done need no analysis of their own. Checked at
+        // the start and every so often (newly finished files make new twins).
+        if chunks % 100 == 0 {
+            let n = reuse_finished(&mut conn, faces)? as u64;
+            stats.reused += n;
+            done.fetch_add(n, Ordering::Relaxed);
+        }
+        chunks += 1;
         while pause.is_paused() && !stop.is_stopped() {
             progress(Progress::new("analysis", "paused", done.load(Ordering::Relaxed), total, ""));
             std::thread::sleep(Duration::from_millis(500));
@@ -419,10 +515,16 @@ pub fn run(
         if rows.is_empty() {
             break;
         }
+        let screenshots: std::collections::HashSet<i64> = {
+            let ids = rows.iter().map(|f| f.id.to_string()).collect::<Vec<_>>().join(",");
+            let mut st = conn.prepare(&format!("SELECT file_id FROM labels WHERE label = 'screenshot' AND file_id IN ({ids})"))?;
+            let set = st.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+            set
+        };
         let outs: Vec<Result<FileOut, (i64, String, bool)>> = pool.install(|| {
             rows.par_iter()
                 .map(|f| {
-                    let r = analyze_one(f, cache, engine).map_err(|e| (f.id, format!("{e:#}"), f.abs_path().exists()));
+                    let r = analyze_one(f, cache, engine, screenshots.contains(&f.id)).map_err(|e| (f.id, format!("{e:#}"), f.abs_path().exists()));
                     let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                     let eta = if d > 0 { (started.elapsed().as_secs_f64() / d as f64 * (total.saturating_sub(d)) as f64) as u64 } else { 0 };
                     progress(Progress::new("analysis", "analyze", d, total, format!("{}|{eta}", f.name)));
