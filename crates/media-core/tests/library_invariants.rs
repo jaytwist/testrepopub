@@ -203,12 +203,21 @@ fn run(seed: u64) {
                 for s in &found.sets {
                     if rng.chance(30) {
                         // The first copy stays; the suggested folder and the other copies go.
-                        picks.push(Pick { keep: r(&s.copies[0]), copy: r(&s.keep) });
-                        picks.extend(s.copies[1..].iter().map(|c| Pick { keep: r(&s.copies[0]), copy: r(c) }));
+                        picks.push(Pick { keep: r(&s.copies[0]), copy: r(&s.keep), partial: false });
+                        picks.extend(s.copies[1..].iter().map(|c| Pick { keep: r(&s.copies[0]), copy: r(c), partial: false }));
                     } else {
-                        picks.extend(s.copies.iter().map(|c| Pick { keep: r(&s.keep), copy: r(c) }));
+                        picks.extend(s.copies.iter().map(|c| Pick { keep: r(&s.keep), copy: r(c), partial: false }));
                     }
                 }
+                // And "what both have goes" between any two folders: safe whatever they hold.
+                if rng.chance(50) {
+                    let vol: Option<i64> = found.sets.first().map(|s| s.keep.volume_id).or_else(|| conn.query_row("SELECT volume_id FROM sources ORDER BY id LIMIT 1", [], |r| r.get(0)).ok());
+                    let (x, y) = (folders[rng.below(folders.len())], folders[rng.below(folders.len())]);
+                    if let Some(volume_id) = vol.filter(|_| x != y) {
+                        picks.push(Pick { keep: FolderRef { volume_id, rel_dir: x.into() }, copy: FolderRef { volume_id, rel_dir: y.into() }, partial: true });
+                    }
+                }
+                picks.extend(found.near.iter().flat_map(|n| n.others.iter().map(|o| Pick { keep: r(&n.base), copy: r(&o.info), partial: true })));
                 let purge = rng.chance(60);
                 let rep = copy_folders::remove(&db, &picks, purge, &stop, &quiet).unwrap();
                 assert_eq!(rep.failed, 0, "seed {seed} round {round} copy folders: {:?} after:\n  {}", rep.errors, log.borrow().join("\n  "));

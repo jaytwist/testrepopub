@@ -91,6 +91,15 @@ fn library_plan_many_files() {
             params![ve],
         )
         .unwrap();
+    // And a copy of that copy with a file in three hundred missing: the two trees are almost
+    // the same (and most of their folders still identical).
+    conn.execute(
+        "INSERT INTO files(volume_id, rel_path, name, ext, kind, size, mtime, taken_at, date_source, prehash)
+         SELECT volume_id, '통복사2/' || substr(rel_path, 5), name, ext, kind, size, mtime, taken_at, date_source, prehash
+         FROM files WHERE volume_id = ?1 AND rel_path LIKE '통복사/옛날/2010-%' AND id % 300 != 0",
+        params![ve],
+    )
+    .unwrap();
     {
         let mut st = conn.prepare("SELECT DISTINCT rtrim(rel_path, replace(rel_path, '/', '')) FROM files WHERE volume_id = ?1 AND rel_path LIKE '%옛날/2010-%'").unwrap();
         for d in st.query_map(params![ve], |r| r.get::<_, String>(0)).unwrap() {
@@ -100,7 +109,19 @@ fn library_plan_many_files() {
     println!("{n} index rows written in {:.2?} (+{copied} in copied folders)", t.elapsed());
     let t = Instant::now();
     let found = media_core::folders::find(&conn).unwrap();
-    println!("copy folders: {} sets, {} files in copies, found in {:.2?}", found.sets.len(), found.sets.iter().map(|s| s.files * s.copies.len() as u64).sum::<u64>(), t.elapsed());
+    println!(
+        "copy folders: {} sets ({} files in copies), {} almost the same, found in {:.2?}",
+        found.sets.len(),
+        found.sets.iter().map(|s| s.files * s.copies.len() as u64).sum::<u64>(),
+        found.near.len(),
+        t.elapsed()
+    );
+    assert!(!found.near.is_empty());
+    for bar in [0.90, 0.80] {
+        let t = Instant::now();
+        let f = media_core::folders::find_with(&conn, bar).unwrap();
+        println!("  at {:.0} %: {} almost the same ({} folders), found in {:.2?}", bar * 100.0, f.near.len(), f.near.iter().map(|n| n.others.len()).sum::<usize>(), t.elapsed());
+    }
     assert!(!found.sets.is_empty());
     let opts = OrganizeOptions {
         target_dir: e.join("사진").to_string_lossy().into_owned(),

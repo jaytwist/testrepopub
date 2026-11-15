@@ -50,7 +50,7 @@ fn walk(root: &Path) -> Vec<String> {
 
 fn picks(set: &FolderSet) -> Vec<Pick> {
     let r = |f: &folders::FolderInfo| FolderRef { volume_id: f.volume_id, rel_dir: f.rel_dir.clone() };
-    set.copies.iter().map(|c| Pick { keep: r(&set.keep), copy: r(c) }).collect()
+    set.copies.iter().map(|c| Pick { keep: r(&set.keep), copy: r(c), partial: false }).collect()
 }
 
 fn trip(dir: &Path) {
@@ -107,8 +107,8 @@ fn finds_whole_copies_only() {
     // The user keeps the copy in 백업 instead: the original and the third go.
     let r = |d: &str| FolderRef { volume_id: s.keep.volume_id, rel_dir: d.into() };
     let p = vec![
-        Pick { keep: r("백업/제주도 - 복사본"), copy: r("옛날/2015-08 제주도") },
-        Pick { keep: r("백업/제주도 - 복사본"), copy: r("백업2/x") },
+        Pick { keep: r("백업/제주도 - 복사본"), copy: r("옛날/2015-08 제주도"), partial: false },
+        Pick { keep: r("백업/제주도 - 복사본"), copy: r("백업2/x"), partial: false },
     ];
     let rep = folders::remove(&db, &p, true, &stop, &quiet).unwrap();
     assert_eq!((rep.folders, rep.partial, rep.skipped, rep.files, rep.different, rep.left, rep.failed), (2, 0, 0, 6, 0, 0, 0), "{rep:?}");
@@ -282,4 +282,93 @@ fn only_the_library_drive_once_one_is_chosen() {
     let rep = folders::remove(&db, &picks(&found.sets[0]), true, &stop, &quiet).unwrap();
     assert_eq!((rep.folders, rep.files), (1, 3), "{rep:?}");
     assert!(!e.join("백업/제주도").exists() && e.join("여행/제주도/둘째날/j3.jpg").is_file());
+}
+
+/// A file the scanner indexes (as a photo) without it being a real picture: quick to make.
+fn blob(p: &Path, seed: u32) {
+    fs::create_dir_all(p.parent().unwrap()).unwrap();
+    fs::write(p, (0..4000 + seed * 7).map(|i| (i * (seed + 3)) as u8).collect::<Vec<u8>>()).unwrap();
+}
+
+#[test]
+fn almost_the_same_folders_are_listed_apart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let e = drive(tmp.path(), "diskE");
+    // 30 photos: 20 in the folder, 10 in a sub-folder.
+    let a = e.join("여행/유럽");
+    for i in 0..20 {
+        blob(&a.join(format!("a{i:02}.jpg")), i);
+    }
+    for i in 0..10 {
+        blob(&a.join(format!("파리/p{i}.jpg")), 100 + i);
+    }
+    sleep(Duration::from_millis(30));
+    // B: one photo missing, one of its own (29 of 30 the same). C: three missing (27 of 30).
+    let b = e.join("백업/유럽 사본");
+    copy_tree(&a, &b);
+    fs::remove_file(b.join("a19.jpg")).unwrap();
+    blob(&b.join("b_only.jpg"), 200);
+    fs::write(b.join("메모.txt"), "복사본에만 있는 메모").unwrap();
+    let c = e.join("다른/유럽 조금");
+    copy_tree(&a, &c);
+    for n in ["a17.jpg", "a18.jpg", "a19.jpg"] {
+        fs::remove_file(c.join(n)).unwrap();
+    }
+
+    let db = Db::open(tmp.path().join("app/library.db")).unwrap();
+    let conn = db.conn().unwrap();
+    volumes::add_source(&conn, &e).unwrap();
+    let stop = StopFlag::new();
+    scanner::scan_all(&db, &ScanOptions { min_image_bytes: 0, min_image_side: 0, ..Default::default() }, &stop, &quiet).unwrap();
+
+    let found = folders::find(&conn).unwrap();
+    // 100 %: only the sub-folder, which all three have unchanged.
+    assert_eq!(found.sets.len(), 1, "{:#?}", found.sets);
+    assert_eq!((found.sets[0].keep.rel_dir.as_str(), found.sets[0].copies.len()), ("여행/유럽/파리", 2));
+    // 95 %: A and B (C is 90 %); the sub-folders are not listed again.
+    assert_eq!(found.near.len(), 1, "{:#?}", found.near);
+    let n = &found.near[0];
+    assert_eq!((n.base.rel_dir.as_str(), n.others.len()), ("여행/유럽", 1), "the bigger — here the older — is the base");
+    let o = &n.others[0];
+    assert_eq!((o.info.rel_dir.as_str(), o.shared, o.only_base, o.only_here), ("백업/유럽 사본", 29, 1, 1));
+    assert!(o.ratio > 0.96 && o.ratio < 0.97 && o.shared_bytes > 0);
+    // A lower bar lists more: at 90 % C joins (27 of 30), at 95 % it does not.
+    let at90 = folders::find_with(&conn, 0.90).unwrap();
+    assert_eq!(at90.near.len(), 1, "{:#?}", at90.near);
+    assert_eq!(at90.near[0].others.iter().map(|o| (o.info.rel_dir.as_str(), o.shared)).collect::<Vec<_>>(), [("백업/유럽 사본", 29), ("다른/유럽 조금", 27)]);
+    assert_eq!(at90.near[0].others[1].only_here, 0, "everything C has is in the base folder");
+    // What the cards show.
+    assert_eq!((n.base.photos, n.base.videos, n.base.subfolders), (30, 0, 1));
+    assert_eq!(n.base.bytes, (0..20).map(|i| 4000 + i * 7).chain((100..110).map(|i| 4000 + i * 7)).sum::<i64>());
+    assert!(n.base.created.is_some() || n.base.modified.is_some());
+
+    // Looking inside.
+    let r = |d: &str| FolderRef { volume_id: n.base.volume_id, rel_dir: d.into() };
+    let inside = folders::files_in(&conn, &r("여행/유럽")).unwrap();
+    assert_eq!(inside.iter().map(|f| (f.dir.as_str(), f.ids.len())).collect::<Vec<_>>(), [("", 20), ("파리", 10)]);
+    let cmp = folders::compare(&conn, &r("여행/유럽"), &r("백업/유럽 사본")).unwrap();
+    assert_eq!((cmp.shared.len(), cmp.only_keep.len(), cmp.only_copy.len()), (29, 1, 1));
+    let name = |id: i64| -> String { conn.query_row("SELECT name FROM files WHERE id = ?", [id], |r| r.get(0)).unwrap() };
+    assert_eq!((name(cmp.only_keep[0]), name(cmp.only_copy[0])), ("a19.jpg".to_string(), "b_only.jpg".to_string()));
+    assert!(cmp.shared.iter().all(|(k, c)| name(*k) == name(*c)), "pairs are the files at the same place");
+    let props = folders::props(&conn, &r("백업/유럽 사본")).unwrap();
+    assert_eq!((props.other_files, props.examples.as_slice()), (1, ["메모.txt".to_string()].as_slice()));
+
+    // As a 100 % copy it is refused; as an almost-copy only what both have goes.
+    let whole = Pick { keep: r("여행/유럽"), copy: r("백업/유럽 사본"), partial: false };
+    let rep = folders::remove(&db, &[whole], true, &stop, &quiet).unwrap();
+    assert_eq!((rep.skipped, rep.files), (1, 0), "{rep:?}");
+    let part = Pick { keep: r("여행/유럽"), copy: r("백업/유럽 사본"), partial: true };
+    let rep = folders::remove(&db, &[part], true, &stop, &quiet).unwrap();
+    assert_eq!((rep.files, rep.unique_left, rep.folders, rep.partial, rep.different, rep.failed), (29, 1, 0, 1, 0, 0), "{rep:?}");
+    assert_eq!(rep.left, 1, "the memo only the copy has: {rep:?}");
+    assert!(b.join("b_only.jpg").is_file() && b.join("메모.txt").is_file(), "what only the copy has stays where it is");
+    assert!(!b.join("a00.jpg").exists() && !b.join("파리").exists());
+    assert_eq!(walk(&a).len(), 30, "the base folder is untouched");
+    assert!(!walk(&e).iter().any(|p| p.contains(&rep.batch_id)));
+    let what: String = conn.query_row("SELECT description FROM batches WHERE id = ?", [&rep.batch_id], |r| r.get(0)).unwrap();
+    assert_eq!(what, "거의 같은 폴더 1개에서 겹치는 사진 정리");
+    let found = folders::find(&conn).unwrap();
+    assert!(found.near.is_empty(), "{:#?}", found.near);
+    assert_eq!(found.sets.len(), 1, "A/파리 and C/파리 are still a set");
 }

@@ -185,16 +185,28 @@ export interface FolderDeleteReport { batch_id: string; deleted: number; bytes: 
 export interface CopyFolderInfo {
   volume_id: number; rel_dir: string; abs_path: string; created: number | null; modified: number | null;
   keep_rule: boolean; filed: boolean; names: string;
+  photos: number; videos: number; bytes: number; subfolders: number; taken_from: number | null; taken_to: number | null;
 }
 export interface CopyFolderSet {
   keep: CopyFolderInfo; keep_why: "keep_rule" | "filed" | "oldest" | ""; copies: CopyFolderInfo[];
   files: number; bytes: number; sample: number[];
 }
-export interface CopyFolders { sets: CopyFolderSet[]; unread: number; drive: string | null }
-export interface CopyFolderPick { keep: { volume_id: number; rel_dir: string }; copy: { volume_id: number; rel_dir: string } }
+export interface NearFolder {
+  info: CopyFolderInfo; shared: number; shared_bytes: number; only_base: number; only_here: number; ratio: number;
+  /** Folders inside that are also listed as 100 % copies, and the size not already counted there. */
+  also_listed: number; extra_bytes: number;
+}
+export interface NearFolderSet { base: CopyFolderInfo; others: NearFolder[]; sample: number[] }
+export interface CopyFolders { sets: CopyFolderSet[]; near: NearFolderSet[]; unread: number; drive: string | null }
+export interface FolderRef { volume_id: number; rel_dir: string }
+export interface CopyFolderPick { keep: FolderRef; copy: FolderRef; partial: boolean }
+export interface FolderFiles { dir: string; ids: number[] }
+export interface FolderCompare { shared: [number, number][]; only_keep: number[]; only_copy: number[] }
+export interface FolderProps { other_files: number; other_bytes: number; examples: string[] }
 export interface CopyFolderReport {
   batch_id: string; folders: number; partial: number; skipped: number; skipped_why: string[]; files: number; bytes: number; purged: boolean;
-  different: number; other_deleted: number; left: number; left_examples: string[]; labels_moved: number; failed: number; errors: string[]; cancelled: boolean;
+  different: number; other_deleted: number; left: number; left_examples: string[]; unique_left: number; labels_moved: number;
+  failed: number; errors: string[]; cancelled: boolean;
 }
 export interface ExecReport {
   batch_id: string; done: number; failed: number; bytes: number; sidecars: number; removed: number; removed_bytes: number;
@@ -338,9 +350,13 @@ export const api = {
   libraryDeletePreview: (planId: string, groups: string[]) => invoke<FolderDeletePreview>("library_delete_preview", { planId, groups }),
   startLibraryDelete: (planId: string, groups: string[], keepProtected: boolean) =>
     invoke<void>("start_library_delete", { planId, groups, keepProtected }),
-  copyFolders: () => invoke<CopyFolders>("copy_folders"),
+  /** `near`: how alike "almost the same" folders must be (0.95 = 95 %). */
+  copyFolders: (near?: number) => invoke<CopyFolders>("copy_folders", { near }),
   startRemoveCopyFolders: (picks: CopyFolderPick[], purge: boolean) => invoke<void>("start_remove_copy_folders", { picks, purge }),
   openFolder: (path: string) => invoke<void>("open_folder", { path }),
+  folderFiles: (folder: FolderRef) => invoke<FolderFiles[]>("folder_files", { folder }),
+  folderCompare: (keep: FolderRef, copy: FolderRef) => invoke<FolderCompare>("folder_compare", { keep, copy }),
+  folderProps: (folder: FolderRef) => invoke<FolderProps>("folder_props", { folder }),
   planTree: (planId: string) => invoke<TreeNode[]>("plan_tree", { planId }),
   getLibraryRules: () => invoke<FolderRule[]>("get_library_rules"),
   setLibraryRules: (rules: FolderRule[]) => invoke<void>("set_library_rules", { rules }),

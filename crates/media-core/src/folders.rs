@@ -35,6 +35,9 @@ struct Rec {
     size: i64,
     /// Content fingerprint; `None` for a row an older version indexed and nothing has read since.
     key: Option<String>,
+    video: bool,
+    /// Wall-clock time taken, if known.
+    taken: Option<i64>,
 }
 
 struct Vol {
@@ -62,7 +65,7 @@ fn load(conn: &Connection) -> Result<Vec<Vol>> {
     let mut vols: Vec<Vol> = Vec::new();
     let mut at: HashMap<i64, usize> = HashMap::new();
     let mut st = conn.prepare(
-        "SELECT f.id, f.volume_id, f.rel_path, f.size, COALESCE(f.prehash, f.hash), v.mount
+        "SELECT f.id, f.volume_id, f.rel_path, f.size, COALESCE(f.prehash, f.hash), v.mount, f.kind, f.taken_at
          FROM files f JOIN volumes v ON v.id = f.volume_id
          WHERE f.missing = 0 AND f.quarantined = 0 AND v.online = 1",
     )?;
@@ -77,7 +80,8 @@ fn load(conn: &Connection) -> Result<Vec<Vol>> {
                 vols.len() - 1
             }
         };
-        vols[i].files.push(Rec { id: r.get(0)?, rel: r.get(2)?, size: r.get(3)?, key: r.get(4)? });
+        let kind: String = r.get(6)?;
+        vols[i].files.push(Rec { id: r.get(0)?, rel: r.get(2)?, size: r.get(3)?, key: r.get(4)?, video: kind == "video", taken: r.get(7)? });
     }
     for v in &mut vols {
         v.files.sort_unstable_by(|a, b| a.rel.cmp(&b.rel));
@@ -100,11 +104,27 @@ fn nested(a: &str, b: &str) -> bool {
     a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
 }
 
-fn fingerprint(key: &str, size: i64) -> u128 {
-    let h = blake3::hash(format!("{size}:{key}").as_bytes());
-    let mut b = [0u8; 16];
-    b.copy_from_slice(&h.as_bytes()[..16]);
-    u128::from_le_bytes(b)
+/// How many independent hashes a folder is sketched with (see `near_in`).
+const SKETCH: usize = 16;
+
+/// Hashes of one file's content: a 128-bit value for a folder's signature (their sum), and
+/// `SKETCH` independent 64-bit values for finding folders that share most of their files (the
+/// smallest of each over a folder: two folders agree on one with the chance of their overlap,
+/// so folders 80 % alike are missed on all sixteen about once in a hundred million pairs).
+fn hashes(key: &str, size: i64) -> (u128, [u64; SKETCH]) {
+    let mut h = blake3::Hasher::new();
+    h.update(format!("{size}:{key}").as_bytes());
+    let mut b = [0u8; 16 + SKETCH * 8];
+    h.finalize_xof().fill(&mut b);
+    let mut lo = [0u8; 16];
+    lo.copy_from_slice(&b[..16]);
+    let mut m = [0u64; SKETCH];
+    for (i, v) in m.iter_mut().enumerate() {
+        let mut w = [0u8; 8];
+        w.copy_from_slice(&b[16 + i * 8..24 + i * 8]);
+        *v = u64::from_le_bytes(w);
+    }
+    (u128::from_le_bytes(lo), m)
 }
 
 /// A folder's content as a sorted list — what "the same" finally means.
@@ -112,6 +132,31 @@ fn content<'a>(files: impl Iterator<Item = &'a Rec>) -> Vec<(&'a str, i64)> {
     let mut l: Vec<(&str, i64)> = files.map(|r| (r.key.as_deref().unwrap_or(""), r.size)).collect();
     l.sort_unstable();
     l
+}
+
+/// The same, of the files that have a fingerprint (a file without one is no copy of anything).
+fn keyed<'a>(files: impl Iterator<Item = &'a Rec>) -> Vec<(&'a str, i64)> {
+    let mut l: Vec<(&str, i64)> = files.filter_map(|r| Some((r.key.as_deref()?, r.size))).collect();
+    l.sort_unstable();
+    l
+}
+
+/// How many entries two sorted content lists share (each file counted once), and their size.
+fn overlap(a: &[(&str, i64)], b: &[(&str, i64)]) -> (u64, i64) {
+    let (mut i, mut j, mut n, mut bytes) = (0, 0, 0u64, 0i64);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                n += 1;
+                bytes += a[i].1;
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    (n, bytes)
 }
 
 /// Names and places inside the folder (lower-cased) with the content at each: two folders with
@@ -127,6 +172,38 @@ fn names_key(v: &Vol, dir: &str) -> String {
         h.update(&[0]);
     }
     h.finalize().to_hex()[..16].to_string()
+}
+
+/// Each file of the copy folder with its twin in the folder that stays: the file at the same
+/// place if it is the same content, else any file with that content (each twin used once).
+/// Files without a fingerprint have no twin.
+fn twins<'a>(k: &[&'a Rec], kd: &str, c: &[&'a Rec], cd: &str) -> HashMap<i64, &'a Rec> {
+    let mut pool: HashMap<(&str, i64), Vec<&Rec>> = HashMap::new();
+    for r in k {
+        if let Some(key) = r.key.as_deref() {
+            pool.entry((key, r.size)).or_default().push(r);
+        }
+    }
+    let inner = |r: &Rec, d: &str| r.rel[d.len() + 1..].to_lowercase();
+    let mut twin: HashMap<i64, &Rec> = HashMap::new();
+    for r in c {
+        let Some(key) = r.key.as_deref() else { continue };
+        let name = inner(r, cd);
+        if let Some(l) = pool.get_mut(&(key, r.size)) {
+            if let Some(i) = l.iter().position(|t| inner(t, kd) == name) {
+                twin.insert(r.id, l.swap_remove(i));
+            }
+        }
+    }
+    for r in c {
+        let Some(key) = r.key.as_deref() else { continue };
+        if let std::collections::hash_map::Entry::Vacant(slot) = twin.entry(r.id) {
+            if let Some(t) = pool.get_mut(&(key, r.size)).and_then(|l| l.pop()) {
+                slot.insert(t);
+            }
+        }
+    }
+    twin
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -148,6 +225,14 @@ pub struct FolderInfo {
     pub filed: bool,
     /// Equal between two folders whose files also have the same names and places.
     pub names: String,
+    /// What is inside (sub-folders included): photos, videos, their size, the folders below,
+    /// and when the first and the last were taken (wall-clock).
+    pub photos: u64,
+    pub videos: u64,
+    pub bytes: i64,
+    pub subfolders: u64,
+    pub taken_from: Option<i64>,
+    pub taken_to: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -164,9 +249,37 @@ pub struct FolderSet {
     pub sample: Vec<i64>,
 }
 
+/// A folder almost the same as the base folder of its set.
+#[derive(Clone, Debug, Serialize)]
+pub struct NearFolder {
+    pub info: FolderInfo,
+    /// Files both have (by content), and their size: what goes from this folder.
+    pub shared: u64,
+    pub shared_bytes: i64,
+    /// Files only the base folder has / only this folder has.
+    pub only_base: u64,
+    pub only_here: u64,
+    /// `shared` over the files of the bigger of the two.
+    pub ratio: f64,
+    /// Folders inside this one that are also listed as 100 % copies (removing what is shared
+    /// here settles those too), and the part of `shared_bytes` not already counted there.
+    pub also_listed: u64,
+    pub extra_bytes: i64,
+}
+
+/// Folders that are almost the same: the biggest one and the others compared with it.
+#[derive(Clone, Debug, Serialize)]
+pub struct NearSet {
+    pub base: FolderInfo,
+    pub others: Vec<NearFolder>,
+    pub sample: Vec<i64>,
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Found {
     pub sets: Vec<FolderSet>,
+    /// Folders that share at least the asked share of their files without being identical.
+    pub near: Vec<NearSet>,
     /// Files not fingerprinted yet that could be copies (another file has their size): folders
     /// holding them are not judged until they are read. (A file whose size is unique is never
     /// read and never a copy.)
@@ -175,22 +288,85 @@ pub struct Found {
     pub drive: Option<String>,
 }
 
+/// "거의 같은 폴더": at least this share of the bigger folder's files is in both.
+pub const NEAR: f64 = 0.95;
+
 /// Order among identical folders (lowest stays): see `info`.
 type Rank = (u8, bool, i64, i64, i64);
 /// A folder's sorted content, and the folders that have exactly it.
 type SameContent<'a> = (Vec<(&'a str, i64)>, Vec<&'a str>);
 
-#[derive(Default, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct Agg {
     count: u64,
     bytes: i64,
     sum: u128,
     unknown: bool,
+    /// Smallest of each of the sketch hashes over the fingerprinted files.
+    mins: [u64; SKETCH],
+    keyed: u64,
 }
 
-/// Every set of identical folders, biggest first. Reads the index, and the disk only for the
-/// dates of the folders it reports.
+impl Default for Agg {
+    fn default() -> Self {
+        Self { count: 0, bytes: 0, sum: 0, unknown: false, mins: [u64::MAX; SKETCH], keyed: 0 }
+    }
+}
+
+impl Agg {
+    fn add(&mut self, o: &Agg) {
+        self.count += o.count;
+        self.bytes += o.bytes;
+        self.sum = self.sum.wrapping_add(o.sum);
+        self.unknown |= o.unknown;
+        self.keyed += o.keyed;
+        for (m, other) in self.mins.iter_mut().zip(o.mins) {
+            *m = (*m).min(other);
+        }
+    }
+}
+
+/// Every folder's whole subtree in numbers: each folder's own files, added up into every
+/// folder above it.
+fn totals(v: &Vol) -> HashMap<&str, Agg> {
+    let mut direct: HashMap<&str, Agg> = HashMap::new();
+    for r in &v.files {
+        let Some(i) = r.rel.rfind('/') else { continue };
+        let a = direct.entry(&r.rel[..i]).or_default();
+        a.count += 1;
+        a.bytes += r.size;
+        match &r.key {
+            Some(k) => {
+                let (sum, mins) = hashes(k, r.size);
+                a.sum = a.sum.wrapping_add(sum);
+                a.keyed += 1;
+                for (m, h) in a.mins.iter_mut().zip(mins) {
+                    *m = (*m).min(h);
+                }
+            }
+            None => a.unknown = true,
+        }
+    }
+    let mut total: HashMap<&str, Agg> = HashMap::new();
+    for (dir, a) in &direct {
+        for d in std::iter::once(*dir).chain(ancestors(dir)) {
+            total.entry(d).or_default().add(a);
+        }
+    }
+    total
+}
+
+/// Every set of identical folders and of almost identical folders, biggest first. Reads the
+/// index, and the disk only for the dates of the folders it reports.
 pub fn find(conn: &Connection) -> Result<Found> {
+    find_with(conn, NEAR)
+}
+
+/// `find` with another bar for "almost the same" (`near`: 0.95 = 95 % of the bigger folder).
+/// A lower bar lists more folders — and more that are no copies at all, only folders sharing
+/// photos; what is removed stays the same either way: files the other folder really has.
+pub fn find_with(conn: &Connection, near: f64) -> Result<Found> {
+    let near = near.clamp(0.5, 0.999);
     let vols = load(conn)?;
     let rules = DupRules::load(conn)?;
     let lib = library::location(conn);
@@ -207,39 +383,23 @@ pub fn find(conn: &Connection) -> Result<Found> {
             out.drive = Some(v.mount.clone());
         }
         out.unread += v.files.iter().filter(|r| r.key.is_none() && sizes.get(&r.size).is_some_and(|n| *n > 1)).count() as u64;
-        find_in(v, &rules, lib.as_ref(), &mut out.sets);
+        let total = totals(v);
+        let covered = find_in(v, &total, &rules, lib.as_ref(), &mut out.sets);
+        near_in(v, &total, &covered, &rules, lib.as_ref(), near, &mut out.near);
     }
     out.sets.sort_by(|a, b| {
         (b.bytes * b.copies.len() as i64).cmp(&(a.bytes * a.copies.len() as i64)).then_with(|| a.keep.abs_path.cmp(&b.keep.abs_path))
     });
+    let gain = |n: &NearSet| n.others.iter().map(|o| o.shared_bytes).sum::<i64>();
+    out.near.sort_by(|a, b| gain(b).cmp(&gain(a)).then_with(|| a.base.abs_path.cmp(&b.base.abs_path)));
     Ok(out)
 }
 
-fn find_in(v: &Vol, rules: &DupRules, lib: Option<&(i64, String)>, out: &mut Vec<FolderSet>) {
-    // Each folder's own files, then added up into every folder above it.
-    let mut direct: HashMap<&str, Agg> = HashMap::new();
-    for r in &v.files {
-        let Some(i) = r.rel.rfind('/') else { continue };
-        let a = direct.entry(&r.rel[..i]).or_default();
-        a.count += 1;
-        a.bytes += r.size;
-        match &r.key {
-            Some(k) => a.sum = a.sum.wrapping_add(fingerprint(k, r.size)),
-            None => a.unknown = true,
-        }
-    }
-    let mut total: HashMap<&str, Agg> = HashMap::new();
-    for (dir, a) in &direct {
-        for d in std::iter::once(*dir).chain(ancestors(dir)) {
-            let t = total.entry(d).or_default();
-            t.count += a.count;
-            t.bytes += a.bytes;
-            t.sum = t.sum.wrapping_add(a.sum);
-            t.unknown |= a.unknown;
-        }
-    }
+/// The sets of identical folders of one drive. Returns the folders of those sets: `true` for
+/// the one that stays, `false` for a copy that goes.
+fn find_in<'a>(v: &'a Vol, total: &HashMap<&'a str, Agg>, rules: &DupRules, lib: Option<&(i64, String)>, out: &mut Vec<FolderSet>) -> HashMap<&'a str, bool> {
     let mut by_sig: HashMap<(u64, i64, u128), Vec<&str>> = HashMap::new();
-    for (d, a) in &total {
+    for (d, a) in total {
         if !a.unknown && a.count > 0 {
             by_sig.entry((a.count, a.bytes, a.sum)).or_default().push(d);
         }
@@ -271,7 +431,7 @@ fn find_in(v: &Vol, rules: &DupRules, lib: Option<&(i64, String)>, out: &mut Vec
     }
     // Bigger sets first: a folder inside a copy that goes anyway is not listed again.
     cands.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then_with(|| a.2.cmp(&b.2)));
-    let mut covered: HashMap<&str, bool> = HashMap::new(); // folder of a set → it is the one that stays
+    let mut covered: HashMap<&str, bool> = HashMap::new();
     for (count, bytes, dirs) in cands {
         let mut infos: Vec<(&str, FolderInfo, Rank)> = dirs
             .into_iter()
@@ -299,6 +459,113 @@ fn find_in(v: &Vol, rules: &DupRules, lib: Option<&(i64, String)>, out: &mut Vec
         };
         out.push(FolderSet { keep, keep_why: keep_why.into(), copies: it.collect(), files: count, bytes, sample });
     }
+    covered
+}
+
+/// The sets of almost identical folders of one drive: pairs sharing at least `near` of the
+/// bigger one's files. Candidates come from the smallest sketch hashes (folders that alike
+/// agree on at least one, all but never missing a pair); each candidate is then counted
+/// exactly. Only the outermost pairs are kept, grouped around the biggest folder.
+#[allow(clippy::too_many_arguments)]
+fn near_in<'a>(v: &'a Vol, total: &HashMap<&'a str, Agg>, covered: &HashMap<&'a str, bool>, rules: &DupRules, lib: Option<&(i64, String)>, near: f64, out: &mut Vec<NearSet>) {
+    let min_files = (1.0 / (1.0 - near)).round() as u64; // below this, one file apart is already too far
+    // A folder holding nothing but one sub-folder is that sub-folder.
+    let wrappers: HashSet<&str> = total.iter().filter_map(|(d, a)| ancestors(d).next().filter(|p| total.get(p).is_some_and(|t| t.count == a.count))).collect();
+    let goes = |d: &str| std::iter::once(d).chain(ancestors(d)).find_map(|a| covered.get(a)).is_some_and(|stays| !*stays);
+    let mut buckets: HashMap<(u8, u64), Vec<&str>> = HashMap::new();
+    for (d, a) in total {
+        if a.count < min_files || a.keyed == 0 || wrappers.contains(d) || goes(d) {
+            continue;
+        }
+        for (i, m) in a.mins.iter().enumerate() {
+            buckets.entry((i as u8, *m)).or_default().push(d);
+        }
+    }
+    let count = |d: &str| total.get(d).map_or(0, |a| a.count);
+    let mut pairs: HashSet<(&str, &str)> = HashSet::new();
+    for (_, mut ds) in buckets {
+        if ds.len() < 2 {
+            continue;
+        }
+        ds.sort_unstable_by_key(|d| (count(d), *d));
+        for i in 0..ds.len() {
+            // Only folders of nearly the same size can share that much (and not endlessly many).
+            for j in (i + 1..ds.len()).take(200) {
+                if (count(ds[i]) as f64) < near * count(ds[j]) as f64 {
+                    break;
+                }
+                let (a, b) = (ds[i], ds[j]);
+                if !nested(a, b) {
+                    pairs.insert(if a < b { (a, b) } else { (b, a) });
+                }
+            }
+        }
+    }
+    let mut lists: HashMap<&str, Vec<(&str, i64)>> = HashMap::new();
+    let mut alike: Vec<(&str, &str, u64, i64)> = Vec::new();
+    for (a, b) in pairs {
+        for d in [a, b] {
+            lists.entry(d).or_insert_with(|| keyed(v.subtree(d).iter()));
+        }
+        let (shared, bytes) = overlap(&lists[a], &lists[b]);
+        let (ca, cb) = (count(a), count(b));
+        let identical = shared == ca && shared == cb;
+        if !identical && shared as f64 >= near * ca.max(cb) as f64 - 1e-9 {
+            alike.push((a, b, shared, bytes));
+        }
+    }
+    // Outermost pairs only: `A` ~ `B` covers `A/파리` ~ `B/파리` (and `A/파리` ~ `B`).
+    alike.sort_by(|x, y| count(y.0).max(count(y.1)).cmp(&count(x.0).max(count(x.1))).then_with(|| (x.0, x.1).cmp(&(y.0, y.1))));
+    let mut accepted: HashSet<(&str, &str)> = HashSet::new();
+    let mut partners: HashMap<&str, Vec<(&str, u64, i64)>> = HashMap::new();
+    for (a, b, shared, bytes) in alike {
+        let inside = std::iter::once(a).chain(ancestors(a)).any(|x| std::iter::once(b).chain(ancestors(b)).any(|y| accepted.contains(&if x < y { (x, y) } else { (y, x) })));
+        if inside {
+            continue;
+        }
+        accepted.insert((a, b));
+        partners.entry(a).or_default().push((b, shared, bytes));
+        partners.entry(b).or_default().push((a, shared, bytes));
+    }
+    // The biggest folder of each group is its base (then the usual order); a folder appears once.
+    let mut nodes: Vec<(&str, FolderInfo, Rank)> = partners.keys().filter_map(|d| info(v, d, rules, lib).map(|(i, r)| (*d, i, r))).collect();
+    nodes.sort_by(|x, y| count(y.0).cmp(&count(x.0)).then_with(|| x.2.cmp(&y.2)).then_with(|| x.0.cmp(y.0)));
+    let infos: HashMap<&str, FolderInfo> = nodes.iter().map(|(d, i, _)| (*d, i.clone())).collect();
+    let mut used: HashSet<&str> = HashSet::new();
+    for (d, base, _) in &nodes {
+        if used.contains(d) {
+            continue;
+        }
+        let mut others: Vec<NearFolder> = partners[d]
+            .iter()
+            .filter(|(o, _, _)| !used.contains(o))
+            .filter_map(|(o, shared, bytes)| {
+                let info = infos.get(o)?.clone();
+                let (cb, co) = (count(d), count(o));
+                // Folders of 100 % sets inside this one (the outermost of them, for the size).
+                let inside: Vec<&str> = covered.keys().copied().filter(|c| c.starts_with(&format!("{o}/"))).collect();
+                let listed: i64 = inside.iter().filter(|c| !ancestors(c).any(|a| a.len() > o.len() && covered.contains_key(a))).map(|c| total.get(c).map_or(0, |a| a.bytes)).sum();
+                Some(NearFolder {
+                    info,
+                    shared: *shared,
+                    shared_bytes: *bytes,
+                    only_base: cb - shared,
+                    only_here: co - shared,
+                    ratio: *shared as f64 / cb.max(co) as f64,
+                    also_listed: inside.len() as u64,
+                    extra_bytes: (*bytes - listed).max(0),
+                })
+            })
+            .collect();
+        if others.is_empty() {
+            continue;
+        }
+        others.sort_by(|x, y| y.shared.cmp(&x.shared).then_with(|| x.info.rel_dir.cmp(&y.info.rel_dir)));
+        used.insert(d);
+        used.extend(others.iter().filter_map(|o| infos.get_key_value(o.info.rel_dir.as_str()).map(|(k, _)| *k)));
+        let sample: Vec<i64> = v.subtree(d).iter().take(6).map(|r| r.id).collect();
+        out.push(NearSet { base: base.clone(), others, sample });
+    }
 }
 
 /// A folder as shown, and its rank among identical folders (lowest stays): under a keep rule,
@@ -312,12 +579,134 @@ fn info(v: &Vol, dir: &str, rules: &DupRules, lib: Option<&(i64, String)>) -> Op
     let abs_s = abs.to_string_lossy().into_owned();
     let class = rules.class_of_path(&abs_s);
     let filed = lib.is_some_and(|(lv, root)| *lv == v.id && (root.is_empty() || dir == root || dir.starts_with(&format!("{root}/"))));
-    let first_id = v.subtree(dir).iter().map(|r| r.id).min().unwrap_or(i64::MAX);
+    let files = v.subtree(dir);
+    let first_id = files.iter().map(|r| r.id).min().unwrap_or(i64::MAX);
+    let videos = files.iter().filter(|r| r.video).count() as u64;
+    let below: HashSet<&str> = files.iter().filter_map(|r| r.rel.rfind('/').map(|i| &r.rel[..i])).flat_map(|d| std::iter::once(d).chain(ancestors(d))).filter(|d| d.len() > dir.len()).collect();
     let rank = (class, !filed, created_ms.unwrap_or(i64::MAX), modified_ms.unwrap_or(i64::MAX), first_id);
     Some((
-        FolderInfo { volume_id: v.id, rel_dir: dir.to_string(), abs_path: abs_s, created, modified, keep_rule: class == 0, filed, names: names_key(v, dir) },
+        FolderInfo {
+            volume_id: v.id,
+            rel_dir: dir.to_string(),
+            abs_path: abs_s,
+            created,
+            modified,
+            keep_rule: class == 0,
+            filed,
+            names: names_key(v, dir),
+            photos: files.len() as u64 - videos,
+            videos,
+            bytes: files.iter().map(|r| r.size).sum(),
+            subfolders: below.len() as u64,
+            taken_from: files.iter().filter_map(|r| r.taken).min(),
+            taken_to: files.iter().filter_map(|r| r.taken).max(),
+        },
         rank,
     ))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Look inside
+// ---------------------------------------------------------------------------------------------
+
+/// The live files of one folder (sub-folders included), by path, and the drive's mount.
+fn rows_in(conn: &Connection, f: &FolderRef) -> Result<(String, Vec<Rec>)> {
+    let f = clean(f);
+    let mount: String = conn.query_row("SELECT mount FROM volumes WHERE id = ?", [f.volume_id], |r| r.get(0))?;
+    let mut st = conn.prepare(
+        "SELECT id, rel_path, size, COALESCE(prehash, hash), kind, taken_at FROM files
+         WHERE volume_id = ?1 AND rel_path >= ?2 AND rel_path < ?3 AND missing = 0 AND quarantined = 0 ORDER BY rel_path",
+    )?;
+    // Everything that starts with "dir/": up to the next character after '/'.
+    let rows = st
+        .query_map(params![f.volume_id, format!("{}/", f.rel_dir), format!("{}0", f.rel_dir)], |r| {
+            let kind: String = r.get(4)?;
+            Ok(Rec { id: r.get(0)?, rel: r.get(1)?, size: r.get(2)?, key: r.get(3)?, video: kind == "video", taken: r.get(5)? })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok((mount, rows))
+}
+
+/// The files of a folder, sub-folder by sub-folder ("" = the folder itself).
+#[derive(Clone, Debug, Serialize)]
+pub struct FolderFiles {
+    pub dir: String,
+    pub ids: Vec<i64>,
+}
+
+pub fn files_in(conn: &Connection, folder: &FolderRef) -> Result<Vec<FolderFiles>> {
+    let (_, rows) = rows_in(conn, folder)?;
+    let root = clean(folder).rel_dir;
+    let mut by_dir: std::collections::BTreeMap<String, Vec<i64>> = std::collections::BTreeMap::new();
+    for r in &rows {
+        let inner = &r.rel[root.len() + 1..];
+        by_dir.entry(inner.rfind('/').map_or(String::new(), |i| inner[..i].to_string())).or_default().push(r.id);
+    }
+    Ok(by_dir.into_iter().map(|(dir, ids)| FolderFiles { dir, ids }).collect())
+}
+
+/// Two folders side by side: the files both have (as pairs: in the folder that stays, in the
+/// copy), and the files only one of them has.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct Compare {
+    pub shared: Vec<(i64, i64)>,
+    pub only_keep: Vec<i64>,
+    pub only_copy: Vec<i64>,
+}
+
+pub fn compare(conn: &Connection, keep: &FolderRef, copy: &FolderRef) -> Result<Compare> {
+    let (_, k) = rows_in(conn, keep)?;
+    let (_, c) = rows_in(conn, copy)?;
+    let (kd, cd) = (clean(keep).rel_dir, clean(copy).rel_dir);
+    let (kr, cr): (Vec<&Rec>, Vec<&Rec>) = (k.iter().collect(), c.iter().collect());
+    let twin = twins(&kr, &kd, &cr, &cd);
+    let mut out = Compare::default();
+    let mut paired: HashSet<i64> = HashSet::new();
+    for r in &c {
+        match twin.get(&r.id) {
+            Some(t) => {
+                paired.insert(t.id);
+                out.shared.push((t.id, r.id));
+            }
+            None => out.only_copy.push(r.id),
+        }
+    }
+    out.only_keep = k.iter().filter(|r| !paired.contains(&r.id)).map(|r| r.id).collect();
+    Ok(out)
+}
+
+/// What else is in a folder on disk: files the index does not hold (documents, sidecars) —
+/// what stays behind when the photos go.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct FolderProps {
+    pub other_files: u64,
+    pub other_bytes: u64,
+    pub examples: Vec<String>,
+}
+
+pub fn props(conn: &Connection, folder: &FolderRef) -> Result<FolderProps> {
+    let (mount, rows) = rows_in(conn, folder)?;
+    let root = volumes::join_rel(Path::new(&mount), &clean(folder).rel_dir);
+    let known: HashSet<PathBuf> = rows.iter().map(|r| volumes::join_rel(Path::new(&mount), &r.rel)).collect();
+    let mut out = FolderProps::default();
+    let mut stack = vec![root.clone()];
+    while let Some(d) = stack.pop() {
+        for e in fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            match e.file_type() {
+                Ok(t) if t.is_dir() => stack.push(p),
+                Ok(t) if t.is_file() && !known.contains(&p) => {
+                    out.other_files += 1;
+                    out.other_bytes += e.metadata().map_or(0, |m| m.len());
+                    if out.examples.len() < 5 {
+                        out.examples.push(p.strip_prefix(&root).unwrap_or(&p).to_string_lossy().into_owned());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -330,11 +719,14 @@ pub struct FolderRef {
     pub rel_dir: String,
 }
 
-/// One copy folder to remove, and the identical folder that stays.
+/// One copy folder to remove, and the identical folder that stays. `partial`: the two are only
+/// almost the same — what the folder that stays also has goes, the rest stays where it is.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Pick {
     pub keep: FolderRef,
     pub copy: FolderRef,
+    #[serde(default)]
+    pub partial: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -360,6 +752,8 @@ pub struct FolderRemoveReport {
     /// Files left in the copy folders: only there, or not the same as in the folder that stays.
     pub left: u64,
     pub left_examples: Vec<String>,
+    /// Photos only the copy folder has (`partial` picks): left where they are.
+    pub unique_left: u64,
     /// ♥ and other marks of the user carried over to the file that stays.
     pub labels_moved: u64,
     pub failed: u64,
@@ -382,11 +776,17 @@ pub fn remove(db: &Db, picks: &[Pick], purge: bool, stop: &StopFlag, progress: P
     let lib_vol = library::location(&conn).map(|l| l.0);
     // Outer folders first: a pick inside a folder that goes anyway then finds nothing to do.
     let mut seen: HashSet<(i64, String)> = HashSet::new();
-    let mut picks: Vec<Pick> = picks.iter().map(|p| Pick { keep: clean(&p.keep), copy: clean(&p.copy) }).filter(|p| seen.insert((p.copy.volume_id, p.copy.rel_dir.clone()))).collect();
+    let mut picks: Vec<Pick> = picks.iter().map(|p| Pick { keep: clean(&p.keep), copy: clean(&p.copy), partial: p.partial }).filter(|p| seen.insert((p.copy.volume_id, p.copy.rel_dir.clone()))).collect();
     picks.sort_by_key(|p| p.copy.rel_dir.matches('/').count());
     let total: u64 = picks.iter().map(|p| vols.iter().find(|v| v.id == p.copy.volume_id).map_or(0, |v| v.subtree(&p.copy.rel_dir).len() as u64)).sum();
 
-    let batch = journal::new_batch(&conn, "copies", &format!("100% 복사 폴더 {}개 정리", picks.len()))?;
+    let near = picks.iter().filter(|p| p.partial).count();
+    let label = |n: u64| match near {
+        0 => format!("100% 복사 폴더 {n}개 정리"),
+        m if m == picks.len() => format!("거의 같은 폴더 {n}개에서 겹치는 사진 정리"),
+        m => format!("복사 폴더 {n}개 정리 (거의 같은 폴더 {m}개 포함)"),
+    };
+    let batch = journal::new_batch(&conn, "copies", &label(picks.len() as u64))?;
     let mut rep = FolderRemoveReport { batch_id: batch.clone(), purged: purge, ..Default::default() };
     let mut run = Run { conn: &conn, vols: &vols, rules: &rules, lib_vol, batch: &batch, purge, stop, progress, gone: HashSet::new(), done: 0, total };
     for p in &picks {
@@ -408,7 +808,7 @@ pub fn remove(db: &Db, picks: &[Pick], purge: bool, stop: &StopFlag, progress: P
             }
         }
     }
-    conn.execute("UPDATE batches SET description = ? WHERE id = ?", params![format!("100% 복사 폴더 {}개 정리", rep.folders + rep.partial), batch])?;
+    conn.execute("UPDATE batches SET description = ? WHERE id = ?", params![label(rep.folders + rep.partial), batch])?;
     journal::finish_batch(&conn, &batch)?;
     if rep.files == 0 {
         conn.execute("DELETE FROM batches WHERE id = ? AND op_count = 0", [&batch])?;
@@ -462,42 +862,26 @@ impl Run<'_> {
         let live = |d: &str| -> Vec<&Rec> { v.subtree(d).iter().filter(|r| !self.gone.contains(&r.id)).collect() };
         let (k, c) = (live(kd), live(cd));
         if c.is_empty() {
-            return Ok(Some("이미 정리되었습니다".into()));
+            // Nothing left: emptied before, or by an outer pick of this very run (not worth a word).
+            return Ok(v.subtree(cd).is_empty().then(|| "이미 정리되었습니다".into()));
         }
-        if k.iter().chain(c.iter()).any(|r| r.key.is_none()) {
-            return Ok(Some("아직 확인하지 못한 파일이 있습니다".into()));
-        }
-        if content(k.iter().copied()) != content(c.iter().copied()) {
-            return Ok(Some("두 폴더의 내용이 달라져서 지우지 않았습니다".into()));
+        if !p.partial {
+            if k.iter().chain(c.iter()).any(|r| r.key.is_none()) {
+                return Ok(Some("아직 확인하지 못한 파일이 있습니다".into()));
+            }
+            if content(k.iter().copied()) != content(c.iter().copied()) {
+                return Ok(Some("두 폴더의 내용이 달라져서 지우지 않았습니다".into()));
+            }
         }
         if !keep_abs.is_dir() {
             return Ok(Some("남길 폴더를 찾을 수 없습니다".into()));
         }
-
-        // Each copy's twin in the folder that stays: the file at the same place if it is the
-        // same content, else any file with that content (each twin used once).
-        let mut pool: HashMap<(&str, i64), Vec<&Rec>> = HashMap::new();
-        for r in &k {
-            pool.entry((r.key.as_deref().unwrap_or(""), r.size)).or_default().push(r);
-        }
-        let inner = |r: &Rec, d: &str| r.rel[d.len() + 1..].to_lowercase();
-        let mut twin: HashMap<i64, &Rec> = HashMap::new();
-        for r in &c {
-            let name = inner(r, cd);
-            if let Some(l) = pool.get_mut(&(r.key.as_deref().unwrap_or(""), r.size)) {
-                if let Some(i) = l.iter().position(|t| inner(t, kd) == name) {
-                    twin.insert(r.id, l.swap_remove(i));
-                }
-            }
-        }
-        for r in &c {
-            if let std::collections::hash_map::Entry::Vacant(slot) = twin.entry(r.id) {
-                if let Some(t) = pool.get_mut(&(r.key.as_deref().unwrap_or(""), r.size)).and_then(|l| l.pop()) {
-                    slot.insert(t);
-                }
-            }
+        let twin = twins(&k, kd, &c, cd);
+        if twin.is_empty() {
+            return Ok(Some("두 폴더에 같은 사진이 없습니다".into()));
         }
 
+        let mut only_here: HashSet<PathBuf> = HashSet::new(); // photos the folder that stays does not have
         let mut stay: HashSet<PathBuf> = HashSet::new(); // indexed files that could not be taken out
         for r in &c {
             let here = v.abs(&r.rel);
@@ -508,7 +892,12 @@ impl Run<'_> {
             }
             self.done += 1;
             (self.progress)(Progress::new(JOB, "move", self.done, self.total, r.rel.clone()));
-            let t = twin.get(&r.id).filter(|t| v.abs(&t.rel).is_file());
+            let Some(t) = twin.get(&r.id) else {
+                rep.unique_left += 1;
+                only_here.insert(here);
+                continue;
+            };
+            let t = Some(t).filter(|t| v.abs(&t.rel).is_file());
             let f = db::get_file(self.conn, r.id)?.filter(|f| !f.quarantined && !f.missing);
             let (Some(t), Some(f)) = (t, f) else {
                 stay.insert(here);
@@ -535,7 +924,7 @@ impl Run<'_> {
         // What else is in the folder (documents, sidecars — nothing the index knows), then the
         // folders that are empty now.
         if !rep.cancelled {
-            sweep(&copy_abs, &keep_abs, self.purge, &stay, rep);
+            sweep(&copy_abs, &keep_abs, self.purge, &stay, &only_here, rep);
         }
         if copy_abs.exists() {
             rep.partial += 1;
@@ -557,14 +946,17 @@ fn is_junk(lower: &str) -> bool {
 /// Delete from `dir` what the folder that stays (`twin_dir`) also has at the same place with
 /// the same bytes, and the system's own leftovers; then the folder itself if nothing is left.
 /// Everything else stays and is counted.
-fn sweep(dir: &Path, twin_dir: &Path, purge: bool, stay: &HashSet<PathBuf>, rep: &mut FolderRemoveReport) {
+fn sweep(dir: &Path, twin_dir: &Path, purge: bool, stay: &HashSet<PathBuf>, only_here: &HashSet<PathBuf>, rep: &mut FolderRemoveReport) {
     let Ok(rd) = fs::read_dir(dir) else { return };
     for e in rd.flatten() {
         let (p, name) = (e.path(), e.file_name());
         let kind = e.file_type().ok();
         if kind.is_some_and(|k| k.is_dir()) {
-            sweep(&p, &twin_dir.join(&name), purge, stay, rep);
+            sweep(&p, &twin_dir.join(&name), purge, stay, only_here, rep);
             continue;
+        }
+        if only_here.contains(&p) {
+            continue; // counted as a photo of its own, not as something left over
         }
         let mut deleted = false;
         if kind.is_some_and(|k| k.is_file()) && !stay.contains(&p) {

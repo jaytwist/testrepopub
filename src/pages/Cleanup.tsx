@@ -52,6 +52,11 @@ export default function Cleanup() {
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [folderBytes, setFolderBytes] = useState(0);
+  const [nearBytes, setNearBytes] = useState(0);
+  const onFolderTotals = useCallback((exact: number, near: number) => {
+    setFolderBytes(exact);
+    setNearBytes(near);
+  }, []);
   const [triage, setTriage] = useState<{ kind: TriageKind; variant?: "safe" | "edited"; title: string } | null>(null);
 
   const load = useCallback(() => {
@@ -183,9 +188,10 @@ export default function Cleanup() {
         <div className="cleanup-hero card">
           <div>
             <div className="muted small">정리하면 확보할 수 있는 공간</div>
-            <div className="hero-num">{fmtBytes(s.total_bytes + folderBytes)}</div>
+            <div className="hero-num">{fmtBytes(s.total_bytes + folderBytes + nearBytes)}</div>
             <div className="hero-tiers small">
               {folderBytes > 0 && <span className="t-first">100% 복사 폴더 {fmtBytes(folderBytes)}</span>}
+              {nearBytes > 0 && <span className="t-check">거의 같은 폴더 {fmtBytes(nearBytes)}</span>}
               <span className="t-safe">안전 {fmtBytes(tierBytes("safe"))}</span>
               <span className="t-quick">빠르게 볼 것 {fmtBytes(tierBytes("quick"))}</span>
               <span className="t-check">확인 필요 {fmtBytes(tierBytes("check"))}</span>
@@ -205,7 +211,7 @@ export default function Cleanup() {
         </div>
       )}
 
-      <CopyFolders onTotals={setFolderBytes} />
+      <CopyFolders onTotals={onFolderTotals} />
 
       {TIERS.map((t) => {
         const list = cards.filter((c) => c.tier === t.id);

@@ -1244,9 +1244,30 @@ fn start_library_delete(app: AppHandle, state: State<AppState>, plan_id: String,
 
 /// Folders copied whole, on the library drive ("100% 복사 폴더"): reads the index only.
 #[tauri::command(async)]
-fn copy_folders(state: State<'_, AppState>) -> CmdResult<media_core::folders::Found> {
+fn copy_folders(state: State<'_, AppState>, near: Option<f64>) -> CmdResult<media_core::folders::Found> {
     let conn = state.db.conn().map_err(err)?;
-    media_core::folders::find(&conn).map_err(err)
+    media_core::folders::find_with(&conn, near.unwrap_or(media_core::folders::NEAR)).map_err(err)
+}
+
+/// A folder's photos and videos, sub-folder by sub-folder.
+#[tauri::command(async)]
+fn folder_files(state: State<'_, AppState>, folder: media_core::folders::FolderRef) -> CmdResult<Vec<media_core::folders::FolderFiles>> {
+    let conn = state.db.conn().map_err(err)?;
+    media_core::folders::files_in(&conn, &folder).map_err(err)
+}
+
+/// Two folders side by side: what both have, what only one has.
+#[tauri::command(async)]
+fn folder_compare(state: State<'_, AppState>, keep: media_core::folders::FolderRef, copy: media_core::folders::FolderRef) -> CmdResult<media_core::folders::Compare> {
+    let conn = state.db.conn().map_err(err)?;
+    media_core::folders::compare(&conn, &keep, &copy).map_err(err)
+}
+
+/// What else a folder holds on disk (files that are not photos or videos).
+#[tauri::command(async)]
+fn folder_props(state: State<'_, AppState>, folder: media_core::folders::FolderRef) -> CmdResult<media_core::folders::FolderProps> {
+    let conn = state.db.conn().map_err(err)?;
+    media_core::folders::props(&conn, &folder).map_err(err)
 }
 
 /// Remove the chosen copy folders (each file compared with its twin before it is deleted).
@@ -1579,6 +1600,9 @@ pub fn run() {
             library_delete_preview,
             start_library_delete,
             copy_folders,
+            folder_files,
+            folder_compare,
+            folder_props,
             start_remove_copy_folders,
             open_folder,
         ])
