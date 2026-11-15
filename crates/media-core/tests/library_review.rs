@@ -190,7 +190,7 @@ fn group_ids_are_stable_and_stale_decisions_do_nothing() {
 
     // The stale decision is saved onto nothing.
     let before = keeps(gc);
-    triage::commit(&mut db.conn().unwrap(), &[stale.clone()]).unwrap();
+    triage::commit(&mut db.conn().unwrap(), std::slice::from_ref(&stale)).unwrap();
     assert_eq!(keeps(gc), before);
     // Even addressed at the new group's id, a decision that keeps none of its photos is refused.
     triage::commit(&mut db.conn().unwrap(), &[Decision { key: format!("dup:{gc}"), keep: vec![id("b.jpg")], ..Default::default() }]).unwrap();

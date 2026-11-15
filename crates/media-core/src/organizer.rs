@@ -472,7 +472,7 @@ pub fn plan(db: &Db, opts: &OrganizeOptions, stop: &StopFlag, progress: Progress
         if to_check {
             summary.uncertain_dates += 1;
         }
-        let ctx = TemplateCtx { file: &f, labels, trip: trips.get(id).map(String::as_str), person: persons.get(id).map(String::as_str) };
+        let ctx = TemplateCtx { file: f, labels, trip: trips.get(id).map(String::as_str), person: persons.get(id).map(String::as_str) };
         let place = placements.get(id);
         if library {
             let Some(p) = place else { continue };
@@ -512,7 +512,7 @@ pub fn plan(db: &Db, opts: &OrganizeOptions, stop: &StopFlag, progress: Progress
             _ => render_template(&opts.template, &ctx),
         };
         let dir = volumes::join_rel(&target, &rel_dir);
-        let base_name = target_name(&f, opts.rename);
+        let base_name = target_name(f, opts.rename);
         let copy = match place {
             Some(p) => p.act == crate::library::Act::Copy,
             None => opts.mode == Mode::Copy,
@@ -1494,7 +1494,17 @@ pub fn execute_with(db: &Db, plan: &Plan, xo: &ExecOptions, stop: &StopFlag, pro
             if !src.is_file() {
                 bail!("파일이 없습니다: {}", it.src);
             }
-            let dst = PathBuf::from(&it.dst);
+            // Something is already there that the plan did not know about (a file put there
+            // outside the app, not indexed yet): nothing is overwritten and nothing fails — this
+            // file goes beside it under a numbered name; the next scan sorts out copies.
+            let mut dst = PathBuf::from(&it.dst);
+            if dst.exists() {
+                let name = dst.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                dst = (1..1000)
+                    .map(|n| dst.with_file_name(with_suffix(&name, n)))
+                    .find(|p| !p.exists())
+                    .ok_or_else(|| anyhow::anyhow!("대상 폴더에 같은 이름이 너무 많습니다: {}", it.dst))?;
+            }
             let dst_rel = volumes::rel_of(&tvol.root, &dst)?;
             let copy = it.action == Action::Copy;
             // The folder's names, read before anything in it moves (so a RAW beside the JPG is seen).

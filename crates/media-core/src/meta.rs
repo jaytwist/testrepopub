@@ -265,19 +265,25 @@ static RE_FOLDER_YMD: Lazy<Regex> = Lazy::new(|| {
 
 pub fn date_from_filename(name: &str) -> Option<NaiveDateTime> {
     let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
+    // `\d` also matches digits of other scripts (full-width ２０２４ in some file names), which do
+    // not parse as numbers: such a name simply has no date (it must not stop a scan).
     if let Some(c) = RE_DATETIME.captures(stem) {
-        let n = |i: usize| c.get(i).unwrap().as_str().parse::<u32>().unwrap();
-        if let Some(dt) = NaiveDate::from_ymd_opt(n(1) as i32, n(2), n(3)).and_then(|d| d.and_hms_opt(n(4), n(5), n(6))) {
-            if plausible(&dt) {
-                return Some(dt);
+        let n = |i: usize| c.get(i).and_then(|m| m.as_str().parse::<u32>().ok());
+        if let (Some(y), Some(mo), Some(d), Some(h), Some(mi), Some(s)) = (n(1), n(2), n(3), n(4), n(5), n(6)) {
+            if let Some(dt) = NaiveDate::from_ymd_opt(y as i32, mo, d).and_then(|d| d.and_hms_opt(h, mi, s)) {
+                if plausible(&dt) {
+                    return Some(dt);
+                }
             }
         }
     }
     if let Some(c) = RE_DATE.captures(stem) {
-        let n = |i: usize| c.get(i).unwrap().as_str().parse::<u32>().unwrap();
-        if let Some(dt) = NaiveDate::from_ymd_opt(n(1) as i32, n(2), n(3)).and_then(|d| d.and_hms_opt(12, 0, 0)) {
-            if plausible(&dt) {
-                return Some(dt);
+        let n = |i: usize| c.get(i).and_then(|m| m.as_str().parse::<u32>().ok());
+        if let (Some(y), Some(mo), Some(d)) = (n(1), n(2), n(3)) {
+            if let Some(dt) = NaiveDate::from_ymd_opt(y as i32, mo, d).and_then(|d| d.and_hms_opt(12, 0, 0)) {
+                if plausible(&dt) {
+                    return Some(dt);
+                }
             }
         }
     }
@@ -351,6 +357,14 @@ pub fn fmt_ts(ts: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn digits_of_other_scripts_are_not_a_date() {
+        // Full-width digits match `\d` but are not numbers: no date, and no panic.
+        assert_eq!(date_from_filename("IMG_20２４0101_120000.jpg"), None);
+        assert_eq!(date_from_filename("사진 20２４-01-０１.jpg"), None);
+        assert!(date_from_filename("IMG_20240101_120000.jpg").is_some());
+    }
 
     #[test]
     fn broken_exif_sizes() {

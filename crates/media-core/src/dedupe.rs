@@ -114,11 +114,11 @@ pub fn find_exact(db: &Db, stop: &StopFlag, progress: ProgressFn) -> Result<Dedu
             let mut m: HashMap<String, Vec<FileRow>> = HashMap::new();
             for f in group {
                 let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                if d % 200 == 0 {
+                if d.is_multiple_of(200) {
                     progress(Progress::new(job, "prehash", d, pre_total, f.name.clone()));
                 }
                 if let Ok(p) = journal::prehash_file(&f.abs_path(), f.size as u64) {
-                    fresh_prehashes.lock().unwrap().push((f.id, p.clone()));
+                    fresh_prehashes.lock().unwrap_or_else(|e| e.into_inner()).push((f.id, p.clone()));
                     m.entry(p).or_default().push(f);
                 }
             }
@@ -143,7 +143,7 @@ pub fn find_exact(db: &Db, stop: &StopFlag, progress: ProgressFn) -> Result<Dedu
             }
             let h = journal::hash_file(&f.abs_path()).ok()?;
             let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-            if d % 20 == 0 {
+            if d.is_multiple_of(20) {
                 progress(Progress::new(job, "hash", d, total, f.name.clone()));
             }
             Some((f.id, h))
@@ -160,7 +160,7 @@ pub fn find_exact(db: &Db, stop: &StopFlag, progress: ProgressFn) -> Result<Dedu
                 st.execute(params![h, id])?;
             }
             let mut st = tx.prepare_cached("UPDATE files SET prehash = ? WHERE id = ? AND prehash IS NULL")?;
-            for (id, p) in fresh_prehashes.into_inner().unwrap() {
+            for (id, p) in fresh_prehashes.into_inner().unwrap_or_else(|e| e.into_inner()) {
                 st.execute(params![p, id])?;
             }
         }

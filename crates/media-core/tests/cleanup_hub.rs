@@ -126,7 +126,7 @@ fn backups_on_other_drives_are_kept() {
     let mut roles = vec![role(a), role(a_copy), role(backup)];
     roles.sort();
     assert_eq!(roles, vec!["backup".to_string(), "copy".to_string(), "original".to_string()]);
-    assert_eq!(role(a) == "copy" || role(a_copy) == "copy", true, "the extra copy is on drive A");
+    assert!(role(a) == "copy" || role(a_copy) == "copy", "the extra copy is on drive A");
     assert_eq!(cleanup::summary(&conn).unwrap().backups.count, 1);
 
     // Applying removes only the extra copy on drive A.

@@ -81,7 +81,9 @@ struct IndexedFile {
 /// Indexed files of this part of the volume, by folder.
 fn indexed_by_dir(conn: &Connection, volume_id: i64, rel_root: &str) -> Result<HashMap<String, Vec<IndexedFile>>> {
     let mut st = conn.prepare(
-        "SELECT rel_path, name, ext, kind, size, mtime FROM files WHERE volume_id = ?1 AND missing = 0
+        // What is really in the folders: a quarantined file's row keeps its old path, but the
+        // file is not there (taking it for present brought removed copies back into the index).
+        "SELECT rel_path, name, ext, kind, size, mtime FROM files WHERE volume_id = ?1 AND missing = 0 AND quarantined = 0
            AND (?2 = '' OR substr(rel_path, 1, length(?2) + 1) = ?2 || '/')",
     )?;
     let mut out: HashMap<String, Vec<IndexedFile>> = HashMap::new();
@@ -202,7 +204,7 @@ pub fn scan_with(db: &Db, source_id: i64, sub: Option<&str>, opts: &ScanOptions,
             let mt = mtime_ns(&md);
             seen_dirs.push((rel_dir.clone(), mt));
             walked += 1;
-            if walked % 500 == 0 {
+            if walked.is_multiple_of(500) {
                 progress(Progress::new(&job, "walk", cands.len() as u64, 0, abs.to_string_lossy()));
             }
             if known_dirs.get(&rel_dir) == Some(&mt) {
@@ -274,7 +276,7 @@ pub fn scan_with(db: &Db, source_id: i64, sub: Option<&str>, opts: &ScanOptions,
                 continue;
             };
             walked += 1;
-            if walked % 2000 == 0 {
+            if walked.is_multiple_of(2000) {
                 progress(Progress::new(&job, "walk", cands.len() as u64, 0, entry.path().to_string_lossy()));
             }
             if entry.file_type().is_dir() {
@@ -340,6 +342,12 @@ pub fn scan_with(db: &Db, source_id: i64, sub: Option<&str>, opts: &ScanOptions,
     let gone_here: HashSet<i64> = existing.iter().filter(|(rel, _)| !seen.contains(rel.as_str())).map(|(_, (id, _, _))| *id).collect();
     let mut moved_ids: HashSet<i64> = HashSet::new();
     let mut known_rels: HashSet<&str> = HashSet::new();
+    // Paths still held by a quarantined file's row (it keeps its path so undo can put it back).
+    let held: HashSet<String> = {
+        let mut st = conn.prepare("SELECT rel_path FROM files WHERE volume_id = ? AND quarantined = 1")?;
+        let s = st.query_map([volume_id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        s
+    };
     {
         let tx = conn.transaction()?;
         for c in todo.iter().filter(|c| !existing.contains_key(&c.rel)) {
@@ -347,6 +355,13 @@ pub fn scan_with(db: &Db, source_id: i64, sub: Option<&str>, opts: &ScanOptions,
                 return Err(anyhow!("cancelled"));
             }
             match identity::find_known(&tx, &c.abs, c.size as i64, c.mtime, &gone_here, &moved_ids)? {
+                // A file moved (outside the app) to where a quarantined file used to be cannot
+                // take that row's path: it is indexed as a copy there (the row comes back to
+                // life), and the place it left is marked missing as usual.
+                Some(Known::Moved(id)) if held.contains(&c.rel) => {
+                    identity::apply_copy(&tx, id, volume_id, &c.rel, &c.name, &c.ext, now)?;
+                    stats.reused += 1;
+                }
                 Some(Known::Moved(id)) => {
                     identity::apply_move(&tx, id, volume_id, &c.rel, &c.name, &c.ext, now)?;
                     moved_ids.insert(id);
@@ -380,7 +395,7 @@ pub fn scan_with(db: &Db, source_id: i64, sub: Option<&str>, opts: &ScanOptions,
                 // (the header was just read, so this is served from the OS cache).
                 let ph = journal::prehash_file(&c.abs, c.size).ok();
                 let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                if d % 50 == 0 {
+                if d.is_multiple_of(50) {
                     progress(Progress::new(&job, "meta", d, total, c.name.clone()));
                 }
                 (*c, m, ph)

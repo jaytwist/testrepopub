@@ -624,7 +624,14 @@ pub fn layout(
             let first = sp.map(|s| s.0);
             // The folder's own date, else a date-only folder above it (`2009/2009-07/제주도` already in the library).
             let written = (0..=k).rev().find_map(|j| folder_month(&segs[j]));
+            // Already filed in the library under a month folder: it stays in that month (the
+            // event's photos may have been planned from several places; what is filed is not
+            // moved again because the folder now holds other photos).
+            let filed = f.vol == lib_vol
+                && (lib_root.is_empty() || f.rel.starts_with(&format!("{lib_root}/")))
+                && (0..k).rev().find_map(|j| folder_month(&segs[j])).is_some();
             let month = match (written, first) {
+                (Some((y, m)), _) if filed => Some(format!("{y:04}/{y:04}-{m:02}")),
                 (Some((y, m)), Some(t)) => {
                     let named = mid_month((y, m));
                     if (named - t).abs() <= 31 * 86_400 {

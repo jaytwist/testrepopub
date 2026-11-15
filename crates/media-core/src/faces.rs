@@ -102,7 +102,7 @@ impl FaceEngine {
             }
             #[cfg(not(windows))]
             let _ = gpu;
-            Ok(b.commit_from_file(models.join(file)).with_context(|| format!("모델을 불러오지 못했습니다: {file}"))?)
+            b.commit_from_file(models.join(file)).with_context(|| format!("모델을 불러오지 못했습니다: {file}"))
         };
         // GPU first (Windows), CPU if the GPU path fails for any reason.
         if use_gpu && cfg!(windows) {

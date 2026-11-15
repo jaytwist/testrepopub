@@ -74,9 +74,9 @@ fn merge_and_delete_folders() {
     scanner::scan_all(&db, &ScanOptions::default(), &stop, &quiet).unwrap();
     let plan = organizer::plan(&db, &opts, &stop, &quiet).unwrap();
     assert_eq!((item(&plan, "제주도/c4.jpg").action, item(&plan, "제주도/c4.jpg").group), (Action::Copy, g1.clone()));
-    let t = organizer::delete_targets(&plan, &[g1.clone()]);
+    let t = organizer::delete_targets(&plan, std::slice::from_ref(&g1));
     assert_eq!(t.ids.len(), 4, "j1, j2, j3 and j1's copy in 백업: {t:?}");
-    let rep = organizer::delete_folders(&db, &plan, &[g1.clone()], true, &stop, &quiet).unwrap();
+    let rep = organizer::delete_folders(&db, &plan, std::slice::from_ref(&g1), true, &stop, &quiet).unwrap();
     assert_eq!((rep.deleted, rep.kept_protected, rep.not_copied), (3, 1, 1), "{rep:?}");
     assert!(!e.join("사진/2015/2015-08/제주도/j1.jpg").exists());
     assert!(!e.join("백업/j1.jpg").exists());

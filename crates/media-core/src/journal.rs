@@ -429,6 +429,16 @@ pub fn undo_batch(conn: &Connection, batch_id: &str) -> Result<UndoReport> {
                     }
                 }
                 "copy" => {
+                    // The copy was moved on since (organized again, say): it is no longer at
+                    // `dst`. Removing only its index entry would leave a file the app does not
+                    // know about: leave both and say so.
+                    if let Some(nid) = e.new_file_id {
+                        if let Some(now_at) = db::get_file(conn, nid)?.map(|f| f.abs_path()) {
+                            if now_at != dst && !dst.exists() {
+                                bail!("가져온 파일이 그 뒤에 다른 곳으로 옮겨져 그대로 두었습니다: {}", now_at.display());
+                            }
+                        }
+                    }
                     if dst.exists() {
                         let hs = hash_file(&src).ok();
                         let hd = hash_file(&dst)?;

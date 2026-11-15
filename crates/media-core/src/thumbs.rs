@@ -372,7 +372,7 @@ pub fn warm(db: &Db, cache: &ThumbCache, stop: &StopFlag, progress: ProgressFn) 
             failed.fetch_add(1, Ordering::Relaxed);
         }
         let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-        if d % 25 == 0 || d == total {
+        if d.is_multiple_of(25) || d == total {
             progress(Progress::new("thumbs", "thumbs", d, total, f.name.clone()));
         }
     });

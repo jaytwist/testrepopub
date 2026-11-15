@@ -50,7 +50,7 @@ fn library_plan_many_files() {
                 let day = (originals % 5400) as i64;
                 let taken = 1_100_000_000 + day * 86_400 + (originals as i64 % 3600);
                 let year = 2004 + day / 360;
-                let dir = if originals % 2 == 0 {
+                let dir = if originals.is_multiple_of(2) {
                     format!("옛날/{year}-{:02} 여행 {}", (day / 30) % 12 + 1, originals / 200)
                 } else {
                     format!("DCIM/{:03}CANON", 100 + (originals / 500) % 900)
@@ -61,7 +61,7 @@ fn library_plan_many_files() {
                 st.execute(params![ve, format!("{dir}/{name}.JPG"), format!("{name}.JPG"), "jpg", "photo", size, taken, key]).unwrap();
                 i += 1;
                 // Every 10th has a RAW beside it.
-                if originals % 10 == 0 && i < n {
+                if originals.is_multiple_of(10) && i < n {
                     st.execute(params![ve, format!("{dir}/{name}.CR2"), format!("{name}.CR2"), "cr2", "raw", size * 3, taken, format!("raw{originals}")])
                         .unwrap();
                     i += 1;

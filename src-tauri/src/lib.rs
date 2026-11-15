@@ -778,14 +778,14 @@ async fn compare_files(app: AppHandle, ids: Vec<i64>) -> CmdResult<CompareInfo> 
 fn detail_of(state: &AppState, conn: &media_core::rusqlite::Connection, id: i64) -> CmdResult<FileDetail> {
     let f = db::get_file(conn, id).map_err(err)?.ok_or("not found")?;
     Ok(FileDetail {
-        reasons: media_core::cleanup::reasons(&conn, id).map_err(err)?,
-        labels: labels::labels_for(&conn, id).map_err(err)?,
+        reasons: media_core::cleanup::reasons(conn, id).map_err(err)?,
+        labels: labels::labels_for(conn, id).map_err(err)?,
         abs_path: f.abs_path().to_string_lossy().into(),
         taken: f.taken_at.map(meta::fmt_ts).unwrap_or_default(),
         confidence: meta::confidence(&f.date_source).into(),
         thumb_cached: state.thumbs.has_thumb(&f),
-        place: media_core::places::place_of(&conn, id).map_err(err)?,
-        people: media_core::people::names_in(&conn, id).map_err(err)?,
+        place: media_core::places::place_of(conn, id).map_err(err)?,
+        people: media_core::people::names_in(conn, id).map_err(err)?,
         dup_role: conn.query_row("SELECT role FROM dup_roles WHERE file_id = ?", [id], |r| r.get(0)).ok(),
         dup_group_size: conn.query_row("SELECT group_size FROM dup_roles WHERE file_id = ?", [id], |r| r.get(0)).unwrap_or(0),
         file: f,

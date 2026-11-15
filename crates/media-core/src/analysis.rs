@@ -509,7 +509,7 @@ pub fn run(
         }
         // Identical copies and RAWs whose JPG is done need no analysis of their own. Checked at
         // the start and every so often (newly finished files make new twins).
-        if chunks % 100 == 0 {
+        if chunks.is_multiple_of(100) {
             let n = reuse_finished(&mut conn, faces)? as u64;
             stats.reused += n;
             done.fetch_add(n, Ordering::Relaxed);
@@ -555,7 +555,7 @@ mod tests {
     use image::{ImageBuffer, Luma};
 
     fn checker(w: u32, h: u32, cell: u32) -> GrayImage {
-        ImageBuffer::from_fn(w, h, |x, y| Luma([if ((x / cell) + (y / cell)) % 2 == 0 { 20 } else { 230 }]))
+        ImageBuffer::from_fn(w, h, |x, y| Luma([if ((x / cell) + (y / cell)).is_multiple_of(2) { 20 } else { 230 }]))
     }
 
     #[test]
