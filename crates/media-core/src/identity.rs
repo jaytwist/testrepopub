@@ -184,14 +184,33 @@ pub fn backfill_prehashes(conn: &Connection) -> Result<usize> {
 /// be read gets a fingerprint of its own (`unreadable-<id>`): not read again, and never taken for
 /// a copy of anything.
 pub fn backfill_prehashes_with(conn: &Connection, limit: usize, stop: &crate::StopFlag, paused: &dyn Fn() -> bool) -> Result<usize> {
+    backfill_where(conn, "", limit, stop, paused)
+}
+
+/// Only the files that could be a copy of something on drive `volume_id` (same size as one of
+/// its files) — all an import from a card needs, instead of fingerprinting the whole library.
+pub fn backfill_prehashes_for_volume(conn: &Connection, volume_id: i64, stop: &crate::StopFlag) -> Result<usize> {
+    let only = format!("AND f.size IN (SELECT size FROM files WHERE volume_id = {volume_id} AND missing = 0 AND quarantined = 0)");
+    let mut done = 0;
+    loop {
+        let n = backfill_where(conn, &only, 2000, stop, &|| false)?;
+        done += n;
+        if n == 0 || stop.is_stopped() {
+            return Ok(done);
+        }
+    }
+}
+
+fn backfill_where(conn: &Connection, only: &str, limit: usize, stop: &crate::StopFlag, paused: &dyn Fn() -> bool) -> Result<usize> {
     use rayon::prelude::*;
     let todo: Vec<(i64, std::path::PathBuf, u64)> = {
-        let mut st = conn.prepare(
+        let mut st = conn.prepare(&format!(
             "SELECT f.id, v.mount, f.rel_path, f.size FROM files f JOIN volumes v ON v.id = f.volume_id
              WHERE f.prehash IS NULL AND f.missing = 0 AND f.quarantined = 0 AND v.online = 1
                AND EXISTS (SELECT 1 FROM files g WHERE g.id != f.id AND g.size = f.size AND g.missing = 0 AND g.quarantined = 0)
-             ORDER BY f.volume_id, f.rel_path LIMIT ?",
-        )?;
+               {only}
+             ORDER BY f.volume_id, f.rel_path LIMIT ?"
+        ))?;
         let rows = st
             .query_map([limit.min(i64::MAX as usize) as i64], |r| {
                 let mount: String = r.get(1)?;
@@ -213,11 +232,13 @@ pub fn backfill_prehashes_with(conn: &Connection, limit: usize, stop: &crate::St
         }
         let hashes: Vec<(i64, String)> =
             pool.install(|| chunk.par_iter().map(|(id, p, size)| (*id, journal::prehash_file(p, *size).unwrap_or_else(|_| format!("unreadable-{id}")))).collect());
-        conn.execute_batch("BEGIN")?;
+        // A transaction that is always closed (an error inside must not leave it open on this
+        // connection).
+        let tx = conn.unchecked_transaction()?;
         for (id, h) in &hashes {
             st.execute(params![h, id])?;
         }
-        conn.execute_batch("COMMIT")?;
+        tx.commit()?;
         done += hashes.len();
     }
     Ok(done)

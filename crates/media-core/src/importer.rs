@@ -100,9 +100,10 @@ pub fn preview(db: &Db, card: &Path, opts: &ScanOptions, stop: &StopFlag, progre
     };
     scanner::scan_source(db, source_id, opts, stop, progress)?;
     let conn = db.conn()?;
-    // Same-size files elsewhere get their fingerprint (once) so copies are recognised by content.
-    identity::backfill_prehashes(&conn)?;
     let volume_id: i64 = conn.query_row("SELECT volume_id FROM sources WHERE id = ?", [source_id], |r| r.get(0))?;
+    // Files elsewhere with the size of a file on the card get their fingerprint (once), so copies
+    // are recognised by content — only those, not the whole library.
+    identity::backfill_prehashes_for_volume(&conn, volume_id, stop)?;
     let all = db::filtered_stats(&conn, &FileFilter { volume_id: Some(volume_id), ..Default::default() })?;
     let new = db::filtered_stats(&conn, &new_on_card(volume_id))?;
     Ok(Preview { source_id, volume_id, new_files: new.count, new_bytes: new.bytes, already: all.count - new.count })

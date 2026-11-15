@@ -74,6 +74,32 @@ impl Progress {
 
 pub type ProgressFn<'a> = &'a (dyn Fn(Progress) + Sync);
 
+/// Run `f`; a panic inside it (a decoder choking on a damaged file, say) becomes an error
+/// instead of killing the thread — one bad file must not stop the rest.
+pub fn guarded<T>(what: &str, f: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(r) => r,
+        Err(p) => Err(anyhow::anyhow!("{what}: 예기치 못한 오류 ({})", panic_text(p.as_ref()))),
+    }
+}
+
+/// What a panic said.
+pub fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
+    p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "panic".into())
+}
+
+/// A lock that still opens after a thread died holding it (the data is plain state; a stuck
+/// lock would freeze every later use).
+pub trait Locked<T> {
+    fn locked(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> Locked<T> for std::sync::Mutex<T> {
+    fn locked(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 pub fn now_ts() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

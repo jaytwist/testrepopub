@@ -207,7 +207,7 @@ export interface LaneStatus {
   timed_files: number; read_ms: number; faces_ms: number; reused: number;
 }
 export interface AnalysisOptions { auto: boolean; people: boolean; gpu: boolean; pause_on_battery: boolean }
-export interface AppInfo { version: string; data_dir: string; cache_dir: string; ffmpeg: boolean; job: string | null }
+export interface AppInfo { version: string; data_dir: string; cache_dir: string; ffmpeg: boolean; job: string | null; interrupted: string[] }
 
 export const api = {
   appInfo: () => invoke<AppInfo>("app_info"),

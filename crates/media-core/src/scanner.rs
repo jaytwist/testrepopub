@@ -515,8 +515,8 @@ pub fn scan_all_with(db: &Db, opts: &ScanOptions, mode: Mode, stop: &StopFlag, p
         }
         out.push(scan_with(db, id, None, opts, mode, stop, progress)?);
     }
-    // Older entries that could have a copy get their content fingerprint (once).
-    identity::backfill_prehashes(&db.conn()?)?;
+    // Entries indexed by older versions get their content fingerprint in the background (the
+    // app's analysis lane): a scan does not wait for it.
     Ok(out)
 }
 
@@ -541,7 +541,6 @@ pub fn scan_volume_with(db: &Db, volume_id: i64, opts: &ScanOptions, mode: Mode,
         }
         out.push(scan_with(db, id, None, opts, mode, stop, progress)?);
     }
-    identity::backfill_prehashes(&db.conn()?)?;
     Ok(out)
 }
 

@@ -33,6 +33,26 @@ pub fn finish_batch(conn: &Connection, batch_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Work left `running` by a crash or power loss (call at start, when nothing can be running):
+/// entries that did nothing are dropped, the others are closed and marked 「중단됨」 so they can
+/// be undone. Returns their descriptions. File moves made after the last saved step are found
+/// again by the next scan (by content).
+pub fn recover_interrupted(conn: &Connection) -> Result<Vec<String>> {
+    conn.execute("DELETE FROM batches WHERE state = 'running' AND NOT EXISTS (SELECT 1 FROM journal j WHERE j.batch_id = batches.id)", [])?;
+    let names: Vec<String> = {
+        let mut st = conn.prepare("SELECT description FROM batches WHERE state = 'running' ORDER BY created_at")?;
+        let rows = st.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        rows
+    };
+    conn.execute(
+        "UPDATE batches SET state = 'done', description = description || ' (중단됨)',
+                op_count = (SELECT COUNT(*) FROM journal j WHERE j.batch_id = batches.id)
+         WHERE state = 'running'",
+        [],
+    )?;
+    Ok(names)
+}
+
 // ---------------------------------------------------------------------------------------------
 // Low-level file helpers
 // ---------------------------------------------------------------------------------------------

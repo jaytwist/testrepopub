@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use media_core::analysis::{self, AnalysisOptions, FaceRuntime, PauseFlag};
 use media_core::faces::FaceEngine;
-use media_core::{power, Progress, StopFlag};
+use media_core::{power, Locked, Progress, StopFlag};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -53,6 +53,7 @@ pub struct Lane {
     on_battery: AtomicBool,
     /// Face finding turned off by the user (this session only).
     faces_off: AtomicBool,
+    backfilling: AtomicBool,
     pub pause: PauseFlag,
     pub stop: StopFlag,
     status: Mutex<LaneStatus>,
@@ -109,7 +110,7 @@ impl Lane {
             None
         };
         self.pause.set(reason.is_some());
-        let mut s = self.status.lock().unwrap();
+        let mut s = self.status.locked();
         s.paused = reason.is_some();
         s.reason = reason.map(String::from);
         s.faces_enabled = !self.faces_off.load(Ordering::Relaxed);
@@ -133,7 +134,7 @@ impl Lane {
     pub fn status(&self, app: &AppHandle) -> LaneStatus {
         let st = app.state::<AppState>();
         let opts = Self::options(app);
-        let mut s = self.status.lock().unwrap().clone();
+        let mut s = self.status.locked().clone();
         if let Ok(conn) = st.db.conn() {
             if let Ok(p) = analysis::pending(&conn, people_active(app, &opts) && !self.faces_off.load(Ordering::Relaxed)) {
                 s.pending_online = p.online;
@@ -157,7 +158,7 @@ impl Lane {
         if self.faces_off.swap(!on, Ordering::SeqCst) == !on {
             return;
         }
-        self.status.lock().unwrap().faces_enabled = on;
+        self.status.locked().faces_enabled = on;
         let lane = self.clone();
         let app = app.clone();
         std::thread::spawn(move || {
@@ -177,14 +178,14 @@ impl Lane {
 
     /// Drop the cached face engine (people feature toggled or GPU setting changed).
     pub fn reset_engine(&self) {
-        *self.engine.lock().unwrap() = None;
+        *self.engine.locked() = None;
     }
 
     fn engine(&self, app: &AppHandle, opts: &AnalysisOptions) -> Result<Option<Arc<Mutex<FaceEngine>>>, String> {
         if !opts.people {
             return Ok(None);
         }
-        let mut cached = self.engine.lock().unwrap();
+        let mut cached = self.engine.locked();
         if let Some(e) = cached.as_ref() {
             return Ok(Some(e.clone()));
         }
@@ -196,6 +197,41 @@ impl Lane {
         let e = Arc::new(Mutex::new(e));
         *cached = Some(e.clone());
         Ok(Some(e))
+    }
+
+    /// Read the content fingerprints still missing (entries indexed by older versions), behind
+    /// everything else: waits while a user job runs, and does nothing if an analysis pass is
+    /// running (a pass starts with the same work).
+    pub fn kick_backfill(self: &Arc<Self>, app: &AppHandle) {
+        if self.running.load(Ordering::SeqCst) || self.backfilling.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let lane = self.clone();
+        let app = app.clone();
+        std::thread::spawn(move || {
+            struct Done(Arc<Lane>);
+            impl Drop for Done {
+                fn drop(&mut self) {
+                    self.0.backfilling.store(false, Ordering::SeqCst);
+                }
+            }
+            let _done = Done(lane.clone());
+            let st = app.state::<AppState>();
+            let stop = StopFlag::new();
+            let Ok(conn) = st.db.conn() else { return };
+            let busy = || lane.job_active.load(Ordering::Relaxed);
+            loop {
+                if busy() {
+                    std::thread::sleep(Duration::from_secs(1));
+                    continue;
+                }
+                match media_core::guarded("지문 읽기", || media_core::identity::backfill_prehashes_with(&conn, 500, &stop, &busy)) {
+                    Ok(0) if busy() => continue,
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
     }
 
     /// Start analysing if there is work and nothing is running. `force` ignores the auto setting.
@@ -210,6 +246,14 @@ impl Lane {
         let lane = self.clone();
         let app = app.clone();
         std::thread::spawn(move || {
+            // However this thread ends, the lane can be started again.
+            struct NotRunning(Arc<Lane>);
+            impl Drop for NotRunning {
+                fn drop(&mut self) {
+                    self.0.running.store(false, Ordering::SeqCst);
+                }
+            }
+            let _not_running = NotRunning(lane.clone());
             lane.stop.reset();
             lane.update_pause(&app);
             let st = app.state::<AppState>();
@@ -219,7 +263,7 @@ impl Lane {
                 // the background so copies are recognised; planning no longer reads the drives.
                 if let Ok(conn) = st.db.conn() {
                     {
-                        let mut s = lane.status.lock().unwrap();
+                        let mut s = lane.status.locked();
                         s.current = "사본 확인용 지문 읽는 중".into();
                     }
                     while !lane.stop.is_stopped() && !lane.pause.is_paused() {
@@ -233,17 +277,25 @@ impl Lane {
                 let engine = if lane.faces_off.load(Ordering::Relaxed) { Ok(None) } else { lane.engine(&app, &opts) };
                 let engine = match engine {
                     Ok(e) => {
-                        lane.status.lock().unwrap().last_error = None;
+                        lane.status.locked().last_error = None;
                         e
                     }
                     Err(msg) => {
-                        lane.status.lock().unwrap().last_error = Some(format!("인물(얼굴) 분석을 시작하지 못했습니다: {msg}"));
+                        lane.status.locked().last_error = Some(format!("인물(얼굴) 분석을 시작하지 못했습니다: {msg}"));
                         None
                     }
                 };
                 // People, bursts and blur are regrouped every couple of minutes while a long pass
                 // runs, so the People screen fills in progressively instead of after hours.
                 let ticking = Arc::new(AtomicBool::new(true));
+                // Stops the ticker however this pass ends (a panic included).
+                struct StopTick(Arc<AtomicBool>);
+                impl Drop for StopTick {
+                    fn drop(&mut self) {
+                        self.0.store(false, Ordering::Relaxed);
+                    }
+                }
+                let _stop_tick = StopTick(ticking.clone());
                 {
                     let ticking = ticking.clone();
                     let app = app.clone();
@@ -255,8 +307,8 @@ impl Lane {
                             if waited >= regroup_every() {
                                 waited = Duration::ZERO;
                                 let st = app.state::<AppState>();
-                                if let Err(e) = crate::post_analysis(&st) {
-                                    st.lane.status.lock().unwrap().last_error = Some(format!("{e:#}"));
+                                if let Err(e) = media_core::guarded("분석 후 정리", || crate::post_analysis(&st)) {
+                                    st.lane.status.locked().last_error = Some(format!("{e:#}"));
                                 }
                                 // Partial results (e.g. people even if cleanup failed) still show.
                                 let _ = app.emit("analysis-done", ());
@@ -268,35 +320,37 @@ impl Lane {
                 let status_lane = lane.clone();
                 let last = Mutex::new(Instant::now() - Duration::from_secs(1));
                 let progress = move |p: Progress| {
-                    let mut s = status_lane.status.lock().unwrap();
+                    let mut s = status_lane.status.locked();
                     s.done = p.done;
                     s.total = p.total;
                     if let Some((name, eta)) = p.message.rsplit_once('|') {
                         s.current = name.to_string();
                         s.eta_secs = eta.parse().unwrap_or(0);
                     }
-                    let mut l = last.lock().unwrap();
+                    let mut l = last.locked();
                     if l.elapsed().as_millis() >= 250 || p.done == p.total {
                         *l = Instant::now();
                         let _ = emit_app.emit("analysis-status", s.clone());
                     }
                 };
                 {
-                    let mut s = lane.status.lock().unwrap();
+                    let mut s = lane.status.locked();
                     s.running = true;
                     // Live updates carry these too (not only the full status query).
                     s.faces_enabled = !lane.faces_off.load(Ordering::Relaxed);
                     s.faces_available = face_runtime(&app).available();
                     s.provider = engine.as_ref().and_then(|e| e.lock().ok().map(|e| e.provider.clone())).unwrap_or_else(|| "-".into());
                 }
-                let res = analysis::run(&st.db, &st.thumbs, engine.as_deref(), threads, &lane.stop, &lane.pause, &progress);
+                let res = media_core::guarded("사진 분석", || {
+                    analysis::run(&st.db, &st.thumbs, engine.as_deref(), threads, &lane.stop, &lane.pause, &progress)
+                });
                 ticking.store(false, Ordering::Relaxed);
                 if let Err(e) = &res {
-                    lane.status.lock().unwrap().last_error = Some(format!("{e:#}"));
+                    lane.status.locked().last_error = Some(format!("{e:#}"));
                 }
                 // Derived data (bursts, places, trips, people) is recomputed after each pass.
-                if let Err(e) = crate::post_analysis(&st) {
-                    lane.status.lock().unwrap().last_error = Some(format!("{e:#}"));
+                if let Err(e) = media_core::guarded("분석 후 정리", || crate::post_analysis(&st)) {
+                    lane.status.locked().last_error = Some(format!("{e:#}"));
                 }
                 let again = !lane.stop.is_stopped()
                     && res.is_ok()
@@ -307,7 +361,7 @@ impl Lane {
             }
             lane.running.store(false, Ordering::SeqCst);
             let snapshot = {
-                let mut s = lane.status.lock().unwrap();
+                let mut s = lane.status.locked();
                 s.running = false;
                 s.clone()
             };

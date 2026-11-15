@@ -146,6 +146,8 @@ export default function App() {
   const [stats, setStats] = useState<LibraryStats | null>(null);
   const [info, setInfo] = useState<AppInfo | null>(null);
   const [toast, setToast] = useState<{ ok: boolean; text: string } | null>(null);
+  // Stays until dismissed (unlike a toast).
+  const [notice, setNotice] = useState<string | null>(null);
   /** A drive with registered folders was just plugged in. */
   const [plugged, setPlugged] = useState<{ volume_id: number; label: string } | null>(null);
   useEffect(() => {
@@ -242,7 +244,19 @@ export default function App() {
     api.appInfo().then((i) => {
       setInfo(i);
       if (i.job) setRunning(i.job);
+      // Work cut short last time (crash, power loss): say so and look at the files again, so
+      // anything moved just before is found where it is now.
+      if (i.interrupted?.length) {
+        setNotice(`지난번 작업이 중간에 끝났습니다: ${i.interrupted.join(", ")} — 파일 위치를 다시 확인합니다. 「작업 기록」에서 되돌릴 수 있습니다.`);
+        if (!i.job) api.startScan().then(() => setRunning("scan")).catch(() => {});
+      }
     });
+    // An error nobody handled (a failed command, say) is shown instead of vanishing.
+    const onRejected = (e: PromiseRejectionEvent) => {
+      const text = String(e.reason?.message ?? e.reason ?? "");
+      if (text && text !== "cancelled") setToast({ ok: false, text });
+    };
+    window.addEventListener("unhandledrejection", onRejected);
     const p = onProgress((p) => {
       setProgress(p);
       setRunning((r) => r ?? p.job);
@@ -256,6 +270,7 @@ export default function App() {
       else if (d.ok) setToast({ ok: true, text: doneText(d) });
     });
     return () => {
+      window.removeEventListener("unhandledrejection", onRejected);
       p.then((u) => u());
       d.then((u) => u());
     };
@@ -410,6 +425,11 @@ export default function App() {
             </div>
             <div className="bar"><div className={`bar-fill ${pct == null ? "indeterminate" : ""}`} style={{ width: pct == null ? "30%" : `${pct}%` }} /></div>
             <button className="btn small ghost" onClick={() => api.cancelJob()}>취소</button>
+          </div>
+        )}
+        {notice && (
+          <div className="alert notice-bar">
+            {notice} <button className="btn small ghost" onClick={() => setNotice(null)}>닫기</button>
           </div>
         )}
         {toast && <div className={`toast ${toast.ok ? "ok" : "bad"}`} onClick={() => setToast(null)}>{toast.text}</div>}

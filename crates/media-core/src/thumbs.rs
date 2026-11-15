@@ -122,9 +122,11 @@ impl ThumbCache {
         if !f.online {
             bail!("offline");
         }
-        let img = render(&f.abs_path(), &f.kind, &f.ext, THUMB_SIZE)?;
-        save_jpeg(&img.thumbnail(THUMB_SIZE, THUMB_SIZE), &out, 80)?;
-        Ok(out)
+        crate::guarded("썸네일", || {
+            let img = render(&f.abs_path(), &f.kind, &f.ext, THUMB_SIZE)?;
+            save_jpeg(&img.thumbnail(THUMB_SIZE, THUMB_SIZE), &out, 80)?;
+            Ok(out)
+        })
     }
 
     /// A file the webview can display: the original for JPEG/PNG/WebP/GIF, otherwise a cached
@@ -144,10 +146,12 @@ impl ThumbCache {
         if !f.online {
             return self.ensure_thumb(f);
         }
-        let img = render(&f.abs_path(), &f.kind, &f.ext, PREVIEW_SIZE)?;
-        let img = if img.width() > PREVIEW_SIZE || img.height() > PREVIEW_SIZE { img.resize(PREVIEW_SIZE, PREVIEW_SIZE, image::imageops::FilterType::Triangle) } else { img };
-        save_jpeg(&img, &out, 88)?;
-        Ok(out)
+        crate::guarded("미리보기", || {
+            let img = render(&f.abs_path(), &f.kind, &f.ext, PREVIEW_SIZE)?;
+            let img = if img.width() > PREVIEW_SIZE || img.height() > PREVIEW_SIZE { img.resize(PREVIEW_SIZE, PREVIEW_SIZE, image::imageops::FilterType::Triangle) } else { img };
+            save_jpeg(&img, &out, 88)?;
+            Ok(out)
+        })
     }
 
     /// H.264/AAC 720p transcode for videos the webview cannot play (HEVC, AVI, WMV, MTS...).

@@ -281,6 +281,17 @@ struct FileOut {
 }
 
 fn analyze_one(f: &FileRow, cache: &ThumbCache, engine: Option<&Mutex<FaceEngine>>, screenshot: bool) -> Result<FileOut> {
+    // A damaged file can make a decoder panic: that file fails (recorded, not tried again); the
+    // others go on.
+    crate::guarded("분석", || analyze_inner(f, cache, engine, screenshot))
+}
+
+fn analyze_inner(f: &FileRow, cache: &ThumbCache, engine: Option<&Mutex<FaceEngine>>, screenshot: bool) -> Result<FileOut> {
+    // Test hook (debug builds only): `MO_TEST_PANIC=<file name>` panics on that file.
+    #[cfg(debug_assertions)]
+    if std::env::var("MO_TEST_PANIC").is_ok_and(|n| n == f.name) {
+        panic!("test panic on {}", f.name);
+    }
     // Videos: only make sure a thumbnail exists; nothing else to measure.
     if f.kind == "video" {
         cache.ensure_thumb(f)?;
@@ -302,7 +313,8 @@ fn analyze_one(f: &FileRow, cache: &ThumbCache, engine: Option<&Mutex<FaceEngine
         Some(eng) => {
             let rgb = img.to_rgb8();
             let (iw, ih) = (rgb.width() as f32, rgb.height() as f32);
-            let mut eng = eng.lock().map_err(|_| anyhow!("face engine poisoned"))?;
+            // Still usable after a panic on another photo (the lock only serialises access).
+            let mut eng = eng.lock().unwrap_or_else(|e| e.into_inner());
             let found = eng.detect(&rgb, FACE_MIN_SCORE)?;
             let mut out = Vec::new();
             for face in found.iter().filter(|d| d.w.min(d.h) >= FACE_MIN_PX) {

@@ -1421,6 +1421,8 @@ pub fn execute_with(db: &Db, plan: &Plan, xo: &ExecOptions, stop: &StopFlag, pro
     // big libraries). A crash loses at most that many index updates; the next scan recognises
     // those files at their new place by content, so nothing is lost or read again.
     conn.execute_batch("BEGIN")?;
+    let mut last_commit = std::time::Instant::now();
+    let mut after_big = false;
     for (i, it) in work.iter().enumerate() {
         if stop.is_stopped() {
             rep.cancelled = true;
@@ -1429,9 +1431,14 @@ pub fn execute_with(db: &Db, plan: &Plan, xo: &ExecOptions, stop: &StopFlag, pro
         if i % 10 == 0 {
             progress(Progress::new("organize:run", "run", i as u64, total, it.src.clone()));
         }
-        if i > 0 && i % 200 == 0 {
+        // Saved every 200 files or 2 seconds, and right before and after a big copy: the
+        // database is never held (locked for other writers) while a large file is copied.
+        let big = it.action == Action::Copy && it.size >= 64 << 20;
+        if (i > 0 && i % 200 == 0) || big || after_big || last_commit.elapsed().as_secs() >= 2 {
             conn.execute_batch("COMMIT; BEGIN")?;
+            last_commit = std::time::Instant::now();
         }
+        after_big = big;
         if it.action == Action::Copy {
             let left = room.get_or_insert_with(|| match volumes::disk_space(&target) {
                 Some((free, total)) => free as i64 - volumes::space_reserve(total) as i64,

@@ -17,7 +17,7 @@ use media_core::organizer::{self, OrganizeOptions, Plan, PlanItem, PlanSummary};
 use media_core::scanner;
 use media_core::userfiles::{self, ScanOptions};
 use media_core::thumbs::{self, ThumbCache};
-use media_core::{meta, volumes, Db, Progress, StopFlag};
+use media_core::{meta, volumes, Db, Locked, Progress, StopFlag};
 use serde::Serialize;
 use tauri::http::{Response, StatusCode};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -44,6 +44,9 @@ struct AppState {
     job: Mutex<Option<String>>,
     plans: Mutex<HashMap<String, Arc<Plan>>>,
     lane: Arc<Lane>,
+    /// Work a crash or power loss cut short last time (told to the user once, then files are
+    /// checked again).
+    interrupted: Mutex<Vec<String>>,
 }
 
 /// Recompute data derived from the per-file analysis (bursts, places, trips, people).
@@ -104,7 +107,7 @@ where
     R: Serialize,
 {
     {
-        let mut j = state.job.lock().unwrap();
+        let mut j = state.job.locked();
         if let Some(cur) = j.as_ref() {
             return Err(format!("다른 작업이 진행 중입니다: {cur}"));
         }
@@ -121,17 +124,28 @@ where
         let last = Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(1));
         let progress = move |p: Progress| {
             // Throttle UI updates to ~15/s, but always deliver stage changes and completion.
-            let mut l = last.lock().unwrap();
+            let mut l = last.locked();
             if l.elapsed().as_millis() >= 66 || p.done == p.total || p.done == 0 {
                 *l = std::time::Instant::now();
                 let _ = emit_app.emit("job-progress", p);
             }
         };
-        let res = f(&st, &progress);
-        *st.job.lock().unwrap() = None;
+        // A panic inside a job must not leave the app saying "작업 중" for ever.
+        let res = media_core::guarded("작업", || f(&st, &progress));
+        // After work that wrote a lot: refresh planner statistics and fold the write-ahead log
+        // back (both cheap; failures do not matter).
+        if let Ok(conn) = st.db.conn() {
+            let _ = conn.execute_batch("PRAGMA optimize; PRAGMA wal_checkpoint(PASSIVE);");
+        }
+        *st.job.locked() = None;
         st.lane.set_job_active(&app, false);
         if name == "scan" {
             st.lane.kick(&app, false);
+        }
+        // Fingerprints for entries indexed by older versions (needed to recognise copies): read
+        // behind, whether or not automatic analysis is on.
+        if name == "scan" || name == "organize:plan" {
+            st.lane.kick_backfill(&app);
         }
         // New GPS files, deletions, moves: keep places and trips current (cheap).
         if let Err(e) = refresh_places(&st) {
@@ -157,6 +171,8 @@ struct AppInfo {
     cache_dir: String,
     ffmpeg: bool,
     job: Option<String>,
+    /// Work cut short last time (given once).
+    interrupted: Vec<String>,
 }
 
 #[tauri::command]
@@ -166,7 +182,8 @@ fn app_info(state: State<AppState>) -> AppInfo {
         data_dir: state.data_dir.to_string_lossy().into(),
         cache_dir: state.cache_dir.to_string_lossy().into(),
         ffmpeg: dedupe::ffmpeg_available(),
-        job: state.job.lock().unwrap().clone(),
+        job: state.job.locked().clone(),
+        interrupted: std::mem::take(&mut *state.interrupted.locked()),
     }
 }
 
@@ -226,9 +243,7 @@ fn start_scan(
         drop(conn);
         let stats = match (scope, source_id, volume_id) {
             (Some((id, sub)), _, _) => {
-                let s = scanner::scan_with(&st.db, id, Some(&sub), &opts, mode, &st.stop, progress)?;
-                media_core::identity::backfill_prehashes(&st.db.conn()?)?;
-                vec![s]
+                vec![scanner::scan_with(&st.db, id, Some(&sub), &opts, mode, &st.stop, progress)?]
             }
             (None, Some(id), _) => vec![scanner::scan_with(&st.db, id, None, &opts, mode, &st.stop, progress)?],
             (None, None, Some(v)) => scanner::scan_volume_with(&st.db, v, &opts, mode, &st.stop, progress)?,
@@ -671,7 +686,18 @@ async fn prepare_copies(app: AppHandle) -> CmdResult<usize> {
         let st = app.state::<AppState>();
         let conn = st.db.conn().map_err(err)?;
         volumes::refresh(&conn).map_err(err)?;
-        media_core::identity::backfill_prehashes(&conn).map_err(err)
+        // A few seconds here (the filter works with what is known); the rest goes on behind.
+        let started = std::time::Instant::now();
+        let mut done = 0;
+        while started.elapsed() < std::time::Duration::from_secs(3) {
+            let n = media_core::identity::backfill_prehashes_with(&conn, 300, &StopFlag::new(), &|| started.elapsed() >= std::time::Duration::from_secs(3)).map_err(err)?;
+            done += n;
+            if n == 0 {
+                break;
+            }
+        }
+        st.lane.kick_backfill(&app);
+        Ok(done)
     })
     .await
     .map_err(err)?
@@ -890,13 +916,13 @@ async fn check_update(app: AppHandle) -> CmdResult<UpdateInfo> {
 async fn install_update(app: AppHandle) -> CmdResult<()> {
     {
         let st = app.state::<AppState>();
-        let mut j = st.job.lock().unwrap();
+        let mut j = st.job.locked();
         if let Some(cur) = j.as_ref() {
             return Err(format!("작업이 끝난 뒤 업데이트할 수 있습니다 (진행 중: {cur})"));
         }
         *j = Some("update".into());
     }
-    let release = |app: &AppHandle| *app.state::<AppState>().job.lock().unwrap() = None;
+    let release = |app: &AppHandle| *app.state::<AppState>().job.locked() = None;
     let update = match updater(&app)?.check().await {
         Ok(Some(u)) => u,
         Ok(None) => {
@@ -1025,7 +1051,7 @@ fn start_plan(app: AppHandle, state: State<AppState>, options: OrganizeOptions) 
     spawn_job(&app, &state, "organize:plan", move |st, progress| {
         let plan = organizer::plan(&st.db, &options, &st.stop, progress)?;
         let view = PlanView { id: plan.id.clone(), summary: plan.summary.clone(), options: plan.options.clone() };
-        let mut plans = st.plans.lock().unwrap();
+        let mut plans = st.plans.locked();
         plans.clear();
         plans.insert(plan.id.clone(), Arc::new(plan));
         Ok(view)
@@ -1034,7 +1060,7 @@ fn start_plan(app: AppHandle, state: State<AppState>, options: OrganizeOptions) 
 
 #[tauri::command]
 fn plan_items(state: State<AppState>, plan_id: String, action: Option<String>, offset: usize, limit: usize) -> CmdResult<Vec<PlanItem>> {
-    let plans = state.plans.lock().unwrap();
+    let plans = state.plans.locked();
     let plan = plans.get(&plan_id).ok_or("계획이 만료되었습니다. 다시 미리보기를 실행하세요")?;
     let want = action.as_deref();
     Ok(plan
@@ -1061,7 +1087,7 @@ fn start_execute(
     drop_ids: Option<Vec<i64>>,
     decisions: Option<Vec<media_core::triage::Decision>>,
 ) -> CmdResult<()> {
-    let plan = state.plans.lock().unwrap().get(&plan_id).cloned().ok_or("계획이 만료되었습니다. 다시 미리보기를 실행하세요")?;
+    let plan = state.plans.locked().get(&plan_id).cloned().ok_or("계획이 만료되었습니다. 다시 미리보기를 실행하세요")?;
     spawn_job(&app, &state, "organize:run", move |st, progress| {
         // Only some folders ("try one first") or one year: re-plan afterwards for the rest.
         let xo = organizer::ExecOptions {
@@ -1076,13 +1102,13 @@ fn start_execute(
             (None, None) => (*plan).clone(),
         };
         let r = organizer::execute_with(&st.db, &part, &xo, &st.stop, progress)?;
-        st.plans.lock().unwrap().remove(&plan.id);
+        st.plans.locked().remove(&plan.id);
         Ok(r)
     })
 }
 
 fn with_plan<T>(state: &State<AppState>, plan_id: &str, f: impl FnOnce(&Plan) -> T) -> CmdResult<T> {
-    let plans = state.plans.lock().unwrap();
+    let plans = state.plans.locked();
     let plan = plans.get(plan_id).ok_or("계획이 만료되었습니다. 다시 미리보기를 실행하세요")?;
     Ok(f(plan))
 }
@@ -1208,10 +1234,10 @@ fn library_delete_preview(state: State<AppState>, plan_id: String, groups: Vec<S
 /// Delete library folders for good (see `organizer::delete_folders`).
 #[tauri::command]
 fn start_library_delete(app: AppHandle, state: State<AppState>, plan_id: String, groups: Vec<String>, keep_protected: bool) -> CmdResult<()> {
-    let plan = state.plans.lock().unwrap().get(&plan_id).cloned().ok_or("계획이 만료되었습니다. 다시 미리보기를 실행하세요")?;
+    let plan = state.plans.locked().get(&plan_id).cloned().ok_or("계획이 만료되었습니다. 다시 미리보기를 실행하세요")?;
     spawn_job(&app, &state, "library:delete", move |st, progress| {
         let r = organizer::delete_folders(&st.db, &plan, &groups, keep_protected, &st.stop, progress)?;
-        st.plans.lock().unwrap().remove(&plan.id);
+        st.plans.locked().remove(&plan.id);
         Ok(r)
     })
 }
@@ -1232,7 +1258,7 @@ fn disk_space(path: String) -> CmdResult<Option<DiskSpace>> {
 /// The library plan as destination folders.
 #[tauri::command]
 fn plan_tree(state: State<AppState>, plan_id: String) -> CmdResult<Vec<organizer::TreeNode>> {
-    let plans = state.plans.lock().unwrap();
+    let plans = state.plans.locked();
     let plan = plans.get(&plan_id).ok_or("계획이 만료되었습니다. 다시 미리보기를 실행하세요")?;
     Ok(organizer::plan_tree(plan))
 }
@@ -1377,11 +1403,15 @@ pub fn run() {
             std::fs::create_dir_all(&cache_dir)?;
             dedupe::init_czkawka(&cache_dir);
             let db = Db::open(data_dir.join("library.db"))?;
-            {
+            let interrupted = {
                 let conn = db.conn()?;
                 volumes::refresh(&conn)?;
-            }
+                // Keep the database tidy (cheap; helps the query planner on big libraries).
+                let _ = conn.execute_batch("PRAGMA optimize;");
+                journal::recover_interrupted(&conn).unwrap_or_default()
+            };
             app.manage(AppState {
+                interrupted: Mutex::new(interrupted),
                 db,
                 thumbs: ThumbCache::new(&cache_dir),
                 data_dir,
@@ -1409,6 +1439,7 @@ pub fn run() {
                 }
                 std::thread::sleep(std::time::Duration::from_secs(5));
                 lane.kick(&handle, false);
+                lane.kick_backfill(&handle);
             });
             Ok(())
         })
