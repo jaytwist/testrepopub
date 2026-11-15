@@ -235,6 +235,65 @@ pub fn folder_month(folder: &str) -> Option<(i32, u32)> {
     Some((y, m))
 }
 
+/// How many folders of a file's path say something (an event rather than "backup").
+fn meaning(r: &FileRow) -> usize {
+    let rel = r.rel_path.replace('\\', "/");
+    let dir = rel.rfind('/').map(|i| &rel[..i]).unwrap_or("");
+    dir.split('/').filter(|s| event_name(s).is_some()).count()
+}
+
+/// Whether a file is already inside the library folder.
+pub fn is_filed(r: &FileRow, lib_vol: i64, lib_root: &str) -> bool {
+    r.volume_id == lib_vol && (lib_root.is_empty() || r.rel_path.replace('\\', "/").starts_with(&format!("{lib_root}/")))
+}
+
+/// Among identical files (already in the duplicate ranking's order), the one kept goes first:
+/// on the library drive, already filed in the library, in the most meaningful folders. One rule
+/// for the organizer and for the "original" shown everywhere.
+pub fn keeper_first(rows: &mut [FileRow], lib_vol: i64, lib_root: &str) {
+    rows.sort_by_key(|r| ((r.volume_id != lib_vol) as u8, !is_filed(r, lib_vol, lib_root) as u8, std::cmp::Reverse(meaning(r))));
+}
+
+/// The library drive and folder (relative to the drive) the user chose, if any.
+pub fn location(conn: &Connection) -> Option<(i64, String)> {
+    let dir = crate::importer::ImportSettings::load(conn).ok()?.target_dir;
+    if dir.trim().is_empty() {
+        return None;
+    }
+    let target = crate::volumes::canonical_lenient(std::path::Path::new(dir.trim())).ok()?;
+    let vol = crate::volumes::identify_lenient(&target).ok()?;
+    let id: i64 = conn.query_row("SELECT id FROM volumes WHERE uid = ?", [&vol.uid], |r| r.get(0)).ok()?;
+    Some((id, crate::volumes::rel_of(&vol.root, &target).unwrap_or_default().replace('\\', "/").trim_matches('/').to_string()))
+}
+
+/// Why `first` is the original among identical files `rest` (in words, for the user): every
+/// reason that set it apart from one of the others.
+pub fn why_original(first: &FileRow, rest: &[FileRow], marked: bool, lib: Option<(i64, &str)>, rules: &DupRules) -> String {
+    if marked {
+        return "직접 원본으로 지정함".into();
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    if let Some((vol, root)) = lib {
+        if is_filed(first, vol, root) {
+            return "라이브러리에 정리되어 있음".into();
+        }
+        if first.volume_id == vol && rest.iter().any(|r| r.volume_id != vol) {
+            parts.push("라이브러리 드라이브에 있음");
+        }
+    }
+    if rules.is_kept(first) {
+        parts.push("「항상 남길 폴더」에 있음");
+    }
+    let beside: Vec<&FileRow> = rest.iter().filter(|r| r.volume_id == first.volume_id).collect();
+    if !beside.is_empty() && beside.iter().all(|r| meaning(first) > meaning(r)) {
+        parts.push("이름 있는 폴더(이벤트)에 있음");
+    }
+    if parts.is_empty() {
+        return "같은 파일 중 자동 선택 (날짜가 확실하고 먼저 만들어진 것)".into();
+    }
+    parts.join(" · ")
+}
+
 /// A folder name Windows accepts: no reserved characters or names, no trailing dot / space,
 /// at most 60 characters.
 pub fn safe_name(s: &str) -> String {
@@ -391,13 +450,7 @@ pub fn layout(
         // Identical bytes: keep the one on the library drive — one already in the library folder
         // first — then the one filed under the most meaningful folders (an event rather than
         // "backup"), then the duplicate ranking.
-        let meaning = |r: &FileRow| -> usize {
-            let rel = r.rel_path.replace('\\', "/");
-            let dir = rel.rfind('/').map(|i| rel[..i].to_string()).unwrap_or_default();
-            dir.split('/').filter(|s| event_name(s).is_some()).count()
-        };
-        let filed = |r: &FileRow| r.volume_id == lib_vol && (lib_root.is_empty() || r.rel_path.replace('\\', "/").starts_with(&format!("{lib_root}/")));
-        rows.sort_by_key(|r| ((r.volume_id != lib_vol) as u8, !filed(r) as u8, std::cmp::Reverse(meaning(r))));
+        keeper_first(&mut rows, lib_vol, &lib_root);
         let keep = rows[0].id;
         for (i, r) in rows.iter().enumerate() {
             let a = if i == 0 {

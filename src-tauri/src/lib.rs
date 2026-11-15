@@ -1242,6 +1242,13 @@ fn start_library_delete(app: AppHandle, state: State<AppState>, plan_id: String,
     })
 }
 
+/// The files that are the same photo as this one: where the original is and what the others are.
+#[tauri::command]
+fn file_family(state: State<AppState>, id: i64) -> CmdResult<Option<media_core::identity::Family>> {
+    let conn = state.db.conn().map_err(err)?;
+    media_core::identity::family(&conn, id).map_err(err)
+}
+
 /// Face finding on / off for this session.
 #[tauri::command]
 fn set_faces_enabled(app: AppHandle, state: State<AppState>, on: bool) -> CmdResult<()> {
@@ -1535,6 +1542,7 @@ pub fn run() {
             year_keep,
             disk_space,
             set_faces_enabled,
+            file_family,
             group_items,
             year_triage_groups,
             year_triage_counts,

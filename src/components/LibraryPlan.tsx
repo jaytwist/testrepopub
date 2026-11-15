@@ -655,6 +655,7 @@ function CopiesTab({ planId, year, drive }: { planId: string; year: string; driv
   const [pairs, setPairs] = useState<CopyPair[]>([]);
   const [kept, setKept] = useState<Set<number>>(new Set());
   const [shown, setShown] = useState(200);
+  const [cmp, setCmp] = useState<number[] | null>(null);
   useEffect(() => {
     api.yearCopies(planId, year).then(setFolders).catch(() => setFolders([]));
   }, [planId, year]);
@@ -685,25 +686,29 @@ function CopiesTab({ planId, year, drive }: { planId: string; year: string; driv
               {fmtCount(f.count)}개 · {fmtBytes(f.bytes)} (복사본 {fmtCount(f.same_name)} · 사본 {fmtCount(f.count - f.same_name)})
             </span>
           </button>
-          <div className="muted small copy-kept-in">
-            원본은 → {f.kept_in.map(([g, c]) => `${g} (${fmtCount(c)})`).join(", ")}
+          <div className="small copy-kept-in">
+            {f.dir_total > 0 && f.count >= f.dir_total
+              ? <span className="bad-text">이 폴더의 사진은 전부 복사본·사본입니다 (정리 후 사진이 남지 않음)</span>
+              : <span className="muted">이 폴더 사진 {fmtCount(f.dir_total)}개 중 {fmtCount(f.count)}개가 복사본·사본</span>}
+            <span className="muted"> — 원본은 라이브러리의 </span>
+            {f.kept_in.map(([g, c], i) => <span key={g}>{i > 0 && ", "}<span className="mono">{g}</span> <span className="muted">({fmtCount(c)})</span></span>)}
           </div>
           {openDir === f.dir && (
             <div className="copy-pairs">
               {pairs.map((p) => (
                 <div key={p.file_id} className={`copy-pair ${kept.has(p.file_id) ? "kept" : ""}`}>
-                  <figure>
+                  <figure className="clickable" title="원본과 나란히 크게 보기" onClick={() => setCmp([p.kept_id, p.file_id])}>
                     <img src={thumbUrl(p.kept_id)} loading="lazy" alt="" />
                     <figcaption className="ok-text">남길 원본</figcaption>
                   </figure>
-                  <figure>
+                  <figure className="clickable" title="원본과 나란히 크게 보기" onClick={() => setCmp([p.kept_id, p.file_id])}>
                     <img src={thumbUrl(p.file_id)} loading="lazy" alt="" />
                     <figcaption className="bad-text">{kept.has(p.file_id) ? "남김" : sameName(p.src, p.kept_src) ? "복사본" : "사본"}</figcaption>
                   </figure>
                   <div className="copy-paths small">
                     <div className="mono" title={p.src}><span className="muted">사본</span> {tail(p.src)} <span className="muted">({fmtBytes(p.size)})</span></div>
-                    <div className="mono" title={p.kept_src}><span className="muted">원본</span> {tail(p.kept_src)}</div>
-                    {p.kept_dst !== p.kept_src && <div className="mono" title={p.kept_dst}><span className="muted">→ 갈 곳</span> {tail(p.kept_dst, 4)}</div>}
+                    <div className="mono" title={p.kept_src}><span className="muted">원본 (지금)</span> {tail(p.kept_src)}</div>
+                    {p.kept_dst !== p.kept_src && <div className="mono" title={p.kept_dst}><span className="muted">원본 (정리 후)</span> {tail(p.kept_dst, 4)}</div>}
                   </div>
                   {!kept.has(p.file_id) && (
                     <button className="btn small ghost" onClick={() => keep(p.file_id)} title="원본으로 지정해 지우지 않음(다음에도)">목록에서 빼기</button>
@@ -718,6 +723,7 @@ function CopiesTab({ planId, year, drive }: { planId: string; year: string; driv
       {folders.length > shown && (
         <button className="btn small" onClick={() => setShown(shown + 200)}>폴더 더 보기 ({fmtCount(folders.length - shown)}개 남음)</button>
       )}
+      {cmp && <Compare ids={cmp} onClose={() => setCmp(null)} />}
     </div>
   );
 }

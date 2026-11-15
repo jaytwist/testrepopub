@@ -171,7 +171,10 @@ export interface YearBucket {
   key: string; label: string; keep: number; keep_bytes: number; moves: number; copies: number; copy_bytes: number;
   in_place: number; remove: number; remove_bytes: number; versions: number; versions_bytes: number; done: boolean;
 }
-export interface CopyFolder { dir: string; count: number; bytes: number; versions: number; same_name: number; kept_in: [string, number][] }
+export interface CopyFolder { dir: string; count: number; bytes: number; versions: number; same_name: number; dir_total: number; kept_in: [string, number][] }
+/** A file that is the same photo as another: role and what it is in words (원본 / 복사본 / 사본 / 백업 / 축소본 …). */
+export interface FamilyMember { file: FileRow; abs_path: string; role: DupRole; relation: string; is_self: boolean }
+export interface Family { kind: "exact" | "similar"; why: string; members: FamilyMember[] }
 export interface CopyPair { file_id: number; src: string; size: number; tag: string; kept_id: number; kept_src: string; kept_dst: string }
 export interface KeepItem { file_id: number; group: string; action: PlanItem["action"]; copies: number; size: number }
 export interface DiskSpace { free: number; total: number; reserve: number }
@@ -309,6 +312,7 @@ export const api = {
     invoke<CopyPair[]>("year_copy_pairs", { planId, year, dir, offset, limit }),
   yearKeep: (planId: string, year: string, offset: number, limit: number) => invoke<KeepItem[]>("year_keep", { planId, year, offset, limit }),
   diskSpace: (path: string) => invoke<DiskSpace | null>("disk_space", { path }),
+  fileFamily: (id: number) => invoke<Family | null>("file_family", { id }),
   yearTriageGroups: (planId: string, year: string, kind: string, offset: number, limit: number) =>
     invoke<TriageGroup[]>("year_triage_groups", { planId, year, kind, offset, limit }),
   yearTriageCounts: (planId: string, year: string) => invoke<{ bursts: number; similar: number; unanalyzed: number }>("year_triage_counts", { planId, year }),

@@ -926,6 +926,8 @@ pub struct CopyFolder {
     pub versions: u64,
     /// 복사본: same name as the original kept (the rest are 사본: same content, another name).
     pub same_name: u64,
+    /// Photos and videos in this folder in all (when equal to `count`, the whole folder is copies).
+    pub dir_total: u64,
     /// Library folders their originals go to (most first, at most 3).
     pub kept_in: Vec<(String, u64)>,
 }
@@ -962,7 +964,7 @@ pub fn year_copies(plan: &Plan, key: &str) -> Vec<CopyFolder> {
         let dir = parent_of(&it.src);
         let e = by_dir
             .entry(dir.clone())
-            .or_insert_with(|| (CopyFolder { dir, count: 0, bytes: 0, versions: 0, same_name: 0, kept_in: Vec::new() }, HashMap::new()));
+            .or_insert_with(|| (CopyFolder { dir, count: 0, bytes: 0, versions: 0, same_name: 0, dir_total: 0, kept_in: Vec::new() }, HashMap::new()));
         e.0.count += 1;
         let kept = it.kept.and_then(item);
         if kept.is_some_and(|k| same_name(&k.src, &it.src)) {
@@ -974,6 +976,13 @@ pub fn year_copies(plan: &Plan, key: &str) -> Vec<CopyFolder> {
         }
         if let Some(k) = kept {
             *e.1.entry(k.group.clone()).or_default() += 1;
+        }
+    }
+    // How many photos / videos each of those folders holds in all.
+    for it in &plan.items {
+        let dir = it.src.rfind(['/', '\\']).map(|i| &it.src[..i]).unwrap_or("");
+        if let Some(e) = by_dir.get_mut(dir) {
+            e.0.dir_total += 1;
         }
     }
     let mut out: Vec<CopyFolder> = by_dir

@@ -2,9 +2,10 @@ import { useEffect, useState } from "react";
 import { useNav } from "../App";
 import ZoomImage from "./ZoomImage";
 import Compare from "./Compare";
+import OriginalCard from "./OriginalCard";
 import {
   FAVORITE, SYSTEM_LABELS,
-  api, DATE_SOURCE_NAMES, ROLE_HINTS, ROLE_NAMES, fileUrl, fmtBytes, fmtDuration, labelName, thumbUrl, toDatetimeLocal,
+  api, DATE_SOURCE_NAMES, fileUrl, fmtBytes, fmtDuration, labelName, thumbUrl, toDatetimeLocal,
   type FileDetail, type GridItem, type LabelCount,
 } from "../api";
 
@@ -46,6 +47,7 @@ export default function Viewer({ items, index, onIndex, onClose, onChanged, revi
   const [vlc, setVlc] = useState<string | null>(null);
   const [vlcMsg, setVlcMsg] = useState<string | null>(null);
   const [comparing, setComparing] = useState<number[] | null>(null);
+  const [famVersion, setFamVersion] = useState(0);
   const [similarMsg, setSimilarMsg] = useState<string | null>(null);
 
   const load = () => {
@@ -320,18 +322,7 @@ export default function Viewer({ items, index, onIndex, onClose, onChanged, revi
               {f.width && <div><span>해상도</span><b>{f.width} × {f.height}</b></div>}
               {f.duration_ms && <div><span>길이</span><b>{fmtDuration(f.duration_ms)}</b></div>}
               <div><span>크기</span><b>{fmtBytes(f.size)}</b></div>
-              {detail!.dup_role && (
-                <div>
-                  <span>중복</span>
-                  <b className="dup-role-line">
-                    {detail!.dup_role === "variant" ? "비슷한 사진" : "같은 파일"} {detail!.dup_group_size}개 중{" "}
-                    <span className={`role-tag ${detail!.dup_role}`} title={ROLE_HINTS[detail!.dup_role]}>{ROLE_NAMES[detail!.dup_role]}</span>
-                    {(detail!.dup_role === "copy" || detail!.dup_role === "backup") && (
-                      <button className="btn small ghost" onClick={async () => { await api.setOriginal(item.id); load(); onChanged?.(); }}>이 파일을 원본으로</button>
-                    )}
-                  </b>
-                </div>
-              )}
+
               {f.camera && <div><span>카메라</span><b>{f.camera}</b></div>}
               {detail!.people.length > 0 && (
                 <div>
@@ -351,6 +342,21 @@ export default function Viewer({ items, index, onIndex, onClose, onChanged, revi
               )}
               <div><span>드라이브</span><b className={f.online ? "" : "warn-text"}>{f.online ? "연결됨" : "연결 안 됨"}</b></div>
             </section>
+
+            {/* Copies / versions: where the original is, what it is, and why. */}
+            {detail!.dup_role && (
+              <OriginalCard
+                id={item.id}
+                version={famVersion}
+                onCompare={(ids) => setComparing(ids)}
+                onOpen={(mid) => {
+                  const at = items.findIndex((x) => x.id === mid);
+                  if (at >= 0) onIndex(at);
+                  else setComparing([mid, item.id]);
+                }}
+                onMakeOriginal={async (mid) => { await api.setOriginal(mid); setFamVersion((v) => v + 1); load(); onChanged?.(); }}
+              />
+            )}
             <div className="info-path" title={detail!.abs_path}>{detail!.abs_path}</div>
             <div className="context-links">
               <a onClick={() => openContext("folder")}>📁 같은 폴더 사진</a>

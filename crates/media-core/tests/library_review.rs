@@ -235,3 +235,53 @@ fn walkdir(root: &Path) -> Vec<String> {
     }
     out
 }
+
+/// For a copy: which file is the original, where it is, what each of the others is, and why —
+/// and it is the same file the organizer keeps.
+#[test]
+fn a_copy_knows_its_original() {
+    use media_core::identity;
+    use media_core::importer::ImportSettings;
+    let tmp = tempfile::tempdir().unwrap();
+    let e = drive(tmp.path(), "diskE");
+    let c = drive(tmp.path(), "diskC");
+    jpeg(&e.join("옛날/2015-08 제주도/a.jpg"), 1, 1600, 1200, "2015:08:10 10:00:00");
+    fs::create_dir_all(e.join("백업")).unwrap();
+    fs::copy(e.join("옛날/2015-08 제주도/a.jpg"), e.join("백업/a.jpg")).unwrap();
+    fs::copy(e.join("옛날/2015-08 제주도/a.jpg"), e.join("백업/a (1).jpg")).unwrap();
+    fs::create_dir_all(c.join("Pictures")).unwrap();
+    fs::copy(e.join("옛날/2015-08 제주도/a.jpg"), c.join("Pictures/a.jpg")).unwrap();
+    jpeg(&e.join("옛날/2015-08 제주도/alone.jpg"), 2, 1600, 1200, "2015:08:11 10:00:00");
+
+    let db = Db::open(tmp.path().join("app/library.db")).unwrap();
+    let conn = db.conn().unwrap();
+    volumes::add_source(&conn, &e).unwrap();
+    volumes::add_source(&conn, &c).unwrap();
+    let stop = StopFlag::new();
+    scanner::scan_all(&db, &ScanOptions::default(), &stop, &quiet).unwrap();
+    let lib = e.join("사진");
+    ImportSettings { target_dir: lib.to_string_lossy().into_owned(), ..Default::default() }.save(&conn).unwrap();
+    identity::refresh_roles(&mut db.conn().unwrap()).unwrap();
+    let id = |like: &str| -> i64 { conn.query_row("SELECT id FROM files WHERE rel_path LIKE ?", [format!("%{like}")], |r| r.get(0)).unwrap() };
+
+    let fam = identity::family(&conn, id("백업/a (1).jpg")).unwrap().unwrap();
+    assert_eq!(fam.kind, "exact");
+    let said: Vec<(String, String)> = fam.members.iter().map(|m| (m.file.rel_path.clone(), m.relation.clone())).collect();
+    assert_eq!(fam.members[0].file.id, id("제주도/a.jpg"), "the one in the named folder is the original: {said:?}");
+    assert_eq!(fam.why, "라이브러리 드라이브에 있음 · 이름 있는 폴더(이벤트)에 있음");
+    let rel = |like: &str| fam.members.iter().find(|m| m.abs_path.replace('\\', "/").ends_with(like)).map(|m| m.relation.as_str()).unwrap();
+    assert_eq!((rel("백업/a.jpg"), rel("백업/a (1).jpg"), rel("Pictures/a.jpg")), ("복사본", "사본", "백업"));
+    assert!(fam.members.iter().find(|m| m.is_self).is_some_and(|m| m.relation == "사본"));
+    assert!(identity::family(&conn, id("alone.jpg")).unwrap().is_none(), "a photo with no copies has no family");
+
+    // The organizer keeps that same file; once filed, that is the reason shown.
+    let opts = OrganizeOptions { target_dir: lib.to_string_lossy().into_owned(), layout: "library".into(), library: LibraryOptions::default(), ..Default::default() };
+    let plan = organizer::plan(&db, &opts, &stop, &quiet).unwrap();
+    let kept: Vec<i64> = plan.items.iter().filter(|i| i.action == Action::Remove).filter_map(|i| i.kept).collect();
+    assert!(!kept.is_empty() && kept.iter().all(|k| *k == fam.members[0].file.id), "{kept:?}");
+    organizer::execute(&db, &plan, &stop, &quiet).unwrap();
+    identity::refresh_roles(&mut db.conn().unwrap()).unwrap();
+    let fam = identity::family(&conn, id("Pictures/a.jpg")).unwrap().unwrap();
+    assert!(fam.members[0].abs_path.replace('\\', "/").ends_with("사진/2015/2015-08/제주도/a.jpg"), "{:?}", fam.members[0].abs_path);
+    assert_eq!(fam.why, "라이브러리에 정리되어 있음");
+}

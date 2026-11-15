@@ -609,3 +609,19 @@ button.keep-tile { border: 0; padding: 0; cursor: pointer; }
 .notice-bar { position: sticky; top: 0; z-index: 20; display: flex; gap: 12px; align-items: center; justify-content: space-between; margin: 0 0 8px; }
 .crash { max-width: 760px; margin: 60px auto; padding: 24px; display: flex; flex-direction: column; gap: 12px; }
 .crash pre { white-space: pre-wrap; font-size: 12px; max-height: 320px; overflow: auto; background: var(--panel-2); padding: 10px; border-radius: 8px; }
+
+/* Where the original is */
+.fam-card { border: 1px solid var(--line); border-radius: 10px; padding: 10px; display: flex; flex-direction: column; gap: 8px; }
+.fam-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.fam-orig { display: grid; grid-template-columns: 84px 1fr; gap: 10px; align-items: start; }
+.fam-thumb { border: 0; padding: 0; background: transparent; cursor: pointer; }
+.fam-thumb:disabled { cursor: default; }
+.fam-thumb img { width: 84px; height: 64px; object-fit: cover; border-radius: 6px; background: var(--panel-2); display: block; }
+.fam-orig-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.fam-path { direction: rtl; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; display: block; }
+.fam-list { display: flex; flex-direction: column; gap: 3px; }
+.fam-row { display: flex; gap: 6px; align-items: center; min-width: 0; font-size: 12px; }
+.fam-row.self { font-weight: 600; }
+.fam-row .fam-path { flex: 1; min-width: 0; font-family: "Cascadia Mono", Consolas, ui-monospace, monospace; }
+.fam-row button.fam-path:disabled { color: inherit; cursor: default; text-decoration: none; }
+figure.clickable { cursor: zoom-in; }

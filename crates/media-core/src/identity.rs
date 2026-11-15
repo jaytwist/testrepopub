@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::{db, journal, labels, meta, volumes};
 
@@ -244,6 +244,118 @@ fn backfill_where(conn: &Connection, only: &str, limit: usize, stop: &crate::Sto
     Ok(done)
 }
 
+/// One of the files that are the same photo.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct FamilyMember {
+    pub file: db::FileRow,
+    pub abs_path: String,
+    /// "original" | "backup" | "copy" | "variant"
+    pub role: String,
+    /// In words: 원본 / 복사본 (same name) / 사본 (another name) / 백업 (another drive) /
+    /// 축소본 / 재압축본 / 편집본.
+    pub relation: String,
+    pub is_self: bool,
+}
+
+/// A file with everything that is the same photo: where the original is, what the others are,
+/// and why that one is the original.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Family {
+    /// "exact" (identical files) or "similar" (versions of one photo).
+    pub kind: String,
+    pub why: String,
+    /// The original first.
+    pub members: Vec<FamilyMember>,
+}
+
+/// The files that are the same photo as `id` — identical ones if there are any, otherwise the
+/// versions of its similar-photo group. None when the file stands alone.
+pub fn family(conn: &Connection, id: i64) -> Result<Option<Family>> {
+    let Some(me) = db::get_file(conn, id)? else { return Ok(None) };
+    let member = |f: db::FileRow, role: &str, relation: &str| FamilyMember {
+        abs_path: f.abs_path().to_string_lossy().into_owned(),
+        is_self: f.id == id,
+        role: role.into(),
+        relation: relation.into(),
+        file: f,
+    };
+    let key: Option<String> = conn.query_row("SELECT COALESCE(prehash, hash) FROM files WHERE id = ?", [id], |r| r.get(0))?;
+    if let Some(key) = key {
+        let sql = format!(
+            "SELECT {}, r.role FROM files f JOIN volumes v ON v.id = f.volume_id LEFT JOIN dup_roles r ON r.file_id = f.id
+             WHERE COALESCE(f.prehash, f.hash) = ?1 AND f.size = ?2 AND f.missing = 0 AND f.quarantined = 0",
+            db::FILE_COLS
+        );
+        let mut rows: Vec<(db::FileRow, Option<String>)> = {
+            let mut st = conn.prepare(&sql)?;
+            let v = st.query_map(params![key, me.size], |r| Ok((db::FileRow::from_row(r)?, r.get(db::FILE_COLS_LEN)?)))?.collect::<rusqlite::Result<_>>()?;
+            v
+        };
+        if rows.len() > 1 {
+            let rank = |r: &Option<String>| match r.as_deref() {
+                Some("original") => 0,
+                Some("backup") => 1,
+                _ => 2,
+            };
+            rows.sort_by(|a, b| rank(&a.1).cmp(&rank(&b.1)).then(a.0.id.cmp(&b.0.id)));
+            let first = rows[0].0.clone();
+            let rest: Vec<db::FileRow> = rows[1..].iter().map(|r| r.0.clone()).collect();
+            let marked: bool = conn.query_row("SELECT 1 FROM labels WHERE file_id = ? AND label = ?", params![first.id, ORIGINAL_LABEL], |_| Ok(())).is_ok();
+            let lib = crate::library::location(conn);
+            let rules = crate::dedupe::DupRules::load(conn)?;
+            let why = crate::library::why_original(&first, &rest, marked, lib.as_ref().map(|(v, r)| (*v, r.as_str())), &rules);
+            let members = rows
+                .into_iter()
+                .enumerate()
+                .map(|(i, (f, role))| {
+                    let (role, relation) = if i == 0 {
+                        ("original", "원본")
+                    } else if role.as_deref() == Some("backup") || f.volume_id != first.volume_id {
+                        ("backup", "백업")
+                    } else if f.name.to_lowercase() == first.name.to_lowercase() {
+                        ("copy", "복사본")
+                    } else {
+                        ("copy", "사본")
+                    };
+                    member(f, role, relation)
+                })
+                .collect();
+            return Ok(Some(Family { kind: "exact".into(), why, members }));
+        }
+    }
+    // Versions of one photo (similar-photo group).
+    let gid: Option<i64> = conn
+        .query_row(
+            "SELECT m.group_id FROM dup_members m JOIN dup_groups g ON g.id = m.group_id
+             WHERE m.file_id = ? AND g.kind = 'similar_image' AND g.resolved = 0",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(gid) = gid else { return Ok(None) };
+    let sql = format!(
+        "SELECT {}, m.variant FROM dup_members m JOIN files f ON f.id = m.file_id JOIN volumes v ON v.id = f.volume_id
+         WHERE m.group_id = ? AND f.missing = 0 AND f.quarantined = 0 ORDER BY m.variant IS NOT NULL, m.rank, f.id",
+        db::FILE_COLS
+    );
+    let mut st = conn.prepare(&sql)?;
+    let members: Vec<FamilyMember> = st
+        .query_map([gid], |r| Ok((db::FileRow::from_row(r)?, r.get::<_, Option<String>>(db::FILE_COLS_LEN)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .map(|(f, v)| match v.as_deref() {
+            None => member(f, "original", "원본"),
+            Some("smaller") => member(f, "variant", "축소본"),
+            Some("recompressed") => member(f, "variant", "재압축본"),
+            Some(_) => member(f, "variant", "편집본"),
+        })
+        .collect();
+    if members.len() < 2 {
+        return Ok(None);
+    }
+    Ok(Some(Family { kind: "similar".into(), why: "가장 크고 선명한 버전".into(), members }))
+}
+
 /// The user label that marks "this copy is the original".
 pub const ORIGINAL_LABEL: &str = "original";
 
@@ -268,6 +380,7 @@ pub fn refresh_roles(conn: &mut Connection) -> Result<usize> {
             groups.entry(k).or_default().push(f);
         }
     }
+    let lib = crate::library::location(conn);
     let tx = conn.transaction()?;
     tx.execute("DELETE FROM dup_roles", [])?;
     let mut n = 0;
@@ -280,6 +393,11 @@ pub fn refresh_roles(conn: &mut Connection) -> Result<usize> {
                 labels.insert(f.id, lab.query_map([f.id], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?);
             }
             crate::dedupe::rank_members(&mut g, &labels, &rules);
+            // The same choice as the organizer makes (library drive, filed, named folder), so
+            // "원본" means one thing everywhere.
+            if let Some((vol, root)) = &lib {
+                crate::library::keeper_first(&mut g, *vol, root);
+            }
             // The user's own pick goes first (stable: ranking order among the rest).
             if let Some(i) = g.iter().position(|f| labels[&f.id].iter().any(|l| l == ORIGINAL_LABEL)) {
                 let picked = g.remove(i);
