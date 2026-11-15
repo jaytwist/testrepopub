@@ -201,7 +201,7 @@ fn quick_review_groups_and_decisions() {
 
     // Keeping everything settles the group: it is not asked again.
     let all: Vec<i64> = g.members.iter().map(|m| m.file.id).collect();
-    media_core::triage::commit(&mut conn, &[media_core::triage::Decision { key: g.key.clone(), keep: all }]).unwrap();
+    media_core::triage::commit(&mut conn, &[media_core::triage::Decision { key: g.key.clone(), keep: all, ..Default::default() }]).unwrap();
     assert!(media_core::triage::groups(&conn, "exact", None, 0, 10).unwrap().is_empty());
 }
 

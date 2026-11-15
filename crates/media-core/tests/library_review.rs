@@ -86,7 +86,7 @@ fn year_delete_list() {
 
     // A new search keeps what was decided: keep only the big one in 2016's group.
     let g16 = triage::groups_in(&conn, "similar_image", &organizer::year_files(&plan, "2016"), lib, 0, 50).unwrap();
-    triage::commit(&mut db.conn().unwrap(), &[Decision { key: g16[0].key.clone(), keep: vec![id("부산/p.jpg")] }]).unwrap();
+    triage::commit(&mut db.conn().unwrap(), &[Decision { key: g16[0].key.clone(), keep: vec![id("부산/p.jpg")], ..Default::default() }]).unwrap();
     dedupe::find_similar_images(&db, Similarity::High, &stop, &quiet).unwrap();
     let kept: Vec<(i64, i64)> = {
         let mut st = conn
@@ -105,7 +105,7 @@ fn year_delete_list() {
         purge: true,
         label: Some("2015년".into()),
         drop_ids: vec![small_id, b_id, c_id],
-        decisions: vec![Decision { key: groups[0].key.clone(), keep: vec![id("제주도/a.jpg")] }],
+        decisions: vec![Decision { key: groups[0].key.clone(), keep: vec![id("제주도/a.jpg")], drop: vec![small_id] }],
     };
     let rep = organizer::execute_with(&db, &organizer::subset_year(&plan, "2015"), &xo, &stop, &quiet).unwrap();
     assert_eq!(rep.failed, 0, "the deleted photo is not moved afterwards: {:?}", rep.errors);
@@ -128,4 +128,110 @@ fn year_delete_list() {
     assert_eq!((cc.action, cc.tag.as_str()), (Action::Leave, "excluded"), "not brought in later either");
     let files15 = organizer::year_files(&again, "2015");
     assert_eq!(triage::groups_in(&conn, "similar_image", &files15, lib, 0, 50).unwrap().len(), 0);
+}
+
+/// Similar-photo groups are found again after every analysis pass. A review in progress refers to
+/// groups by id, so: an unchanged group keeps its id, a deleted group's id never comes back as
+/// another group, and a decision about a group that changed is not saved onto anything.
+#[test]
+fn group_ids_are_stable_and_stale_decisions_do_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let e = drive(tmp.path(), "diskE");
+    for (n, seed) in [("a", 1), ("a2", 1), ("b", 2), ("b2", 2), ("c", 3), ("c2", 3)] {
+        let (w, h) = if n.ends_with('2') { (800, 600) } else { (1600, 1200) };
+        jpeg(&e.join(format!("p/{n}.jpg")), seed, w, h, "2015:08:10 10:00:00");
+    }
+    let db = Db::open(tmp.path().join("app/library.db")).unwrap();
+    let conn = db.conn().unwrap();
+    volumes::add_source(&conn, &e).unwrap();
+    let stop = StopFlag::new();
+    scanner::scan_all(&db, &ScanOptions::default(), &stop, &quiet).unwrap();
+    let id = |name: &str| -> i64 { conn.query_row("SELECT id FROM files WHERE name = ?", [name], |r| r.get(0)).unwrap() };
+    let look = |name: &str, h: i64| {
+        conn.execute("INSERT OR REPLACE INTO analysis(file_id, version, dhash, analyzed_at) VALUES (?, 1, ?, 0)", params![id(name), h]).unwrap();
+    };
+    let group_of = |name: &str| -> Option<i64> {
+        conn.query_row(
+            "SELECT m.group_id FROM dup_members m JOIN dup_groups g ON g.id = m.group_id WHERE g.kind = 'similar_image' AND g.resolved = 0 AND m.file_id = ?",
+            [id(name)],
+            |r| r.get(0),
+        )
+        .ok()
+    };
+    let keeps = |gid: i64| -> Vec<(i64, i64)> {
+        let mut st = conn.prepare("SELECT file_id, keep FROM dup_members WHERE group_id = ? ORDER BY file_id").unwrap();
+        let v = st.query_map([gid], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().collect::<Result<_, _>>().unwrap();
+        v
+    };
+    // Two groups: a + a2, b + b2 (c and c2 not analysed yet).
+    look("a.jpg", 0);
+    look("a2.jpg", 0);
+    look("b.jpg", 0x0000_FFFF_0000_FFFF);
+    look("b2.jpg", 0x0000_FFFF_0000_FFFF);
+    dedupe::find_similar_images(&db, Similarity::High, &stop, &quiet).unwrap();
+    let (ga, gb) = (group_of("a.jpg").unwrap(), group_of("b.jpg").unwrap());
+
+    // Found again with nothing changed: the same ids.
+    dedupe::find_similar_images(&db, Similarity::High, &stop, &quiet).unwrap();
+    assert_eq!((group_of("a.jpg"), group_of("b.jpg")), (Some(ga), Some(gb)));
+
+    // The user opens a review of group b (the newest id)…
+    let stale = Decision { key: format!("dup:{gb}"), keep: vec![id("b.jpg")], drop: vec![id("b2.jpg")] };
+    // …meanwhile b2 is gone (so b's group dissolves) and c + c2 get analysed: a new group.
+    fs::remove_file(e.join("p/b2.jpg")).unwrap();
+    scanner::scan_all(&db, &ScanOptions::default(), &stop, &quiet).unwrap();
+    look("c.jpg", 0x00FF_00FF_00FF_00FF);
+    look("c2.jpg", 0x00FF_00FF_00FF_00FF);
+    dedupe::find_similar_images(&db, Similarity::High, &stop, &quiet).unwrap();
+    assert_eq!(group_of("a.jpg"), Some(ga), "an unchanged group keeps its id");
+    assert_eq!(group_of("b.jpg"), None);
+    let gc = group_of("c.jpg").unwrap();
+    assert!(gc > gb, "a deleted group's id is not used again ({gc} vs {gb})");
+
+    // The stale decision is saved onto nothing.
+    let before = keeps(gc);
+    triage::commit(&mut db.conn().unwrap(), &[stale.clone()]).unwrap();
+    assert_eq!(keeps(gc), before);
+    // Even addressed at the new group's id, a decision that keeps none of its photos is refused.
+    triage::commit(&mut db.conn().unwrap(), &[Decision { key: format!("dup:{gc}"), keep: vec![id("b.jpg")], ..Default::default() }]).unwrap();
+    assert_eq!(keeps(gc), before);
+    triage::commit(&mut db.conn().unwrap(), &[Decision { key: format!("dup:{gc}"), keep: vec![], ..Default::default() }]).unwrap();
+    assert_eq!(keeps(gc), before);
+
+    // Push with a decision whose kept photo no longer exists: its drops are spared.
+    let opts = OrganizeOptions {
+        target_dir: e.join("사진").to_string_lossy().into_owned(),
+        layout: "library".into(),
+        library: LibraryOptions::default(),
+        ..Default::default()
+    };
+    fs::remove_file(e.join("p/c.jpg")).unwrap();
+    scanner::scan_all(&db, &ScanOptions::default(), &stop, &quiet).unwrap();
+    let plan = organizer::plan(&db, &opts, &stop, &quiet).unwrap();
+    let xo = ExecOptions {
+        drop_ids: vec![id("c2.jpg")],
+        decisions: vec![Decision { key: format!("dup:{gc}"), keep: vec![id("c.jpg")], drop: vec![id("c2.jpg")] }],
+        ..Default::default()
+    };
+    let rep = organizer::execute_with(&db, &organizer::subset_year(&plan, "2015"), &xo, &stop, &quiet).unwrap();
+    assert_eq!(rep.dropped, 0, "{rep:?}");
+    let left: Vec<String> = walkdir(&e).into_iter().filter(|p| p.ends_with("c2.jpg")).collect();
+    assert_eq!(left.len(), 1, "the last of its group is not deleted: {left:?} {:?}", rep.errors);
+    assert!(!left[0].contains("quarantine"), "{left:?}");
+}
+
+fn walkdir(root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                out.push(p.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    out
 }

@@ -33,11 +33,15 @@ pub struct TriageGroup {
     pub members: Vec<TriageMember>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct Decision {
     pub key: String,
     /// Files of the group to keep; the rest will be removed by the caller.
     pub keep: Vec<i64>,
+    /// Files of the group the caller is about to remove (when it says so): they are spared if
+    /// none of the kept ones exists any more.
+    #[serde(default)]
+    pub drop: Vec<i64>,
 }
 
 const LIVE: &str = "f.missing = 0 AND f.quarantined = 0";
@@ -91,6 +95,20 @@ fn lock_outside(groups: &mut Vec<TriageGroup>, allowed: &HashSet<i64>, lib_vol: 
     }
     // Something to decide: two photos of this year that may go, at least one of them.
     groups.retain(|g| g.members.iter().filter(|m| !m.locked).count() >= 2 || (g.members.iter().any(|m| !m.locked) && g.members.len() >= 2 && g.members.iter().any(|m| !m.locked && !m.keep)));
+}
+
+/// The files of a review group (`dup:<id>` / `burst:<id>`) that still exist.
+pub fn members(conn: &Connection, key: &str) -> Result<Vec<i64>> {
+    let (sql, id) = if let Some(id) = key.strip_prefix("dup:") {
+        (format!("SELECT m.file_id FROM dup_members m JOIN files f ON f.id = m.file_id WHERE m.group_id = ? AND {LIVE}"), id)
+    } else if let Some(id) = key.strip_prefix("burst:") {
+        (format!("SELECT b.file_id FROM bursts b JOIN files f ON f.id = b.file_id WHERE b.burst_id = ? AND {LIVE}"), id)
+    } else {
+        bail!("unknown review group {key}");
+    };
+    let mut st = conn.prepare(&sql)?;
+    let rows = st.query_map([id.parse::<i64>()?], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
 }
 
 /// How many groups of `kind` there are to review for `allowed` (the same ones `groups_in` gives).
@@ -245,6 +263,24 @@ pub fn commit(conn: &mut Connection, decisions: &[Decision]) -> Result<()> {
                 let rows = st.query_map([gid], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
                 rows
             };
+            // A decision must be about this group as it is now: it keeps at least one of its
+            // photos, and every photo it keeps that still exists is one of the group's. Anything
+            // else is a decision made on a group that has changed since — not saved (it would
+            // mark another group's photos for removal).
+            let kept_here = members.iter().filter(|f| keep.contains(f)).count();
+            let strangers = {
+                let mut live = tx.prepare_cached(&format!("SELECT 1 FROM files f WHERE f.id = ? AND {LIVE}"))?;
+                let mut n = 0;
+                for k in keep.iter().filter(|k| !members.contains(k)) {
+                    if live.exists([k])? {
+                        n += 1;
+                    }
+                }
+                n
+            };
+            if kept_here == 0 || strangers > 0 {
+                continue;
+            }
             for f in &members {
                 tx.execute("UPDATE dup_members SET keep = ? WHERE group_id = ? AND file_id = ?", params![keep.contains(f) as i64, gid, f])?;
             }

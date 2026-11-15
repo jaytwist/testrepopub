@@ -256,7 +256,7 @@ export default function LibraryPlan() {
     if (!(await confirm(text, { title: `${y.label} Push`, kind: "warning", okLabel: "실행", cancelLabel: "취소" }))) return;
     try {
       setLastRunYear(y.key);
-      const decisions = [...list.reviewOf(y.key)].map(([key, e]) => ({ key, keep: e.keep }));
+      const decisions = [...list.reviewOf(y.key)].map(([key, e]) => ({ key, keep: e.keep, drop: e.drops.map((d) => d.id) }));
       await api.startExecute(plan.id, undefined, y.key, purge, [...drops.keys()], decisions);
       setRunning("organize:run");
     } catch (e) {

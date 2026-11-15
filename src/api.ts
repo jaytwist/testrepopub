@@ -299,7 +299,7 @@ export const api = {
   planItems: (planId: string, action: string | null, offset: number, limit: number) =>
     invoke<PlanItem[]>("plan_items", { planId, action, offset, limit }),
   /** Run a plan; `groups` runs only those destination folders (try one first). */
-  startExecute: (planId: string, groups?: string[], year?: string, purge?: boolean, dropIds?: number[], decisions?: { key: string; keep: number[] }[]) =>
+  startExecute: (planId: string, groups?: string[], year?: string, purge?: boolean, dropIds?: number[], decisions?: { key: string; keep: number[]; drop?: number[] }[]) =>
     invoke<void>("start_execute", {
       planId, groups: groups ?? null, year: year ?? null, purge: purge ?? null, dropIds: dropIds ?? null, decisions: decisions ?? null,
     }),

@@ -1354,17 +1354,42 @@ pub fn execute_with(db: &Db, plan: &Plan, xo: &ExecOptions, stop: &StopFlag, pro
     }
 
     // 2. Photos the user put on the delete list.
-    if !xo.drop_ids.is_empty() && !rep.cancelled {
+    // A review never empties a group: a decision that keeps none of its group's photos (a group
+    // that changed since it was reviewed) deletes nothing from that group.
+    let mut drop_ids: Vec<i64> = xo.drop_ids.clone();
+    let mut decisions = xo.decisions.clone();
+    {
+        let mut spared: HashSet<i64> = HashSet::new();
+        decisions.retain(|d| {
+            let members = crate::triage::members(&conn, &d.key).unwrap_or_default();
+            // Still a group with one of the kept photos in it — or, if the group is gone, at
+            // least one of the kept photos still exists.
+            let kept_alive = d.keep.iter().any(|k| conn.query_row("SELECT 1 FROM files WHERE id = ? AND missing = 0 AND quarantined = 0", [k], |_| Ok(())).is_ok());
+            let ok = if members.is_empty() { kept_alive } else { members.iter().any(|m| d.keep.contains(m)) };
+            if !ok {
+                spared.extend(members);
+                spared.extend(d.drop.iter().copied());
+            }
+            ok
+        });
+        let before = drop_ids.len();
+        drop_ids.retain(|id| !spared.contains(id));
+        if drop_ids.len() < before && rep.errors.len() < 200 {
+            rep.errors.push(format!("검토한 뒤 바뀐 묶음의 사진 {}장은 지우지 않았습니다 — 다시 검토하세요", before - drop_ids.len()));
+            rep.drop_kept += (before - drop_ids.len()) as u64;
+        }
+    }
+    if !drop_ids.is_empty() && !rep.cancelled {
         // Photos on other drives are never deleted: they are just not brought in (and remembered).
         let elsewhere: HashSet<i64> = plan.items.iter().filter(|i| i.cross_volume).map(|i| i.file_id).collect();
-        let (keep_out, del): (Vec<i64>, Vec<i64>) = xo.drop_ids.iter().copied().partition(|id| elsewhere.contains(id));
+        let (keep_out, del): (Vec<i64>, Vec<i64>) = drop_ids.iter().copied().partition(|id| elsewhere.contains(id));
         rep.not_brought = keep_out.len() as u64;
         let d = delete_for_good(db, &del, &keep_out, true, &format!("{prefix}골라서 지운 사진 {}장", del.len()), stop, progress)?;
         let keep_out: HashSet<i64> = keep_out.into_iter().collect();
         work.retain(|i| !keep_out.contains(&i.file_id));
         rep.dropped = d.deleted;
         rep.dropped_bytes = d.bytes;
-        rep.drop_kept = d.kept_protected + d.failed;
+        rep.drop_kept += d.kept_protected + d.failed;
         rep.drop_batch = d.batch_id;
         for e in d.errors {
             if rep.errors.len() < 200 {
@@ -1376,9 +1401,9 @@ pub fn execute_with(db: &Db, plan: &Plan, xo: &ExecOptions, stop: &StopFlag, pro
             del.iter().copied().filter(|id| conn.query_row("SELECT 1 FROM files WHERE id = ? AND quarantined = 0", [*id], |_| Ok(())).is_err()).collect();
         work.retain(|i| !gone.contains(&i.file_id));
     }
-    if !xo.decisions.is_empty() {
+    if !decisions.is_empty() {
         let mut c = db.conn()?;
-        crate::triage::commit(&mut c, &xo.decisions)?;
+        crate::triage::commit(&mut c, &decisions)?;
     }
 
     let batch = journal::new_batch(&conn, "organize", &what)?;

@@ -77,8 +77,13 @@ export default function Triage({ kind, variant, title, onClose, source, onFinish
   }, [groups]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const g = groups?.[idx];
+  // The suggestion; never "keep none" — if the stored suggestion keeps nothing, the first
+  // (recommended) photo is kept.
   const keepOf = useCallback(
-    (gr: TriageGroup) => keep.get(gr.key) ?? new Set(gr.members.filter((m) => m.keep).map((m) => m.file.id)),
+    (gr: TriageGroup) => {
+      const s = keep.get(gr.key) ?? new Set(gr.members.filter((m) => m.keep).map((m) => m.file.id));
+      return s.size === 0 && gr.members.length > 0 ? new Set([gr.members[0].file.id]) : s;
+    },
     [keep],
   );
   const setKeepOf = (gr: TriageGroup, s: Set<number>) => setKeep((k) => new Map(k).set(gr.key, s));
@@ -113,7 +118,11 @@ export default function Triage({ kind, variant, title, onClose, source, onFinish
   };
   const next = (keepAll = false) => {
     if (!g) return;
-    setKeepOf(g, keepAll ? new Set(g.members.map((m) => m.file.id)) : keepOf(g));
+    const chosen = keepAll ? new Set(g.members.map((m) => m.file.id)) : keepOf(g);
+    // A group is never emptied here.
+    if (chosen.size === 0) return setErr("한 장은 남겨야 합니다.");
+    setErr(null);
+    setKeepOf(g, chosen);
     setDone((d) => (d.includes(g.key) ? d : [...d, g.key]));
     setIdx((i) => i + 1);
   };
@@ -128,9 +137,12 @@ export default function Triage({ kind, variant, title, onClose, source, onFinish
   const drops = useMemo(() => {
     const byKey = new Map((groups ?? []).map((gr) => [gr.key, gr]));
     return done.flatMap((k) => {
-      const gr = byKey.get(k)!;
-      const s = keep.get(k) ?? new Set<number>();
-      return gr.members.filter((m) => !s.has(m.file.id)).map((m) => m.file);
+      // A decision from an earlier visit whose group is not loaded (or no longer exists) is left
+      // as it was.
+      const gr = byKey.get(k);
+      const s = keep.get(k);
+      if (!gr || !s || s.size === 0) return [];
+      return gr.members.filter((m) => !s.has(m.file.id) && !m.locked).map((m) => m.file);
     });
   }, [done, keep, groups]);
   const dropBytes = drops.reduce((a, f) => a + f.size, 0);
@@ -138,19 +150,22 @@ export default function Triage({ kind, variant, title, onClose, source, onFinish
   const finish = async () => {
     if (onFinish) {
       const byKey = new Map((groups ?? []).map((gr) => [gr.key, gr]));
+      // Only groups seen in this visit (loaded, with a photo kept): earlier decisions on groups
+      // not loaded now stay as they are in the year's list.
+      const seen = done.filter((k) => byKey.has(k) && (keep.get(k)?.size ?? 0) > 0);
       onFinish({
-        decisions: done.map((k) => ({ key: k, keep: [...(keep.get(k) ?? [])] })),
-        drops: done.flatMap((k) => {
-          const gr = byKey.get(k);
-          const s = keep.get(k) ?? new Set<number>();
-          return (gr?.members ?? []).filter((m) => !s.has(m.file.id) && !m.locked).map((m) => ({ id: m.file.id, size: m.file.size, key: k }));
+        decisions: seen.map((k) => ({ key: k, keep: [...keep.get(k)!] })),
+        drops: seen.flatMap((k) => {
+          const s = keep.get(k)!;
+          return byKey.get(k)!.members.filter((m) => !s.has(m.file.id) && !m.locked).map((m) => ({ id: m.file.id, size: m.file.size, key: k }));
         }),
       });
       onClose();
       return;
     }
     try {
-      if (done.length > 0) await api.triageCommit(done.map((k) => ({ key: k, keep: [...(keep.get(k) ?? [])] })));
+      const decided = done.filter((k) => (keep.get(k)?.size ?? 0) > 0);
+      if (decided.length > 0) await api.triageCommit(decided.map((k) => ({ key: k, keep: [...keep.get(k)!] })));
       if (drops.length > 0 && !running && (await confirmDelete(drops.map((f) => f.id), title, dropBytes, title))) setRunning("delete");
       onClose();
     } catch (e) {
