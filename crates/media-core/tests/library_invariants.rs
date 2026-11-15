@@ -162,7 +162,7 @@ fn run(seed: u64) {
     };
 
     for round in 0..10 {
-        match rng.below(6) {
+        match rng.below(7) {
             // Push one year that has work, deleting its copies for good or not.
             0 | 1 => {
                 let plan = organizer::plan(&db, &opts, &stop, &quiet).unwrap();
@@ -224,6 +224,26 @@ fn run(seed: u64) {
                 made_batches.extend(Some(rep.batch_id.clone()).filter(|b| !b.is_empty()));
                 check(&format!("round {round}: remove {} copy folders (purge {purge}) -> {} files, {} skipped", picks.len(), rep.files, rep.skipped));
             }
+            // Take files of one folder into another: what only the second has comes along, and
+            // a file under the same name with other content replaces the first's (which waits in
+            // the quarantine).
+            5 => {
+                let vol: Option<i64> = conn.query_row("SELECT volume_id FROM sources ORDER BY id LIMIT 1", [], |r| r.get(0)).ok();
+                let (x, y) = (folders[rng.below(folders.len())], folders[rng.below(folders.len())]);
+                if let Some(volume_id) = vol.filter(|_| x != y) {
+                    let (keep, copy) = (FolderRef { volume_id, rel_dir: x.into() }, FolderRef { volume_id, rel_dir: y.into() });
+                    let rows = copy_folders::align(&conn, &keep, std::slice::from_ref(&copy)).unwrap();
+                    let choices: Vec<copy_folders::Choice> = rows
+                        .iter()
+                        .filter(|r| r.kind != "same")
+                        .filter_map(|r| Some(copy_folders::Choice { keep_file: r.files[0].as_ref().map(|f| f.id), copy_file: r.files[1].as_ref()?.id, discard: false }))
+                        .collect();
+                    let rep = copy_folders::swap(&db, &keep, &[copy_folders::SwapGroup { copy, choices }], &stop, &quiet).unwrap();
+                    assert_eq!(rep.failed, 0, "seed {seed} round {round} swap: {:?} after:\n  {}", rep.errors, log.borrow().join("\n  "));
+                    made_batches.extend(Some(rep.batch_id.clone()).filter(|b| !b.is_empty()));
+                    check(&format!("round {round}: {y} into {x} -> {} replaced, {} brought", rep.replaced, rep.brought));
+                }
+            }
             _ => {
                 scan();
                 check(&format!("round {round}: rescan"));
@@ -238,7 +258,8 @@ fn run(seed: u64) {
     organizer::execute_with(&db, &plan, &ExecOptions { purge: true, ..Default::default() }, &stop, &quiet).unwrap();
     check("final run");
     let again = organizer::plan(&db, &opts, &stop, &quiet).unwrap();
-    assert_eq!((again.summary.moves, again.summary.copies, again.summary.remove), (0, 0, 0), "seed {seed}: {:?}", again.summary);
+    let todo: Vec<String> = again.items.iter().filter(|i| !matches!(i.action, organizer::Action::InPlace | organizer::Action::Leave)).map(|i| format!("{:?} {} -> {} [{} / {}]", i.action, i.src, i.dst, i.tag, i.group)).collect();
+    assert_eq!((again.summary.moves, again.summary.copies, again.summary.remove), (0, 0, 0), "seed {seed}: still to do {todo:#?} after:\n  {}", log.borrow().join("\n  "));
     let lib = contents(&[&e.join("사진")]);
     let not_media = journal::hash_file(&e.join("옛날/유럽 여행/notes.txt")).ok();
     for k in start.keys().filter(|k| Some(*k) != not_media.as_ref()) {

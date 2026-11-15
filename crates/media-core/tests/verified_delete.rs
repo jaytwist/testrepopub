@@ -179,10 +179,10 @@ fn the_quick_check_still_keeps_what_differs_where_it_looks() {
     fs::write(&p, &data).unwrap();
     let rep = folders::remove_with(&db, &picks, &RemoveOptions { purge: true, quick: true }, &StopFlag::new(), &quiet).unwrap();
     assert!(rep.quick);
-    assert_eq!((rep.files, rep.different), (3, 1), "{rep:?}");
-    let waiting: Vec<String> = walk(&e).into_iter().filter(|p| p.contains(&rep.batch_id)).collect();
-    assert_eq!(waiting.len(), 1, "{waiting:?}");
-    assert!(waiting[0].ends_with("복사/f01.jpg"));
+    assert_eq!((rep.files, rep.different), (2, 1), "{rep:?}");
+    assert!(!walk(&e).iter().any(|p| p.contains(&rep.batch_id)), "nothing waits in the quarantine");
+    assert_eq!(walk(&e.join("복사")).len(), 1, "the one that differs is back in its place");
+    assert_eq!(fs::read(e.join("복사/f01.jpg")).unwrap(), data);
     let conn = db.conn().unwrap();
     let what: String = conn.query_row("SELECT description FROM batches WHERE id = ?", [&rep.batch_id], |r| r.get(0)).unwrap();
     assert_eq!(what, "100% 복사 폴더 1개 정리 · 빠른 확인으로 지움");

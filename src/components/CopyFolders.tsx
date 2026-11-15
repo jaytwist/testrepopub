@@ -6,6 +6,7 @@ import {
 } from "../api";
 import { useJob } from "../App";
 import FolderPeek, { type Peek } from "./FolderPeek";
+import FolderWalk, { type WalkSet } from "./FolderWalk";
 
 const PAGE = 30;
 const dirKey = (f: CopyFolderInfo) => `${f.volume_id}:${f.rel_dir}`;
@@ -24,7 +25,7 @@ interface ExactRow { key: string; set: CopyFolderSet; all: CopyFolderInfo[]; kee
 /** One folder that is almost the same as its base, as shown (a pair may be turned around). */
 interface NearRow {
   key: string; keep: CopyFolderInfo; copy: CopyFolderInfo; shared: number; sharedBytes: number; onlyKeep: number; onlyCopy: number; ratio: number;
-  alsoListed: number; extraBytes: number;
+  alsoListed: number; extraBytes: number; differs: number;
 }
 const inside = (f: CopyFolderInfo, of: CopyFolderInfo) => f.volume_id === of.volume_id && f.rel_dir.startsWith(`${of.rel_dir}/`);
 
@@ -53,6 +54,18 @@ export default function CopyFolders({ onTotals }: { onTotals?: (exact: number, n
   const [shown, setShown] = useState(PAGE);
   const [nearShown, setNearShown] = useState(PAGE);
   const [peek, setPeek] = useState<Peek | null>(null);
+  /** The side-by-side walk-through: which list it walks and which set is open. */
+  const [walk, setWalk] = useState<{ tab: "exact" | "near" | "review"; key: string } | null>(null);
+  /** Sets already looked through (kept across restarts), and whether to hide them. */
+  const [reviewed, setReviewed] = useState<Set<string>>(new Set());
+  const [hideReviewed, setHideReviewed] = useState(false);
+  useEffect(() => {
+    api.foldersReviewed().then((r) => setReviewed(new Set(r))).catch(() => {});
+  }, []);
+  const markReviewed = useCallback((key: string) => {
+    setReviewed((r) => (r.has(key) ? r : new Set(r).add(key)));
+    api.setFolderReviewed(key, true).catch(() => {});
+  }, []);
   const [props, setProps] = useState<Record<string, FolderProps>>({});
   const [confirming, setConfirming] = useState(false);
   const [keepInQuarantine, setKeepInQuarantine] = useState(false);
@@ -70,6 +83,7 @@ export default function CopyFolders({ onTotals }: { onTotals?: (exact: number, n
   };
   useEffect(load, [load, version]);
   useEffect(() => {
+    if (lastDone?.job === "cleanup:swap") return load();
     if (lastDone?.job !== "cleanup:folders") return;
     setOn(new Set());
     setProps({});
@@ -96,7 +110,7 @@ export default function CopyFolders({ onTotals }: { onTotals?: (exact: number, n
           const key = `${dirKey(s.base)}|${dirKey(o.info)}`;
           const flip = s.others.length === 1 && turned.has(key);
           return {
-            key, ratio: o.ratio, shared: o.shared, sharedBytes: o.shared_bytes, alsoListed: o.also_listed, extraBytes: o.extra_bytes,
+            key, ratio: o.ratio, shared: o.shared, sharedBytes: o.shared_bytes, alsoListed: o.also_listed, extraBytes: o.extra_bytes, differs: o.differs,
             keep: flip ? o.info : s.base, copy: flip ? s.base : o.info,
             onlyKeep: flip ? o.only_here : o.only_base, onlyCopy: flip ? o.only_base : o.only_here,
           };
@@ -104,6 +118,37 @@ export default function CopyFolders({ onTotals }: { onTotals?: (exact: number, n
       })),
     [found, turned],
   );
+
+  const exactList = hideReviewed ? exact.filter((r) => !reviewed.has(r.key)) : exact;
+  const nearList = hideReviewed ? near.filter((s) => !reviewed.has(s.key)) : near;
+  /** The sets of the open list as the walk-through takes them. */
+  const walkSets: WalkSet[] = walk?.tab === "review"
+    ? (result?.to_review ?? []).map((p) => ({
+        key: `${p.keep.volume_id}:${p.keep.rel_dir}`, action: "", checked: false,
+        keep: { ...p.keep, abs_path: p.keep_path }, copies: [{ ...p.copy, abs_path: p.copy_path }],
+      }))
+    : walk?.tab === "near"
+    ? nearList.map((s) => ({
+        key: s.key, keep: s.rows[0].keep, copies: s.rows.map((r) => r.copy), action: "겹치는 것 지우기",
+        checked: s.rows.filter((r) => !r.copy.keep_rule).length > 0 && s.rows.filter((r) => !r.copy.keep_rule).every((r) => on.has(`n:${r.key}`)),
+      }))
+    : exactList.map((r) => ({
+        key: r.key, keep: r.keep, copies: r.others, action: "복사본 지우기",
+        checked: r.others.filter((f) => !f.keep_rule).length > 0 && r.others.filter((f) => !f.keep_rule).every((f) => on.has(`x:${dirKey(f)}`)),
+      }));
+  const toggleSet = (key: string) => {
+    if (walk?.tab === "near") {
+      const rows = near.find((s) => s.key === key)?.rows.filter((r) => !r.copy.keep_rule) ?? [];
+      // Looked at side by side: that is the comparison a tick below 95 % asks for.
+      setSeen((x) => new Set([...x, ...rows.map((r) => r.key)]));
+      toggle(rows.map((r) => `n:${r.key}`));
+    } else {
+      toggle(exact.find((r) => r.key === key)?.others.filter((f) => !f.keep_rule).map((f) => `x:${dirKey(f)}`) ?? []);
+    }
+  };
+  const openWalk = (tab: "exact" | "near", key: string) => {
+    setWalk({ tab, key });
+  };
 
   const exactGoing = exact.flatMap((r) => r.others.filter((f) => !f.keep_rule && on.has(`x:${dirKey(f)}`)).map((f) => ({ r, f })));
   const nearGoing = near.flatMap((s) => s.rows.filter((r) => !r.copy.keep_rule && on.has(`n:${r.key}`)));
@@ -189,7 +234,7 @@ export default function CopyFolders({ onTotals }: { onTotals?: (exact: number, n
         {found?.drive ? `${found.drive} 드라이브만 봅니다. 다른 드라이브의 같은 폴더는 백업이므로 건드리지 않습니다.` : "한 드라이브 안에서만 비교하며, 다른 드라이브의 같은 폴더는 백업이므로 건드리지 않습니다."}
       </p>
       {err && <div className="alert bad">{err}</div>}
-      {result && <Result r={result} onClose={() => setResult(null)} />}
+      {result && <Result r={result} onClose={() => setResult(null)} onReview={() => setWalk({ tab: "review", key: "" })} />}
 
       {found == null ? (
         <div className="card muted small">폴더를 비교하는 중…</div>
@@ -229,10 +274,13 @@ export default function CopyFolders({ onTotals }: { onTotals?: (exact: number, n
                   <b>{fmtCount(exact.length)}묶음</b> · 복사 폴더 {fmtCount(exact.reduce((a, r) => a + r.others.length, 0))}개 · 모두 지우면 <b>{fmtBytes(exactBytes)}</b> 확보
                   {found.unread > 0 && <span className="muted small"> · 아직 확인하지 못한 파일 {fmtCount(found.unread)}개 (끝나면 더 나올 수 있음)</span>}
                 </div>
-                <button className="btn small" onClick={() => toggle(exactKeys, !allExactOn)}>{allExactOn ? "선택 모두 해제" : "100% 묶음 모두 선택"}</button>
+                <span className="cf-btns">
+                  <label className="small"><input type="checkbox" checked={hideReviewed} onChange={(e) => setHideReviewed(e.target.checked)} /> 아직 안 본 묶음만</label>
+                  <button className="btn small" onClick={() => toggle(exactKeys, !allExactOn)}>{allExactOn ? "선택 모두 해제" : "100% 묶음 모두 선택"}</button>
+                </span>
               </div>
               <div className="cf-sets">
-                {exact.slice(0, shown).map((r, i) => {
+                {exactList.slice(0, shown).map((r, i) => {
                   const keys = r.others.filter((f) => !f.keep_rule).map((f) => `x:${dirKey(f)}`);
                   const n = keys.filter((k) => on.has(k)).length;
                   return (
@@ -241,6 +289,8 @@ export default function CopyFolders({ onTotals }: { onTotals?: (exact: number, n
                         <span>
                           <b>묶음 {i + 1}</b> · 사진·영상 {fmtCount(r.set.files)}개 · {fmtBytes(r.set.bytes)} · 복사본 {fmtCount(r.others.length)}개
                           {n > 0 && <b className="cf-gain"> → {fmtBytes(n * r.set.bytes)} 확보</b>}
+                          {r.keep.unreadable > 0 && <span className="cf-flag"> 열 수 없는 사진 {fmtCount(r.keep.unreadable)}장</span>}
+                          {reviewed.has(r.key) && <span className="pill ok cf-seen">확인함</span>}
                         </span>
                         <span className="cf-btns">
                           {!props[dirKey(r.keep)] && <button className="btn small ghost" onClick={() => loadProps(r.all)}>그 밖의 파일 확인</button>}
@@ -273,7 +323,7 @@ export default function CopyFolders({ onTotals }: { onTotals?: (exact: number, n
                           </>,
                           <>
                             <button className="btn small" onClick={() => setPeek({ kind: "files", folder: f, role: "복사본" })}>안의 사진 보기</button>
-                            <button className="btn small" onClick={() => setPeek({ kind: "compare", keep: r.keep, copy: f })}>나란히 비교</button>
+                            <button className="btn small" onClick={() => openWalk("exact", r.key)}>나란히 비교</button>
                             <button className="btn small" title="이 폴더를 원본으로 남기고, 지금의 원본을 복사본으로 봅니다" onClick={() => { toggle(keys, false); setStays((m) => ({ ...m, [r.key]: r.all.indexOf(f) })); }}>
                               이쪽을 원본으로
                             </button>
@@ -285,14 +335,15 @@ export default function CopyFolders({ onTotals }: { onTotals?: (exact: number, n
                   );
                 })}
               </div>
-              {exact.length > shown && <button className="btn" onClick={() => setShown((n) => n + PAGE)}>더 보기 ({fmtCount(exact.length - shown)}묶음 남음)</button>}
+              {exactList.length > shown && <button className="btn" onClick={() => setShown((n) => n + PAGE)}>더 보기 ({fmtCount(exactList.length - shown)}묶음 남음)</button>}
+              {exactList.length === 0 && <div className="card muted small">모든 묶음을 확인했습니다. 「아직 안 본 묶음만」을 끄면 다시 보입니다.</div>}
             </>
           )}
 
           {tab === "near" && near.length > 0 && (
             <>
               <p className="muted small tier-note">
-                두 폴더의 사진·영상이 대부분 같지만 서로 없는 것이 조금 있습니다. 「나란히 비교」로 무엇이 다른지 본 뒤 체크하세요.
+                두 폴더의 사진·영상이 대부분 같지만 서로 없는 것이 조금 있습니다. 복사본의 사진이 전부 원본에 들어 있는 폴더는 비율과 관계없이 여기에 나옵니다. 「나란히 비교」로 무엇이 다른지 본 뒤 체크하세요.
                 체크하면 복사본에서 <b>원본에도 있는 것만</b> 지웁니다. 복사본에만 있는 사진은 그 폴더에 그대로 남고, 나중에 「한 곳으로 정리」가 가져갑니다.
               </p>
               <div className="cf-head">
@@ -300,10 +351,14 @@ export default function CopyFolders({ onTotals }: { onTotals?: (exact: number, n
                   {nearBytes > nearExtra && <span className="muted small"> (이 중 {fmtBytes(nearBytes - nearExtra)}는 위 100% 목록에도 들어 있음)</span>}</div>
               </div>
               <div className="cf-sets">
-                {near.slice(0, nearShown).map((s, i) => (
+                {nearList.slice(0, nearShown).map((s, i) => (
                   <div key={s.key} className="card cf-set">
                     <div className="cf-set-head">
-                      <span><b>묶음 {i + 1}</b> · 폴더 {fmtCount(s.rows.length + 1)}개</span>
+                      <span>
+                        <b>묶음 {i + 1}</b> · 폴더 {fmtCount(s.rows.length + 1)}개
+                        {s.rows.some((r) => r.differs > 0) && <span className="cf-flag"> 이름은 같은데 내용이 다른 사진 {fmtCount(s.rows.reduce((a, r) => a + r.differs, 0))}장 — 나란히 보고 고르세요</span>}
+                        {reviewed.has(s.key) && <span className="pill ok cf-seen">확인함</span>}
+                      </span>
                       {!props[dirKey(s.set.base)] && <button className="btn small ghost" onClick={() => loadProps([s.set.base, ...s.set.others.map((o) => o.info)])}>그 밖의 파일 확인</button>}
                     </div>
                     {folder(
@@ -317,7 +372,8 @@ export default function CopyFolders({ onTotals }: { onTotals?: (exact: number, n
                     {s.rows.map((r) => {
                       const k = `n:${r.key}`;
                       const going = !r.copy.keep_rule && on.has(k);
-                      const locked = r.copy.keep_rule || (r.ratio < 0.95 && !seen.has(r.key));
+                      // Below 95 % the comparison comes first — unless everything of the folder is in the original.
+                      const locked = r.copy.keep_rule || (r.ratio < 0.95 && !seen.has(r.key) && r.onlyCopy + r.differs > 0);
                       return folder(
                         r.copy, going ? "go" : "stay",
                         <label className={`cf-tag ${going ? "go" : ""}`}>
@@ -326,14 +382,15 @@ export default function CopyFolders({ onTotals }: { onTotals?: (exact: number, n
                         </label>,
                         <>
                           <b>{Math.floor(r.ratio * 100)}% 같음</b>
-                          {r.onlyCopy === 0 && <span className="cf-in"> 전부 원본에 있음</span>} · 같은 것 {fmtCount(r.shared)}개 ({fmtBytes(r.sharedBytes)}) · 원본에만 {fmtCount(r.onlyKeep)}개 ·{" "}
+                          {r.onlyCopy === 0 && r.differs === 0 && <span className="cf-in"> 전부 원본에 있음</span>}
+                          {r.differs > 0 && <b className="cf-flag"> · 이름은 같은데 내용이 다른 것 {fmtCount(r.differs)}장</b>} · 같은 것 {fmtCount(r.shared)}개 ({fmtBytes(r.sharedBytes)}) · 원본에만 {fmtCount(r.onlyKeep)}개 ·{" "}
                           <b>이 폴더에만 {fmtCount(r.onlyCopy)}개</b>
-                          {r.copy.keep_rule ? " · 「항상 남길 폴더」라서 지우지 않습니다" : r.onlyCopy > 0 ? " (지우지 않고 남김)" : " (이 폴더의 사진은 모두 원본에 있어, 지우면 폴더째 없어짐)"}
+                          {r.copy.keep_rule ? " · 「항상 남길 폴더」라서 지우지 않습니다" : r.onlyCopy + r.differs > 0 ? " (지우지 않고 남김)" : " (이 폴더의 사진은 모두 원본에 있어, 지우면 폴더째 없어짐)"}
                           {r.alsoListed > 0 && <div>이 안의 하위 폴더 {fmtCount(r.alsoListed)}개는 위 100% 목록에도 있습니다. 여기서 체크하면 그 묶음들도 한 번에 정리됩니다.</div>}
                         </>,
                         <>
                           <button className="btn small" onClick={() => setPeek({ kind: "files", folder: r.copy, role: "복사본" })}>안의 사진 보기</button>
-                          <button className="btn small primary" onClick={() => { setSeen((x) => new Set(x).add(r.key)); setPeek({ kind: "compare", keep: r.keep, copy: r.copy }); }}>나란히 비교</button>
+                          <button className="btn small primary" onClick={() => { setSeen((x) => new Set(x).add(r.key)); openWalk("near", s.key); }}>나란히 비교</button>
                           {s.rows.length === 1 && (
                             <button className="btn small" title="이 폴더를 원본으로 남기고, 다른 쪽에서 겹치는 것을 지웁니다" onClick={() => { toggle([k], false); setTurned((t) => { const n = new Set(t); if (!n.delete(r.key)) n.add(r.key); return n; }); }}>
                               이쪽을 원본으로
@@ -346,7 +403,7 @@ export default function CopyFolders({ onTotals }: { onTotals?: (exact: number, n
                   </div>
                 ))}
               </div>
-              {near.length > nearShown && <button className="btn" onClick={() => setNearShown((n) => n + PAGE)}>더 보기 ({fmtCount(near.length - nearShown)}묶음 남음)</button>}
+              {nearList.length > nearShown && <button className="btn" onClick={() => setNearShown((n) => n + PAGE)}>더 보기 ({fmtCount(nearList.length - nearShown)}묶음 남음)</button>}
             </>
           )}
 
@@ -423,11 +480,21 @@ export default function CopyFolders({ onTotals }: { onTotals?: (exact: number, n
         </div>
       )}
       {peek && <FolderPeek peek={peek} onClose={() => setPeek(null)} />}
+      {walk && walkSets.length > 0 && (
+        <FolderWalk
+          sets={walkSets}
+          index={Math.max(0, walkSets.findIndex((x) => x.key === walk.key))}
+          onIndex={(index) => setWalk({ tab: walk.tab, key: walkSets[index].key })}
+          onClose={() => setWalk(null)}
+          onToggle={toggleSet}
+          onReviewed={markReviewed}
+        />
+      )}
     </section>
   );
 }
 
-function Result({ r, onClose }: { r: CopyFolderReport; onClose: () => void }) {
+function Result({ r, onClose, onReview }: { r: CopyFolderReport; onClose: () => void; onReview: () => void }) {
   const clean = r.failed === 0 && r.different === 0 && !r.cancelled;
   return (
     <div className={`alert ${clean ? "ok" : "warn"} cf-result`}>
@@ -445,7 +512,11 @@ function Result({ r, onClose }: { r: CopyFolderReport; onClose: () => void }) {
         {r.labels_moved > 0 && <li>♥ 등 직접 붙인 표시 {fmtCount(r.labels_moved)}개를 남는 사진으로 옮겼습니다.</li>}
         {r.other_deleted > 0 && <li>사진이 아닌 파일 {fmtCount(r.other_deleted)}개도 지웠습니다 (원본 폴더의 같은 자리에 똑같이 있는 파일, Thumbs.db 같은 시스템 파일).</li>}
         {r.different > 0 && (
-          <li>끝까지 비교하니 내용이 달랐던 {fmtCount(r.different)}개는 지우지 않고 격리함에 두었습니다 — 「작업 기록」에서 되돌릴 수 있습니다.</li>
+          <li>
+            <b>끝까지 비교하니 원본과 내용이 달랐던 {fmtCount(r.different)}개는 지우지 않고 제자리에 두었습니다.</b> 둘 중 하나가 깨졌거나 덜 복구된 파일일 수 있습니다.
+            {r.to_review.length > 0 && <> <button className="btn small primary" onClick={onReview}>나란히 보고 고르기</button></>}
+            <div className="cf-left muted">{r.to_review.slice(0, 5).map((p) => <div key={p.copy_path}>{p.copy_path} ({fmtCount(p.files)}개)</div>)}</div>
+          </li>
         )}
         {r.left > 0 && (
           <li>

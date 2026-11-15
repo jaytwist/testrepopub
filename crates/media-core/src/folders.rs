@@ -38,6 +38,8 @@ struct Rec {
     video: bool,
     /// Wall-clock time taken, if known.
     taken: Option<i64>,
+    /// A photo the analysis could not open: likely damaged.
+    bad: bool,
 }
 
 struct Vol {
@@ -65,8 +67,9 @@ fn load(conn: &Connection) -> Result<Vec<Vol>> {
     let mut vols: Vec<Vol> = Vec::new();
     let mut at: HashMap<i64, usize> = HashMap::new();
     let mut st = conn.prepare(
-        "SELECT f.id, f.volume_id, f.rel_path, f.size, COALESCE(f.prehash, f.hash), v.mount, f.kind, f.taken_at
-         FROM files f JOIN volumes v ON v.id = f.volume_id
+        "SELECT f.id, f.volume_id, f.rel_path, f.size, COALESCE(f.prehash, f.hash), v.mount, f.kind, f.taken_at,
+                (a.file_id IS NOT NULL AND a.dhash IS NULL AND f.kind = 'photo')
+         FROM files f JOIN volumes v ON v.id = f.volume_id LEFT JOIN analysis a ON a.file_id = f.id
          WHERE f.missing = 0 AND f.quarantined = 0 AND v.online = 1",
     )?;
     let mut rows = st.query([])?;
@@ -81,7 +84,7 @@ fn load(conn: &Connection) -> Result<Vec<Vol>> {
             }
         };
         let kind: String = r.get(6)?;
-        vols[i].files.push(Rec { id: r.get(0)?, rel: r.get(2)?, size: r.get(3)?, key: r.get(4)?, video: kind == "video", taken: r.get(7)? });
+        vols[i].files.push(Rec { id: r.get(0)?, rel: r.get(2)?, size: r.get(3)?, key: r.get(4)?, video: kind == "video", taken: r.get(7)?, bad: r.get(8)? });
     }
     for v in &mut vols {
         v.files.sort_unstable_by(|a, b| a.rel.cmp(&b.rel));
@@ -206,6 +209,15 @@ fn twins<'a>(k: &[&'a Rec], kd: &str, c: &[&'a Rec], cd: &str) -> HashMap<i64, &
     twin
 }
 
+/// Of the copy's files that have no twin: those with a file of the folder that stays at the
+/// same place (path inside the folder, any letter case) that no copy file is the twin of — the
+/// same photo by name, not by content. Copy file id → that file.
+fn by_place<'a>(k: &[&'a Rec], kd: &str, c: &[&'a Rec], cd: &str, twin: &HashMap<i64, &'a Rec>) -> HashMap<i64, &'a Rec> {
+    let used: HashSet<i64> = twin.values().map(|t| t.id).collect();
+    let free: HashMap<String, &Rec> = k.iter().filter(|r| !used.contains(&r.id)).map(|r| (r.rel[kd.len() + 1..].to_lowercase(), *r)).collect();
+    c.iter().filter(|r| !twin.contains_key(&r.id)).filter_map(|r| free.get(&r.rel[cd.len() + 1..].to_lowercase()).map(|t| (r.id, *t))).collect()
+}
+
 // ---------------------------------------------------------------------------------------------
 // Find
 // ---------------------------------------------------------------------------------------------
@@ -233,6 +245,8 @@ pub struct FolderInfo {
     pub subfolders: u64,
     pub taken_from: Option<i64>,
     pub taken_to: Option<i64>,
+    /// Photos in it the analysis could not open (likely damaged).
+    pub unreadable: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -256,11 +270,14 @@ pub struct NearFolder {
     /// Files both have (by content), and their size: what goes from this folder.
     pub shared: u64,
     pub shared_bytes: i64,
-    /// Files only the base folder has / only this folder has.
+    /// Files only the base folder has / only this folder has (not counting `differs`).
     pub only_base: u64,
     pub only_here: u64,
-    /// `shared` over the files of the bigger of the two.
+    /// The same photos — `shared` and `differs` — over the files of the bigger of the two.
     pub ratio: f64,
+    /// Photos both have under the same name at the same place, with different content — one of
+    /// the two is damaged, cut short or edited. These are the ones to look at.
+    pub differs: u64,
     /// Folders inside this one that are also listed as 100 % copies (removing what is shared
     /// here settles those too), and the part of `shared_bytes` not already counted there.
     pub also_listed: u64,
@@ -473,8 +490,11 @@ fn near_in<'a>(v: &'a Vol, total: &HashMap<&'a str, Agg>, covered: &HashMap<&'a 
     let wrappers: HashSet<&str> = total.iter().filter_map(|(d, a)| ancestors(d).next().filter(|p| total.get(p).is_some_and(|t| t.count == a.count))).collect();
     let goes = |d: &str| std::iter::once(d).chain(ancestors(d)).find_map(|a| covered.get(a)).is_some_and(|stays| !*stays);
     let mut buckets: HashMap<(u8, u64), Vec<&str>> = HashMap::new();
+    // A folder whose every file is in another one is listed whatever its share of that folder
+    // (nothing of it would be lost): those may be small.
+    const CONTAINED_MIN: u64 = 3;
     for (d, a) in total {
-        if a.count < min_files || a.keyed == 0 || wrappers.contains(d) || goes(d) {
+        if a.count < min_files.min(CONTAINED_MIN) || a.keyed == 0 || wrappers.contains(d) || goes(d) {
             continue;
         }
         for (i, m) in a.mins.iter().enumerate() {
@@ -489,11 +509,8 @@ fn near_in<'a>(v: &'a Vol, total: &HashMap<&'a str, Agg>, covered: &HashMap<&'a 
         }
         ds.sort_unstable_by_key(|d| (count(d), *d));
         for i in 0..ds.len() {
-            // Only folders of nearly the same size can share that much (and not endlessly many).
+            // (Not endlessly many: a file that is in hundreds of folders says little.)
             for j in (i + 1..ds.len()).take(200) {
-                if (count(ds[i]) as f64) < near * count(ds[j]) as f64 {
-                    break;
-                }
                 let (a, b) = (ds[i], ds[j]);
                 if !nested(a, b) {
                     pairs.insert(if a < b { (a, b) } else { (b, a) });
@@ -510,7 +527,22 @@ fn near_in<'a>(v: &'a Vol, total: &HashMap<&'a str, Agg>, covered: &HashMap<&'a 
         let (shared, bytes) = overlap(&lists[a], &lists[b]);
         let (ca, cb) = (count(a), count(b));
         let identical = shared == ca && shared == cb;
-        if !identical && shared as f64 >= near * ca.max(cb) as f64 - 1e-9 {
+        let most = ca.max(cb) as f64;
+        // A photo under the same name at the same place counts as the same photo even when its
+        // content differs (damaged, cut short): such a pair is what the list is for, and must
+        // not drop out of it because of the very files worth a look. (Counted only for pairs
+        // that would otherwise just miss the bar.)
+        let mut named = 0u64;
+        if !identical && ca.min(cb) >= min_files && (shared as f64) < near * most - 1e-9 && shared as f64 >= (near - 0.3) * most {
+            let (kr, cr): (Vec<&Rec>, Vec<&Rec>) = (v.subtree(a).iter().collect(), v.subtree(b).iter().collect());
+            named = by_place(&kr, a, &cr, b, &twins(&kr, a, &cr, b)).len() as u64;
+        }
+        let alike_enough = ca.min(cb) >= min_files && (shared + named) as f64 >= near * most - 1e-9;
+        // (A folder that is one of a 100 % set is settled there: its copy inside the other
+        // folder is what goes, not the folder itself.)
+        let smaller = if ca <= cb { a } else { b };
+        let contained = shared == ca.min(cb) && shared >= CONTAINED_MIN && !covered.contains_key(smaller);
+        if !identical && (alike_enough || contained) {
             alike.push((a, b, shared, bytes));
         }
     }
@@ -545,13 +577,16 @@ fn near_in<'a>(v: &'a Vol, total: &HashMap<&'a str, Agg>, covered: &HashMap<&'a 
                 // Folders of 100 % sets inside this one (the outermost of them, for the size).
                 let inside: Vec<&str> = covered.keys().copied().filter(|c| c.starts_with(&format!("{o}/"))).collect();
                 let listed: i64 = inside.iter().filter(|c| !ancestors(c).any(|a| a.len() > o.len() && covered.contains_key(a))).map(|c| total.get(c).map_or(0, |a| a.bytes)).sum();
+                let (kr, cr): (Vec<&Rec>, Vec<&Rec>) = (v.subtree(d).iter().collect(), v.subtree(o).iter().collect());
+                let differs = by_place(&kr, d, &cr, o, &twins(&kr, d, &cr, o)).len() as u64;
                 Some(NearFolder {
                     info,
+                    differs,
                     shared: *shared,
                     shared_bytes: *bytes,
-                    only_base: cb - shared,
-                    only_here: co - shared,
-                    ratio: *shared as f64 / cb.max(co) as f64,
+                    only_base: (cb - shared).saturating_sub(differs),
+                    only_here: (co - shared).saturating_sub(differs),
+                    ratio: (*shared + differs) as f64 / cb.max(co) as f64,
                     also_listed: inside.len() as u64,
                     extra_bytes: (*bytes - listed).max(0),
                 })
@@ -600,6 +635,7 @@ fn info(v: &Vol, dir: &str, rules: &DupRules, lib: Option<&(i64, String)>) -> Op
             subfolders: below.len() as u64,
             taken_from: files.iter().filter_map(|r| r.taken).min(),
             taken_to: files.iter().filter_map(|r| r.taken).max(),
+            unreadable: files.iter().filter(|r| r.bad).count() as u64,
         },
         rank,
     ))
@@ -614,14 +650,16 @@ fn rows_in(conn: &Connection, f: &FolderRef) -> Result<(String, Vec<Rec>)> {
     let f = clean(f);
     let mount: String = conn.query_row("SELECT mount FROM volumes WHERE id = ?", [f.volume_id], |r| r.get(0))?;
     let mut st = conn.prepare(
-        "SELECT id, rel_path, size, COALESCE(prehash, hash), kind, taken_at FROM files
-         WHERE volume_id = ?1 AND rel_path >= ?2 AND rel_path < ?3 AND missing = 0 AND quarantined = 0 ORDER BY rel_path",
+        "SELECT f.id, f.rel_path, f.size, COALESCE(f.prehash, f.hash), f.kind, f.taken_at,
+                (a.file_id IS NOT NULL AND a.dhash IS NULL AND f.kind = 'photo')
+         FROM files f LEFT JOIN analysis a ON a.file_id = f.id
+         WHERE f.volume_id = ?1 AND f.rel_path >= ?2 AND f.rel_path < ?3 AND f.missing = 0 AND f.quarantined = 0 ORDER BY f.rel_path",
     )?;
     // Everything that starts with "dir/": up to the next character after '/'.
     let rows = st
         .query_map(params![f.volume_id, format!("{}/", f.rel_dir), format!("{}0", f.rel_dir)], |r| {
             let kind: String = r.get(4)?;
-            Ok(Rec { id: r.get(0)?, rel: r.get(1)?, size: r.get(2)?, key: r.get(3)?, video: kind == "video", taken: r.get(5)? })
+            Ok(Rec { id: r.get(0)?, rel: r.get(1)?, size: r.get(2)?, key: r.get(3)?, video: kind == "video", taken: r.get(5)?, bad: r.get(6)? })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok((mount, rows))
@@ -709,6 +747,378 @@ pub fn props(conn: &Connection, folder: &FolderRef) -> Result<FolderProps> {
     Ok(out)
 }
 
+/// One folder's file at one place of the walk-through.
+#[derive(Clone, Debug, Serialize)]
+pub struct AlignFile {
+    pub id: i64,
+    pub name: String,
+    pub size: i64,
+    /// The same content as the first file of its row (the original's, where it has one).
+    pub same: bool,
+    /// A photo the analysis could not open: likely damaged.
+    pub unreadable: bool,
+    pub video: bool,
+}
+
+/// One photo across the folders of a set: the original's file first, then each copy's (`None`
+/// where a folder has none). `kind`: "same" (all have it, all identical), "differs" (some file
+/// here is not the same content), "only" (identical where present, but a folder lacks it).
+#[derive(Clone, Debug, Serialize)]
+pub struct AlignRow {
+    pub path: String,
+    pub files: Vec<Option<AlignFile>>,
+    pub kind: String,
+}
+
+/// The folders of a set photo by photo, for looking at them side by side. A copy's file sits
+/// in the row of the original's file with the same content, else of the file at the same place
+/// (same photo by name, different content), else in a row of its own.
+pub fn align(conn: &Connection, keep: &FolderRef, copies: &[FolderRef]) -> Result<Vec<AlignRow>> {
+    let (_, k) = rows_in(conn, keep)?;
+    let kd = clean(keep).rel_dir;
+    let n = copies.len() + 1;
+    let file = |r: &Rec, same: bool| AlignFile { id: r.id, name: r.rel.rsplit('/').next().unwrap_or("").to_string(), size: r.size, same, unreadable: r.bad, video: r.video };
+    let mut rows: Vec<AlignRow> = k
+        .iter()
+        .map(|r| {
+            let mut files = vec![None; n];
+            files[0] = Some(file(r, true));
+            AlignRow { path: r.rel[kd.len() + 1..].to_string(), files, kind: String::new() }
+        })
+        .collect();
+    let at: HashMap<i64, usize> = k.iter().enumerate().map(|(i, r)| (r.id, i)).collect();
+    let kr: Vec<&Rec> = k.iter().collect();
+    // Rows only copies have, by place; and the content of the first file put in each.
+    let mut extra: HashMap<String, (usize, Option<String>, i64)> = HashMap::new();
+    for (j, c_ref) in copies.iter().enumerate() {
+        let (_, c) = rows_in(conn, c_ref)?;
+        let cd = clean(c_ref).rel_dir;
+        let cr: Vec<&Rec> = c.iter().collect();
+        let twin = twins(&kr, &kd, &cr, &cd);
+        let named = by_place(&kr, &kd, &cr, &cd, &twin);
+        for r in &c {
+            if let Some(t) = twin.get(&r.id) {
+                rows[at[&t.id]].files[j + 1] = Some(file(r, true));
+            } else if let Some(t) = named.get(&r.id) {
+                rows[at[&t.id]].files[j + 1] = Some(file(r, false));
+            } else {
+                let place = r.rel[cd.len() + 1..].to_string();
+                let (i, key, size) = extra.entry(place.to_lowercase()).or_insert_with(|| {
+                    rows.push(AlignRow { path: place.clone(), files: vec![None; n], kind: String::new() });
+                    (rows.len() - 1, r.key.clone(), r.size)
+                });
+                rows[*i].files[j + 1] = Some(file(r, r.key.is_some() && *key == r.key && *size == r.size));
+            }
+        }
+    }
+    for row in &mut rows {
+        // The same content opens — or does not — the same way in every folder: one "could not
+        // be opened" among identical files stands for all of them.
+        if row.files.iter().flatten().any(|f| f.same && f.unreadable) {
+            for f in row.files.iter_mut().flatten().filter(|f| f.same) {
+                f.unreadable = true;
+            }
+        }
+        let all_same = row.files.iter().flatten().all(|f| f.same);
+        let all_there = row.files.iter().all(|f| f.is_some());
+        row.kind = if !all_same { "differs" } else if !all_there { "only" } else { "same" }.into();
+    }
+    rows.sort_by_cached_key(|r| r.path.to_lowercase());
+    Ok(rows)
+}
+
+/// Where two files first differ.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct FirstDifference {
+    /// Offset of the first byte that differs (the shorter length if one is the start of the
+    /// other); `None` if the two are the same.
+    pub at: Option<u64>,
+    pub size_a: u64,
+    pub size_b: u64,
+    /// Of two files that differ: which one looks whole and which damaged — cut short, or with
+    /// empty stretches the other does not have. Both `None`: cannot be told from the bytes.
+    pub whole_a: Option<bool>,
+    pub whole_b: Option<bool>,
+}
+
+pub fn first_difference(conn: &Connection, a: i64, b: i64) -> Result<FirstDifference> {
+    use std::io::Read;
+    let path = |id: i64| -> Result<PathBuf> { Ok(db::get_file(conn, id)?.ok_or_else(|| anyhow::anyhow!("파일을 찾을 수 없습니다"))?.abs_path()) };
+    let (pa, pb) = (path(a)?, path(b)?);
+    let mut out = FirstDifference { at: None, size_a: fs::metadata(&pa)?.len(), size_b: fs::metadata(&pb)?.len(), ..Default::default() };
+    let (mut fa, mut fb) = (fs::File::open(&pa)?, fs::File::open(&pb)?);
+    let (mut ba, mut bb) = (vec![0u8; 1 << 20], vec![0u8; 1 << 20]);
+    let mut pos = 0u64;
+    loop {
+        let fill = |f: &mut fs::File, buf: &mut [u8]| -> std::io::Result<usize> {
+            let mut n = 0;
+            while n < buf.len() {
+                match f.read(&mut buf[n..])? {
+                    0 => break,
+                    m => n += m,
+                }
+            }
+            Ok(n)
+        };
+        let (x, y) = (fill(&mut fa, &mut ba)?, fill(&mut fb, &mut bb)?);
+        let both = x.min(y);
+        if let Some(i) = (0..both).find(|i| ba[*i] != bb[*i]) {
+            out.at = Some(pos + i as u64);
+            return Ok(out);
+        }
+        if x != y {
+            out.at = Some(pos + both as u64);
+            return Ok(out);
+        }
+        if x == 0 {
+            return Ok(out);
+        }
+        pos += x as u64;
+    }
+}
+
+/// How much of a file is empty: (4 KiB blocks of nothing but zero bytes, blocks in all).
+/// Photos and videos are compressed, so such stretches hardly occur in them — they are what a
+/// recovery tool or a broken copy leaves where data is missing. `None`: could not be read.
+fn empty_blocks(conn: &Connection, id: i64) -> Option<(u64, u64)> {
+    use std::io::Read;
+    let f = db::get_file(conn, id).ok().flatten()?;
+    let mut file = fs::File::open(f.abs_path()).ok()?;
+    let mut buf = vec![0u8; 1 << 16];
+    let (mut empty, mut blocks) = (0u64, 0u64);
+    loop {
+        let mut n = 0;
+        while n < buf.len() {
+            match file.read(&mut buf[n..]).ok()? {
+                0 => break,
+                m => n += m,
+            }
+        }
+        for block in buf[..n].chunks(4096) {
+            blocks += 1;
+            if block.len() == 4096 && block.iter().all(|b| *b == 0) {
+                empty += 1;
+            }
+        }
+        if n < buf.len() {
+            return Some((empty, blocks));
+        }
+    }
+}
+
+/// Of two files that differ, which one looks damaged: the one cut short (the other continues
+/// where it ends), or the one with clearly more empty stretches. Judged between the two — the
+/// same photo carries the same padding in both, so only what one of them lacks counts. (A
+/// decoder is no judge here: it draws a damaged JPEG without complaint.)
+fn judge(conn: &Connection, a: i64, b: i64, d: &mut FirstDifference) {
+    if d.size_a != d.size_b && d.at == Some(d.size_a.min(d.size_b)) {
+        (d.whole_a, d.whole_b) = (Some(d.size_a > d.size_b), Some(d.size_b > d.size_a));
+        return;
+    }
+    let (Some((ea, na)), Some((eb, nb))) = (empty_blocks(conn, a), empty_blocks(conn, b)) else { return };
+    let clearly = |more: u64, less: u64, blocks: u64| more > less + (blocks / 200).max(1);
+    if clearly(ea, eb, na) {
+        (d.whole_a, d.whole_b) = (Some(false), Some(true));
+    } else if clearly(eb, ea, nb) {
+        (d.whole_a, d.whole_b) = (Some(true), Some(false));
+    }
+}
+
+/// Compare two files to the end, and if they differ although the index took them for the same
+/// (same size, same first 64 KiB), teach the index: from then on they are different files
+/// everywhere. Returns where they first differ.
+pub fn check_pair(conn: &Connection, a: i64, b: i64) -> Result<FirstDifference> {
+    let mut d = first_difference(conn, a, b)?;
+    if d.at.is_some() {
+        judge(conn, a, b, &mut d);
+        let key = |id: i64| -> Option<String> { conn.query_row("SELECT COALESCE(prehash, hash) FROM files WHERE id = ?", [id], |r| r.get::<_, Option<String>>(0)).ok().flatten() };
+        if key(a).is_some() && key(a) == key(b) {
+            tell_apart(conn, a, b)?;
+        }
+    }
+    Ok(d)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Take the better file
+// ---------------------------------------------------------------------------------------------
+
+/// One photo decided between a copy folder and the folder that stays. The copy's file goes
+/// into the folder that stays — in place of `keep_file` (the copy's is the better one), or added
+/// (`None`: only the copy has it). With `discard` it is the other way round: `keep_file` is the
+/// good one, and the copy's differing file goes to the quarantine.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Choice {
+    pub keep_file: Option<i64>,
+    pub copy_file: i64,
+    #[serde(default)]
+    pub discard: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SwapGroup {
+    pub copy: FolderRef,
+    pub choices: Vec<Choice>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct SwapReport {
+    pub batch_id: String,
+    /// Files of the folder that stays replaced by the copy's (the old ones wait in the quarantine).
+    pub replaced: u64,
+    /// Files only a copy had, now in the folder that stays too.
+    pub brought: u64,
+    /// Copies' files that differed from the original's and were not wanted (in the quarantine).
+    pub discarded: u64,
+    pub failed: u64,
+    pub errors: Vec<String>,
+    pub cancelled: bool,
+}
+
+/// Copy the chosen files of copy folders into the folder that stays. A replaced file keeps its
+/// name and place and goes to the quarantine (undoable); the user's marks on it pass to the new
+/// file. The copies themselves stay where they are — removing the copy folder is another step,
+/// and by then the two folders agree on these photos.
+pub fn swap(db: &Db, keep: &FolderRef, groups: &[SwapGroup], stop: &StopFlag, progress: ProgressFn) -> Result<SwapReport> {
+    let conn = db.conn()?;
+    volumes::refresh(&conn)?;
+    let keep = clean(keep);
+    if library::location(&conn).is_some_and(|l| l.0 != keep.volume_id) {
+        anyhow::bail!("라이브러리 드라이브가 아니라서 건드리지 않았습니다");
+    }
+    let total: u64 = groups.iter().map(|g| g.choices.len() as u64).sum();
+    let replacing = groups.iter().any(|g| g.choices.iter().any(|c| c.keep_file.is_some() || c.discard));
+    // With replaced files in its quarantine the batch is a deletion (it can be emptied); else
+    // it only added files.
+    let batch = journal::new_batch(&conn, if replacing { "delete" } else { "organize" }, "복사본의 사진을 원본 폴더로")?;
+    let mut rep = SwapReport { batch_id: batch.clone(), ..Default::default() };
+    let mut done = 0u64;
+    'all: for g in groups {
+        let cd = clean(&g.copy);
+        for ch in &g.choices {
+            if stop.is_stopped() {
+                rep.cancelled = true;
+                break 'all;
+            }
+            done += 1;
+            progress(Progress::new("cleanup:swap", "copy", done, total, ""));
+            match crate::guarded("사진 교체", || swap_one(&conn, &batch, &keep, &cd, ch)) {
+                Ok(Done::Replaced) => rep.replaced += 1,
+                Ok(Done::Brought) => rep.brought += 1,
+                Ok(Done::Discarded) => rep.discarded += 1,
+                Err(e) => {
+                    rep.failed += 1;
+                    if rep.errors.len() < 100 {
+                        rep.errors.push(e.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if rep.replaced > 0 {
+        parts.push(format!("사진 {}장을 복사본 것으로 교체", rep.replaced));
+    }
+    if rep.brought > 0 {
+        parts.push(format!("{}장을 원본 폴더로 가져옴", rep.brought));
+    }
+    if rep.discarded > 0 {
+        parts.push(format!("원본과 다른 복사본 {}장을 격리", rep.discarded));
+    }
+    let what = if parts.is_empty() { "사진 고르기".to_string() } else { parts.join(", ") };
+    conn.execute("UPDATE batches SET description = ? WHERE id = ?", params![what, batch])?;
+    journal::finish_batch(&conn, &batch)?;
+    if rep.replaced + rep.brought + rep.discarded == 0 {
+        conn.execute("DELETE FROM batches WHERE id = ? AND op_count = 0", [&batch])?;
+        rep.batch_id.clear();
+    }
+    Ok(rep)
+}
+
+enum Done {
+    Replaced,
+    Brought,
+    Discarded,
+}
+
+fn swap_one(conn: &Connection, batch: &str, keep: &FolderRef, cd: &FolderRef, ch: &Choice) -> Result<Done> {
+    let live = |id: i64| -> Result<db::FileRow> { db::get_file(conn, id)?.filter(|f| !f.quarantined && !f.missing && f.online).ok_or_else(|| anyhow::anyhow!("파일을 찾을 수 없습니다")) };
+    let inside = |f: &db::FileRow, d: &FolderRef| f.volume_id == d.volume_id && f.rel_path.starts_with(&format!("{}/", d.rel_dir));
+    let c = live(ch.copy_file)?;
+    if cd.volume_id != keep.volume_id || !inside(&c, cd) || !c.abs_path().is_file() {
+        anyhow::bail!("복사본 폴더의 파일이 아닙니다: {}", c.name);
+    }
+    if ch.discard {
+        // Only with the original's file there to stay: a photo is never discarded on its own.
+        let k = live(ch.keep_file.ok_or_else(|| anyhow::anyhow!("원본 폴더에 남는 파일이 없습니다"))?)?;
+        if !inside(&k, keep) || !k.abs_path().is_file() {
+            anyhow::bail!("원본 폴더의 파일이 아닙니다: {}", k.name);
+        }
+        journal::quarantine(conn, batch, &c)?;
+        return Ok(Done::Discarded);
+    }
+    match ch.keep_file {
+        Some(kid) => {
+            let k = live(kid)?;
+            if !inside(&k, keep) {
+                anyhow::bail!("원본 폴더의 파일이 아닙니다: {}", k.name);
+            }
+            let (dst, rel) = (k.abs_path(), k.rel_path.clone());
+            journal::quarantine_parked(conn, batch, &k)?;
+            match journal::copy_indexed(conn, batch, &c, &dst, k.volume_id, &rel) {
+                Ok(new) => {
+                    conn.execute("INSERT OR IGNORE INTO labels(file_id, label, source) SELECT ?2, label, source FROM labels WHERE file_id = ?1 AND source = 'user'", params![k.id, new])?;
+                    Ok(Done::Replaced)
+                }
+                Err(e) => {
+                    // Nothing took its place: the old file goes back.
+                    journal::restore_quarantined(conn, batch, k.id)?;
+                    Err(e)
+                }
+            }
+        }
+        None => {
+            // The same place inside the folder; a free name if that one is taken.
+            let inner = &c.rel_path[cd.rel_dir.len() + 1..];
+            let taken = |rel: &str| -> Result<bool> {
+                let row: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM files WHERE volume_id = ? AND rel_path = ?)", params![keep.volume_id, rel], |r| r.get(0))?;
+                Ok(row || volumes::join_rel(Path::new(&c.mount), rel).exists())
+            };
+            let mut rel = format!("{}/{inner}", keep.rel_dir);
+            let mut n = 2;
+            while taken(&rel)? {
+                rel = match inner.rsplit_once('.') {
+                    Some((stem, ext)) if !stem.ends_with('/') && !ext.contains('/') => format!("{}/{stem} ({n}).{ext}", keep.rel_dir),
+                    _ => format!("{}/{inner} ({n})", keep.rel_dir),
+                };
+                n += 1;
+            }
+            journal::copy_indexed(conn, batch, &c, &volumes::join_rel(Path::new(&c.mount), &rel), keep.volume_id, &rel)?;
+            Ok(Done::Brought)
+        }
+    }
+}
+
+/// Sets the user has looked through (by the folder that stays: "volume:folder").
+pub fn reviewed(conn: &Connection) -> Result<Vec<String>> {
+    use rusqlite::OptionalExtension;
+    let v: Option<String> = conn.query_row("SELECT value FROM settings WHERE key = 'folders_reviewed'", [], |r| r.get(0)).optional()?;
+    Ok(v.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default())
+}
+
+pub fn set_reviewed(conn: &Connection, key: &str, on: bool) -> Result<Vec<String>> {
+    let mut all = reviewed(conn)?;
+    all.retain(|k| k != key);
+    if on {
+        all.push(key.to_string());
+    }
+    // Old marks fall off the front.
+    let from = all.len().saturating_sub(5000);
+    let all = all.split_off(from);
+    conn.execute("INSERT INTO settings(key, value) VALUES ('folders_reviewed', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [serde_json::to_string(&all)?])?;
+    Ok(all)
+}
+
 // ---------------------------------------------------------------------------------------------
 // Remove
 // ---------------------------------------------------------------------------------------------
@@ -744,7 +1154,8 @@ pub struct FolderRemoveReport {
     /// Deleted for good (`purged`), else the size waiting in the quarantine.
     pub bytes: i64,
     pub purged: bool,
-    /// Left in the quarantine: not byte-identical to the file that stays after all.
+    /// Compared with the file that stays and found different after all: put back where they
+    /// were, and from now on known as different files (to look at side by side).
     pub different: u64,
     /// Files that are not photos or videos, deleted because the folder that stays has the same
     /// file at the same place (and `Thumbs.db` and the like).
@@ -761,6 +1172,18 @@ pub struct FolderRemoveReport {
     pub cancelled: bool,
     /// Deleted after the quick check (parts of each file compared) instead of the full one.
     pub quick: bool,
+    /// Where the files that turned out different are: pairs of folders to look at side by side.
+    pub to_review: Vec<ReviewPair>,
+}
+
+/// A copy folder left with files that differ from the original's, and that original folder.
+#[derive(Clone, Debug, Serialize)]
+pub struct ReviewPair {
+    pub keep: FolderRef,
+    pub keep_path: String,
+    pub copy: FolderRef,
+    pub copy_path: String,
+    pub files: u64,
 }
 
 /// How the copies go: `purge` deletes them once compared with their twins (else they wait in
@@ -806,7 +1229,7 @@ pub fn remove_with(db: &Db, picks: &[Pick], opts: &RemoveOptions, stop: &StopFla
     };
     let batch = journal::new_batch(&conn, "copies", &label(picks.len() as u64))?;
     let mut rep = FolderRemoveReport { batch_id: batch.clone(), purged: purge, quick, ..Default::default() };
-    let mut run = Run { conn: &conn, vols: &vols, rules: &rules, lib_vol, batch: &batch, purge, stop, progress, gone: HashSet::new(), done: 0, total };
+    let mut run = Run { conn: &conn, vols: &vols, rules: &rules, lib_vol, batch: &batch, purge, stop, progress, gone: HashSet::new(), done: 0, total, emptied: Vec::new() };
     for p in &picks {
         if stop.is_stopped() {
             rep.cancelled = true;
@@ -826,6 +1249,7 @@ pub fn remove_with(db: &Db, picks: &[Pick], opts: &RemoveOptions, stop: &StopFla
             }
         }
     }
+    let run_emptied = std::mem::take(&mut run.emptied);
     conn.execute("UPDATE batches SET description = ? WHERE id = ?", params![label(rep.folders + rep.partial), batch])?;
     journal::finish_batch(&conn, &batch)?;
     if rep.files == 0 {
@@ -834,10 +1258,44 @@ pub fn remove_with(db: &Db, picks: &[Pick], opts: &RemoveOptions, stop: &StopFla
     } else if purge && !rep.cancelled {
         let p = journal::purge_batch_opts(&conn, &batch, quick, stop, progress)?;
         rep.bytes = p.bytes;
-        rep.different = p.kept;
         rep.failed += p.failed;
-        rep.errors.extend(p.errors);
         rep.cancelled |= p.cancelled;
+        if p.kept > 0 && !p.cancelled {
+            // What was not deleted goes back to its place: files that turned out different are
+            // the user's to look at, not to sit in a quarantine. The two get fingerprints that
+            // tell them apart, so nothing takes them for the same file again.
+            let back = journal::undo_batch(&conn, &batch)?;
+            conn.execute("UPDATE batches SET state = 'purged' WHERE id = ? AND NOT EXISTS (SELECT 1 FROM journal WHERE batch_id = ?1 AND undone = 0)", [&batch])?;
+            rep.files = rep.files.saturating_sub(back.restored);
+            rep.failed += back.failed;
+            rep.errors.extend(back.errors);
+            rep.errors.extend(p.errors.iter().filter(|e| !e.ends_with("남겨 둠")).cloned());
+            for (a, b) in &p.differing {
+                if !tell_apart(&conn, *a, *b)? {
+                    continue;
+                }
+                rep.different += 1;
+                // Which of the picks it belongs to: that pair of folders is worth a look.
+                let Some(f) = db::get_file(&conn, *a)? else { continue };
+                let Some(pick) = picks.iter().find(|p| p.copy.volume_id == f.volume_id && f.rel_path.starts_with(&format!("{}/", p.copy.rel_dir))) else { continue };
+                match rep.to_review.iter_mut().find(|r| r.copy.rel_dir == pick.copy.rel_dir && r.copy.volume_id == pick.copy.volume_id) {
+                    Some(r) => r.files += 1,
+                    None => {
+                        let at = |d: &FolderRef| volumes::join_rel(Path::new(&f.mount), &d.rel_dir).to_string_lossy().into_owned();
+                        rep.to_review.push(ReviewPair { keep: pick.keep.clone(), keep_path: at(&pick.keep), copy: pick.copy.clone(), copy_path: at(&pick.copy), files: 1 });
+                    }
+                }
+            }
+            for dir in &run_emptied {
+                if dir.exists() {
+                    rep.folders = rep.folders.saturating_sub(1);
+                    rep.partial += 1;
+                }
+            }
+        } else {
+            rep.different = p.kept;
+            rep.errors.extend(p.errors);
+        }
     }
     Ok(rep)
 }
@@ -855,6 +1313,27 @@ struct Run<'a> {
     gone: HashSet<i64>,
     done: u64,
     total: u64,
+    /// Copy folders that were gone when their pick was done.
+    emptied: Vec<PathBuf>,
+}
+
+/// Two files that share a fingerprint (same size, same first 64 KiB) but were found to differ:
+/// read both in full and extend their fingerprints by their own hash. `true` if they do differ.
+fn tell_apart(conn: &Connection, a: i64, b: i64) -> Result<bool> {
+    let hash = |id: i64| -> Option<String> { db::get_file(conn, id).ok().flatten().filter(|f| !f.quarantined && !f.missing).and_then(|f| journal::hash_file(&f.abs_path()).ok()) };
+    let (Some(ha), Some(hb)) = (hash(a), hash(b)) else { return Ok(false) };
+    if ha == hb {
+        return Ok(false);
+    }
+    for (id, h) in [(a, &ha), (b, &hb)] {
+        conn.execute(
+            "UPDATE files SET hash = ?1, prehash = CASE WHEN prehash IS NULL THEN NULL
+                 ELSE (CASE WHEN instr(prehash, '~') > 0 THEN substr(prehash, 1, instr(prehash, '~') - 1) ELSE prehash END) || '~' || substr(?1, 1, 16) END
+             WHERE id = ?2",
+            params![h, id],
+        )?;
+    }
+    Ok(true)
 }
 
 impl Run<'_> {
@@ -948,6 +1427,7 @@ impl Run<'_> {
             rep.partial += 1;
         } else {
             rep.folders += 1;
+            self.emptied.push(copy_abs.clone());
             // Folders that held nothing but the copy (`백업/여행/…`) go with it.
             if let Some(up) = copy_abs.parent() {
                 journal::prune_empty_dirs(up, Path::new(&v.mount));

@@ -186,6 +186,8 @@ export interface CopyFolderInfo {
   volume_id: number; rel_dir: string; abs_path: string; created: number | null; modified: number | null;
   keep_rule: boolean; filed: boolean; names: string;
   photos: number; videos: number; bytes: number; subfolders: number; taken_from: number | null; taken_to: number | null;
+  /** Photos the analysis could not open (likely damaged). */
+  unreadable: number;
 }
 export interface CopyFolderSet {
   keep: CopyFolderInfo; keep_why: "keep_rule" | "filed" | "oldest" | ""; copies: CopyFolderInfo[];
@@ -193,6 +195,8 @@ export interface CopyFolderSet {
 }
 export interface NearFolder {
   info: CopyFolderInfo; shared: number; shared_bytes: number; only_base: number; only_here: number; ratio: number;
+  /** Same place, different content: the photos to look at side by side. */
+  differs: number;
   /** Folders inside that are also listed as 100 % copies, and the size not already counted there. */
   also_listed: number; extra_bytes: number;
 }
@@ -203,10 +207,22 @@ export interface CopyFolderPick { keep: FolderRef; copy: FolderRef; partial: boo
 export interface FolderFiles { dir: string; ids: number[] }
 export interface FolderCompare { shared: [number, number][]; only_keep: number[]; only_copy: number[] }
 export interface FolderProps { other_files: number; other_bytes: number; examples: string[] }
+/** One folder's file at one place of the side-by-side walk. `same`: the same content as the row's first file. */
+export interface AlignFile { id: number; name: string; size: number; same: boolean; unreadable: boolean; video: boolean }
+/** One photo across the folders of a set (the original's file first; null where a folder has none). */
+export interface AlignRow { path: string; files: (AlignFile | null)[]; kind: "same" | "differs" | "only" }
+/** `whole_*`: of two files that differ, whether each looks whole — no empty stretches, a proper end (null: unknown). */
+export interface FirstDifference { at: number | null; size_a: number; size_b: number; whole_a: boolean | null; whole_b: boolean | null }
+/** `discard`: the original's file is the good one — the copy's differing file goes to the quarantine. */
+export interface SwapChoice { keep_file: number | null; copy_file: number; discard?: boolean }
+export interface SwapGroup { copy: FolderRef; choices: SwapChoice[] }
+export interface SwapReport { batch_id: string; replaced: number; brought: number; discarded: number; failed: number; errors: string[]; cancelled: boolean }
 export interface CopyFolderReport {
   batch_id: string; folders: number; partial: number; skipped: number; skipped_why: string[]; files: number; bytes: number; purged: boolean;
   different: number; other_deleted: number; left: number; left_examples: string[]; unique_left: number; labels_moved: number;
   failed: number; errors: string[]; cancelled: boolean; quick: boolean;
+  /** Folder pairs left with files that turned out different: to look at side by side. */
+  to_review: { keep: FolderRef; keep_path: string; copy: FolderRef; copy_path: string; files: number }[];
 }
 export interface ExecReport {
   batch_id: string; done: number; failed: number; bytes: number; sidecars: number; removed: number; removed_bytes: number;
@@ -364,6 +380,11 @@ export const api = {
   folderFiles: (folder: FolderRef) => invoke<FolderFiles[]>("folder_files", { folder }),
   folderCompare: (keep: FolderRef, copy: FolderRef) => invoke<FolderCompare>("folder_compare", { keep, copy }),
   folderProps: (folder: FolderRef) => invoke<FolderProps>("folder_props", { folder }),
+  folderAlign: (keep: FolderRef, copies: FolderRef[]) => invoke<AlignRow[]>("folder_align", { keep, copies }),
+  folderFirstDifference: (a: number, b: number) => invoke<FirstDifference>("folder_first_difference", { a, b }),
+  startFolderSwap: (keep: FolderRef, groups: SwapGroup[]) => invoke<void>("start_folder_swap", { keep, groups }),
+  foldersReviewed: () => invoke<string[]>("folders_reviewed"),
+  setFolderReviewed: (key: string, on: boolean) => invoke<string[]>("set_folder_reviewed", { key, on }),
   planTree: (planId: string) => invoke<TreeNode[]>("plan_tree", { planId }),
   getLibraryRules: () => invoke<FolderRule[]>("get_library_rules"),
   setLibraryRules: (rules: FolderRule[]) => invoke<void>("set_library_rules", { rules }),

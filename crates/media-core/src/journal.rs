@@ -221,6 +221,46 @@ pub fn quarantine_copy(conn: &Connection, batch: &str, file: &db::FileRow, twin:
     quarantine_rec(conn, batch, file, Some(twin))
 }
 
+/// Quarantine a file whose place another file takes (an original replaced by a better copy).
+/// Its index row lets go of the path — the new file needs it — and gets it back from the
+/// journal if the quarantine is undone.
+pub fn quarantine_parked(conn: &Connection, batch: &str, file: &db::FileRow) -> Result<()> {
+    quarantine_rec(conn, batch, file, None)?;
+    conn.execute("UPDATE files SET rel_path = ? WHERE id = ?", params![format!("\u{1}replaced/{batch}/{}", file.id), file.id])?;
+    Ok(())
+}
+
+/// Put one quarantined file of a batch back where it was (the step that needed its place failed).
+pub fn restore_quarantined(conn: &Connection, batch: &str, file_id: i64) -> Result<()> {
+    let (jid, src, dst, vol, rel): (i64, String, String, i64, String) = conn.query_row(
+        "SELECT id, src_abs, dst_abs, src_volume, src_rel FROM journal WHERE batch_id = ? AND file_id = ? AND op = 'quarantine' AND undone = 0",
+        params![batch, file_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+    )?;
+    unquarantine(conn, batch, file_id, Path::new(&src), Path::new(&dst), vol, &rel)?;
+    conn.execute("DELETE FROM journal WHERE id = ?", [jid])?;
+    Ok(())
+}
+
+/// Move a quarantined file back to `src` and give its row that place again. Refuses when
+/// something else is there now: the file that took its place stays.
+fn unquarantine(conn: &Connection, batch_id: &str, file_id: i64, src: &Path, dst: &Path, vol: i64, rel: &str) -> Result<()> {
+    let taken: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM files WHERE volume_id = ? AND rel_path = ? AND id != ?)", params![vol, rel, file_id], |r| r.get(0))?;
+    if src.exists() || taken {
+        bail!("원래 위치에 같은 이름의 파일이 있습니다: {}", src.display());
+    }
+    if let Some(p) = src.parent() {
+        fs::create_dir_all(p)?;
+    }
+    fs::rename(dst, src)?;
+    let name = src.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    conn.execute("UPDATE files SET quarantined = 0, missing = 0, volume_id = ?, rel_path = ?, name = ? WHERE id = ?", params![vol, rel, name, file_id])?;
+    if let Some(qroot) = dst.ancestors().find(|a| a.file_name().map(|n| n == batch_id).unwrap_or(false)) {
+        prune_empty_dirs(dst.parent().unwrap_or(qroot), qroot.parent().unwrap_or(qroot));
+    }
+    Ok(())
+}
+
 fn quarantine_rec(conn: &Connection, batch: &str, file: &db::FileRow, twin: Option<i64>) -> Result<()> {
     if !file.online {
         bail!("드라이브가 연결되어 있지 않습니다: {}", file.name);
@@ -517,19 +557,7 @@ pub fn undo_batch(conn: &Connection, batch_id: &str) -> Result<UndoReport> {
         let (src, dst) = (PathBuf::from(&e.src_abs), PathBuf::from(&e.dst_abs));
         let res: Result<()> = (|| {
             match e.op.as_str() {
-                "quarantine" => {
-                    if src.exists() {
-                        bail!("원래 위치에 같은 이름의 파일이 있습니다: {}", src.display());
-                    }
-                    if let Some(p) = src.parent() {
-                        fs::create_dir_all(p)?;
-                    }
-                    fs::rename(&dst, &src)?;
-                    conn.execute("UPDATE files SET quarantined = 0, missing = 0 WHERE id = ?", [e.file_id])?;
-                    if let Some(qroot) = dst.ancestors().find(|a| a.file_name().map(|n| n == batch_id).unwrap_or(false)) {
-                        prune_empty_dirs(dst.parent().unwrap_or(qroot), qroot.parent().unwrap_or(qroot));
-                    }
-                }
+                "quarantine" => unquarantine(conn, batch_id, e.file_id, &src, &dst, e.src_volume, &e.src_rel)?,
                 "move" => {
                     move_file(&dst, &src)?;
                     let name = src.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -632,6 +660,8 @@ pub struct PurgeReport {
     pub cancelled: bool,
     /// Compared by the quick check (parts of each file) instead of all of it.
     pub quick: bool,
+    /// Of the kept: copies compared with their twin and found different (copy, twin).
+    pub differing: Vec<(i64, i64)>,
 }
 
 /// Permanently delete a batch's quarantined files. A copy quarantined with its twin
@@ -679,6 +709,9 @@ pub fn purge_batch_opts(conn: &Connection, batch_id: &str, quick: bool, stop: &c
                 _ => false,
             };
             if !same {
+                if twin_path.is_some() && p.exists() {
+                    rep.differing.push((file_id, twin));
+                }
                 rep.kept += 1;
                 if rep.errors.len() < 200 {
                     rep.errors.push(format!("{}: 원본과 내용이 같은지 확인하지 못해 남겨 둠", dst));

@@ -1,18 +1,15 @@
 import { useEffect, useMemo, useState } from "react";
-import { api, fmtCount, thumbUrl, type CopyFolderInfo, type FolderCompare, type FolderFiles, type GridItem } from "../api";
+import { api, fmtCount, thumbUrl, type CopyFolderInfo, type FolderFiles, type GridItem } from "../api";
 import Viewer from "./Viewer";
 
 const PAGE = 200;
 const ref = (f: CopyFolderInfo) => ({ volume_id: f.volume_id, rel_dir: f.rel_dir });
 
-export type Peek =
-  | { kind: "files"; folder: CopyFolderInfo; role: string }
-  | { kind: "compare"; keep: CopyFolderInfo; copy: CopyFolderInfo };
+export interface Peek { kind: "files"; folder: CopyFolderInfo; role: string }
 
 /**
- * Look inside a folder before deciding: all its photos and videos (sub-folder by sub-folder), or
- * two folders side by side — what both have, what only the original has, what only the copy has.
- * A click on a photo opens it large (videos play).
+ * Look inside a folder before deciding: all its photos and videos, sub-folder by sub-folder. A
+ * click on a photo opens it large (videos play). (Two folders side by side: `FolderWalk`.)
  */
 export default function FolderPeek({ peek, onClose }: { peek: Peek; onClose: () => void }) {
   const [view, setView] = useState<{ items: GridItem[]; index: number } | null>(null);
@@ -27,7 +24,7 @@ export default function FolderPeek({ peek, onClose }: { peek: Peek; onClose: () 
   return (
     <div className="send-back" onClick={onClose}>
       <div className="card sel-preview fp" onClick={(e) => e.stopPropagation()}>
-        {peek.kind === "files" ? <Files folder={peek.folder} role={peek.role} open={open} onClose={onClose} /> : <Side keep={peek.keep} copy={peek.copy} open={open} onClose={onClose} />}
+        <Files folder={peek.folder} role={peek.role} open={open} onClose={onClose} />
       </div>
       {view && (
         <div onClick={(e) => e.stopPropagation()}>
@@ -82,70 +79,6 @@ function Files({ folder, role, open, onClose }: { folder: CopyFolderInfo; role: 
         </div>
       ))}
       {total > shown && <button className="btn small" onClick={() => setShown((n) => n + PAGE)}>더 보기 ({fmtCount(total - shown)}개 남음)</button>}
-    </>
-  );
-}
-
-function Side({ keep, copy, open, onClose }: { keep: CopyFolderInfo; copy: CopyFolderInfo; open: Open; onClose: () => void }) {
-  const [cmp, setCmp] = useState<FolderCompare | null>(null);
-  const [tab, setTab] = useState<"shared" | "keep" | "copy">("shared");
-  const [shown, setShown] = useState(PAGE);
-  useEffect(() => {
-    setCmp(null);
-    api.folderCompare(ref(keep), ref(copy)).then((c) => {
-      setCmp(c);
-      // Open on what differs, if anything does: that is what the user came to see.
-      setTab(c.only_copy.length ? "copy" : c.only_keep.length ? "keep" : "shared");
-    }).catch(() => setCmp({ shared: [], only_keep: [], only_copy: [] }));
-  }, [keep, copy]);
-  useEffect(() => setShown(PAGE), [tab]);
-  const n = cmp ? { shared: cmp.shared.length, keep: cmp.only_keep.length, copy: cmp.only_copy.length } : null;
-  const same = n != null && n.keep === 0 && n.copy === 0;
-  const pairs = cmp?.shared.slice(0, shown) ?? [];
-  const keepIds = pairs.map((p) => p[0]);
-  const copyIds = pairs.map((p) => p[1]);
-  const single = (tab === "keep" ? cmp?.only_keep : cmp?.only_copy)?.slice(0, shown) ?? [];
-  const count = tab === "shared" ? n?.shared ?? 0 : tab === "keep" ? n?.keep ?? 0 : n?.copy ?? 0;
-  return (
-    <>
-      <div className="row-between">
-        <h3>두 폴더 나란히 비교</h3>
-        <button className="btn small ghost" onClick={onClose}>닫기</button>
-      </div>
-      <div className="fp-two">
-        <div><span className="cf-tag keep">원본 · 남김</span><div className="fp-path mono">{keep.abs_path}</div></div>
-        <div><span className="cf-tag go">복사본</span><div className="fp-path mono">{copy.abs_path}</div></div>
-      </div>
-      {!cmp && <div className="muted small">비교하는 중…</div>}
-      {n && (
-        <>
-          <div className={`alert ${same ? "ok" : "warn"} small`}>
-            {same
-              ? `두 폴더의 사진·영상 ${fmtCount(n.shared)}개가 전부 같습니다.`
-              : `같은 것 ${fmtCount(n.shared)}개 · 원본에만 ${fmtCount(n.keep)}개 · 복사본에만 ${fmtCount(n.copy)}개. 지우는 것은 "양쪽에 있음"뿐이고, 복사본에만 있는 것은 그 폴더에 남습니다.`}
-          </div>
-          <div className="fp-tabs">
-            <button className={`fp-tab ${tab === "shared" ? "on" : ""}`} onClick={() => setTab("shared")}>양쪽에 있음 ({fmtCount(n.shared)})</button>
-            <button className={`fp-tab ${tab === "keep" ? "on" : ""}`} onClick={() => setTab("keep")}>원본에만 ({fmtCount(n.keep)})</button>
-            <button className={`fp-tab ${tab === "copy" ? "on" : ""}`} onClick={() => setTab("copy")}>복사본에만 ({fmtCount(n.copy)})</button>
-          </div>
-          {tab === "shared" ? (
-            <div className="fp-pairs">
-              {pairs.map(([k, c]) => (
-                <div key={c} className="fp-pair">
-                  <Tile id={k} around={keepIds} open={open} />
-                  <span className="muted">=</span>
-                  <Tile id={c} around={copyIds} open={open} />
-                </div>
-              ))}
-            </div>
-          ) : (
-            <div className="keep-grid">{single.map((id) => <Tile key={id} id={id} around={single} open={open} />)}</div>
-          )}
-          {count === 0 && <div className="muted small">없습니다.</div>}
-          {count > shown && <button className="btn small" onClick={() => setShown((x) => x + PAGE)}>더 보기 ({fmtCount(count - shown)}개 남음)</button>}
-        </>
-      )}
     </>
   );
 }

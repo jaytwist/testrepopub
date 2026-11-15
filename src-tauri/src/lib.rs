@@ -1263,6 +1263,44 @@ fn folder_compare(state: State<'_, AppState>, keep: media_core::folders::FolderR
     media_core::folders::compare(&conn, &keep, &copy).map_err(err)
 }
 
+/// The folders of a set photo by photo, for looking at them side by side.
+#[tauri::command(async)]
+fn folder_align(state: State<'_, AppState>, keep: media_core::folders::FolderRef, copies: Vec<media_core::folders::FolderRef>) -> CmdResult<Vec<media_core::folders::AlignRow>> {
+    let conn = state.db.conn().map_err(err)?;
+    media_core::folders::align(&conn, &keep, &copies).map_err(err)
+}
+
+/// Compare two files to the end: where they first differ, if they do (the index then learns
+/// that they are different files).
+#[tauri::command(async)]
+fn folder_first_difference(state: State<'_, AppState>, a: i64, b: i64) -> CmdResult<media_core::folders::FirstDifference> {
+    let conn = state.db.conn().map_err(err)?;
+    media_core::folders::check_pair(&conn, a, b).map_err(err)
+}
+
+/// Take the chosen files of copy folders into the folder that stays (replace or add).
+#[tauri::command]
+fn start_folder_swap(app: AppHandle, state: State<AppState>, keep: media_core::folders::FolderRef, groups: Vec<media_core::folders::SwapGroup>) -> CmdResult<()> {
+    spawn_job(&app, &state, "cleanup:swap", move |st, progress| {
+        let r = media_core::folders::swap(&st.db, &keep, &groups, &st.stop, progress)?;
+        st.plans.locked().clear();
+        Ok(r)
+    })
+}
+
+/// Sets the user has looked through.
+#[tauri::command]
+fn folders_reviewed(state: State<AppState>) -> CmdResult<Vec<String>> {
+    let conn = state.db.conn().map_err(err)?;
+    media_core::folders::reviewed(&conn).map_err(err)
+}
+
+#[tauri::command]
+fn set_folder_reviewed(state: State<AppState>, key: String, on: bool) -> CmdResult<Vec<String>> {
+    let conn = state.db.conn().map_err(err)?;
+    media_core::folders::set_reviewed(&conn, &key, on).map_err(err)
+}
+
 /// What else a folder holds on disk (files that are not photos or videos).
 #[tauri::command(async)]
 fn folder_props(state: State<'_, AppState>, folder: media_core::folders::FolderRef) -> CmdResult<media_core::folders::FolderProps> {
@@ -1604,6 +1642,11 @@ pub fn run() {
             folder_files,
             folder_compare,
             folder_props,
+            folder_align,
+            folder_first_difference,
+            start_folder_swap,
+            folders_reviewed,
+            set_folder_reviewed,
             start_remove_copy_folders,
             open_folder,
         ])

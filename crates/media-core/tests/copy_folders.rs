@@ -192,17 +192,31 @@ fn a_file_that_only_looks_the_same_is_not_deleted() {
 
     let found = folders::find(&conn).unwrap();
     assert_eq!(found.sets.len(), 1, "by fingerprint they are the same: {:#?}", found.sets);
+    // Looked at side by side they are "the same" too — until the pair is compared to the end.
+    let same_fp = |conn: &media_core::rusqlite::Connection| -> bool {
+        conn.query_row("SELECT COUNT(DISTINCT prehash) = 1 FROM files WHERE name = 'v.jpg'", [], |r| r.get(0)).unwrap()
+    };
+    assert!(same_fp(&conn));
     let rep = folders::remove(&db, &picks(&found.sets[0]), true, &stop, &quiet).unwrap();
-    assert_eq!((rep.files, rep.different), (2, 1), "{rep:?}");
+    assert_eq!((rep.files, rep.different, rep.folders, rep.partial, rep.failed), (1, 1, 0, 1, 0), "{rep:?}");
     assert!(e.join("원본/v.jpg").is_file() && e.join("원본/w.jpg").is_file());
-    let waiting: Vec<String> = walk(&e).into_iter().filter(|p| p.contains(&rep.batch_id)).collect();
-    assert_eq!(waiting.len(), 1, "the different one waits in the quarantine: {waiting:?}");
-    assert!(waiting[0].ends_with("복사/v.jpg"));
-    assert_eq!(fs::read(&waiting[0]).unwrap()[99_999], 9);
-    // And it can be put back.
-    let undo = media_core::journal::undo_batch(&conn, &rep.batch_id).unwrap();
-    assert_eq!(undo.failed, 0, "{undo:?}");
-    assert!(e.join("복사/v.jpg").is_file());
+    assert_eq!(rep.to_review.iter().map(|r| (r.keep.rel_dir.as_str(), r.copy.rel_dir.as_str(), r.files)).collect::<Vec<_>>(), [("원본", "복사", 1)]);
+    // The one that differs is back where it was — not hidden in a quarantine — and unchanged.
+    assert!(!walk(&e).iter().any(|p| p.contains(".media-organizer-quarantine")), "{:?}", walk(&e));
+    assert_eq!(fs::read(e.join("복사/v.jpg")).unwrap()[99_999], 9);
+    assert!(!e.join("복사/w.jpg").exists(), "the real copy is gone");
+    // From now on the two are different files to everything: no longer a set, and side by
+    // side they show as the same photo with different content.
+    let fp = |rel: &str| -> String { conn.query_row("SELECT prehash FROM files WHERE rel_path = ?", [rel], |r| r.get(0)).unwrap() };
+    assert_ne!(fp("원본/v.jpg"), fp("복사/v.jpg"));
+    assert!(folders::find(&conn).unwrap().sets.is_empty());
+    let vol: i64 = conn.query_row("SELECT volume_id FROM sources LIMIT 1", [], |r| r.get(0)).unwrap();
+    let r = |d: &str| FolderRef { volume_id: vol, rel_dir: d.into() };
+    let rows = folders::align(&conn, &r("원본"), &[r("복사")]).unwrap();
+    assert_eq!(rows.iter().map(|x| (x.path.as_str(), x.kind.as_str())).collect::<Vec<_>>(), [("v.jpg", "differs"), ("w.jpg", "only")]);
+    let ids: Vec<i64> = rows[0].files.iter().flatten().map(|f| f.id).collect();
+    let d = folders::first_difference(&conn, ids[0], ids[1]).unwrap();
+    assert_eq!((d.at, d.size_a, d.size_b), (Some(99_999), 100_000, 100_000));
 }
 
 #[test]
@@ -303,7 +317,7 @@ fn almost_the_same_folders_are_listed_apart() {
         blob(&a.join(format!("파리/p{i}.jpg")), 100 + i);
     }
     sleep(Duration::from_millis(30));
-    // B: one photo missing, one of its own (29 of 30 the same). C: three missing (27 of 30).
+    // B: one photo missing, one of its own (29 of 30 the same). C: three missing, one of its own (27 of 30).
     let b = e.join("백업/유럽 사본");
     copy_tree(&a, &b);
     fs::remove_file(b.join("a19.jpg")).unwrap();
@@ -314,6 +328,7 @@ fn almost_the_same_folders_are_listed_apart() {
     for n in ["a17.jpg", "a18.jpg", "a19.jpg"] {
         fs::remove_file(c.join(n)).unwrap();
     }
+    blob(&c.join("c_only.jpg"), 201); // (with nothing of its own it would be listed as contained)
 
     let db = Db::open(tmp.path().join("app/library.db")).unwrap();
     let conn = db.conn().unwrap();
@@ -336,7 +351,7 @@ fn almost_the_same_folders_are_listed_apart() {
     let at90 = folders::find_with(&conn, 0.90).unwrap();
     assert_eq!(at90.near.len(), 1, "{:#?}", at90.near);
     assert_eq!(at90.near[0].others.iter().map(|o| (o.info.rel_dir.as_str(), o.shared)).collect::<Vec<_>>(), [("백업/유럽 사본", 29), ("다른/유럽 조금", 27)]);
-    assert_eq!(at90.near[0].others[1].only_here, 0, "everything C has is in the base folder");
+    assert_eq!(at90.near[0].others[1].only_here, 1);
     // What the cards show.
     assert_eq!((n.base.photos, n.base.videos, n.base.subfolders), (30, 0, 1));
     assert_eq!(n.base.bytes, (0..20).map(|i| 4000 + i * 7).chain((100..110).map(|i| 4000 + i * 7)).sum::<i64>());
@@ -371,4 +386,196 @@ fn almost_the_same_folders_are_listed_apart() {
     let found = folders::find(&conn).unwrap();
     assert!(found.near.is_empty(), "{:#?}", found.near);
     assert_eq!(found.sets.len(), 1, "A/파리 and C/파리 are still a set");
+}
+
+#[test]
+fn side_by_side_rows_and_taking_the_better_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let e = drive(tmp.path(), "diskE");
+    let a = e.join("원본");
+    for i in 0..6 {
+        blob(&a.join(format!("a{i:02}.jpg")), i);
+    }
+    blob(&a.join("하위/b0.jpg"), 20);
+    sleep(Duration::from_millis(30));
+    // 복사: a01 is another file under the same name, a05 is missing, and it has one of its own.
+    // 복사2: an exact copy.
+    let b = e.join("복사");
+    copy_tree(&a, &b);
+    blob(&b.join("a01.jpg"), 50);
+    fs::remove_file(b.join("a05.jpg")).unwrap();
+    blob(&b.join("only.jpg"), 60);
+    copy_tree(&a, &e.join("복사2"));
+
+    let db = Db::open(tmp.path().join("app/library.db")).unwrap();
+    let conn = db.conn().unwrap();
+    volumes::add_source(&conn, &e).unwrap();
+    let stop = StopFlag::new();
+    scanner::scan_all(&db, &ScanOptions { min_image_bytes: 0, min_image_side: 0, ..Default::default() }, &stop, &quiet).unwrap();
+    let vol: i64 = conn.query_row("SELECT volume_id FROM sources LIMIT 1", [], |r| r.get(0)).unwrap();
+    let r = |d: &str| FolderRef { volume_id: vol, rel_dir: d.into() };
+    let id = |rel: &str| -> i64 { conn.query_row("SELECT id FROM files WHERE rel_path = ? AND quarantined = 0", [rel], |r| r.get(0)).unwrap() };
+    // The original's a01 could not be opened by the analysis, and carries a ♥.
+    conn.execute("INSERT INTO analysis(file_id, version, analyzed_at, face_version) VALUES (?, 1, 0, 0)", [id("원본/a01.jpg")]).unwrap();
+    conn.execute("INSERT INTO labels(file_id, label, source) VALUES (?, 'favorite', 'user')", [id("원본/a01.jpg")]).unwrap();
+
+    // Photo by photo across the three folders.
+    let rows = folders::align(&conn, &r("원본"), &[r("복사"), r("복사2")]).unwrap();
+    let kinds: Vec<(&str, &str)> = rows.iter().map(|x| (x.path.as_str(), x.kind.as_str())).collect();
+    assert_eq!(
+        kinds,
+        [("a00.jpg", "same"), ("a01.jpg", "differs"), ("a02.jpg", "same"), ("a03.jpg", "same"), ("a04.jpg", "same"), ("a05.jpg", "only"), ("only.jpg", "only"), ("하위/b0.jpg", "same")]
+    );
+    let a01 = &rows[1];
+    assert_eq!(a01.files.iter().map(|f| f.as_ref().map(|f| (f.same, f.unreadable))).collect::<Vec<_>>(), [Some((true, true)), Some((false, false)), Some((true, true))]);
+    assert_eq!(rows[5].files.iter().map(|f| f.is_some()).collect::<Vec<_>>(), [true, false, true], "a05: not in 복사");
+    assert_eq!(rows[6].files.iter().map(|f| f.is_some()).collect::<Vec<_>>(), [false, true, false], "only.jpg: only in 복사");
+
+    // In the list: 5 of 7 are the same and one more is the same photo with other content — the
+    // pair counts as 6 of 7 alike, and says which kind of difference it has.
+    let near = folders::find_with(&conn, 0.8).unwrap().near;
+    assert_eq!(near.len(), 1, "{near:#?}");
+    let o = &near[0].others[0];
+    assert_eq!((near[0].base.rel_dir.as_str(), o.info.rel_dir.as_str()), ("원본", "복사"));
+    assert_eq!((o.shared, o.differs, o.only_base, o.only_here), (5, 1, 1, 1));
+    assert!(o.ratio > 0.85 && o.ratio < 0.86);
+    assert_eq!(near[0].base.unreadable, 1);
+    // The copy's a01 is the good one: it replaces the original's; and only.jpg comes along.
+    let old = fs::read(a.join("a01.jpg")).unwrap();
+    let good = fs::read(b.join("a01.jpg")).unwrap();
+    let choices = vec![
+        folders::Choice { keep_file: Some(id("원본/a01.jpg")), copy_file: id("복사/a01.jpg"), discard: false },
+        folders::Choice { keep_file: None, copy_file: id("복사/only.jpg"), discard: false },
+    ];
+    let groups = vec![folders::SwapGroup { copy: r("복사"), choices }];
+    let rep = folders::swap(&db, &r("원본"), &groups, &stop, &quiet).unwrap();
+    assert_eq!((rep.replaced, rep.brought, rep.failed), (1, 1, 0), "{rep:?}");
+    assert_eq!(fs::read(a.join("a01.jpg")).unwrap(), good, "the original's place holds the copy's file");
+    assert!(a.join("only.jpg").is_file() && b.join("a01.jpg").is_file() && b.join("only.jpg").is_file(), "the copy folder is as it was");
+    let waiting: Vec<String> = walk(&e).into_iter().filter(|p| p.contains(&rep.batch_id)).collect();
+    assert_eq!(waiting.len(), 1, "the replaced file waits in the quarantine: {waiting:?}");
+    assert_eq!(fs::read(&waiting[0]).unwrap(), old);
+    let fav: String = conn.query_row("SELECT f.rel_path FROM labels l JOIN files f ON f.id = l.file_id WHERE l.label = 'favorite' AND f.quarantined = 0", [], |r| r.get(0)).unwrap();
+    assert_eq!(fav, "원본/a01.jpg", "♥ is on the new file");
+    let what: String = conn.query_row("SELECT description FROM batches WHERE id = ?", [&rep.batch_id], |r| r.get(0)).unwrap();
+    assert_eq!(what, "사진 1장을 복사본 것으로 교체, 1장을 원본 폴더로 가져옴");
+    let rows = folders::align(&conn, &r("원본"), &[r("복사")]).unwrap();
+    assert!(rows.iter().all(|x| x.kind == "same" || x.path == "a05.jpg"), "{rows:#?}");
+
+    // Undone while the copy is still there: everything as before.
+    let undo = media_core::journal::undo_batch(&conn, &rep.batch_id).unwrap();
+    assert_eq!(undo.failed, 0, "{undo:?}");
+    assert_eq!(fs::read(a.join("a01.jpg")).unwrap(), old);
+    assert!(!a.join("only.jpg").exists());
+    assert_eq!(id("원본/a01.jpg"), groups[0].choices[0].keep_file.unwrap(), "the old row has its place again");
+
+    // Done again, then the copy folder goes (what both have): now the swap cannot be undone —
+    // the new file is the only good one, and it stays.
+    let rep = folders::swap(&db, &r("원본"), &groups, &stop, &quiet).unwrap();
+    assert_eq!((rep.replaced, rep.brought), (1, 1), "{rep:?}");
+    let gone = folders::remove(&db, &[Pick { keep: r("원본"), copy: r("복사"), partial: true }], true, &stop, &quiet).unwrap();
+    assert_eq!((gone.files, gone.unique_left, gone.folders), (7, 0, 1), "{gone:?}");
+    let undo = media_core::journal::undo_batch(&conn, &rep.batch_id).unwrap();
+    assert!(undo.failed >= 2, "{undo:?}");
+    assert_eq!(fs::read(a.join("a01.jpg")).unwrap(), good);
+    assert!(a.join("only.jpg").is_file());
+    // The marks of sets looked through are kept.
+    assert_eq!(folders::set_reviewed(&conn, "1:원본", true).unwrap(), ["1:원본"]);
+    assert!(folders::set_reviewed(&conn, "1:원본", false).unwrap().is_empty());
+}
+
+#[test]
+fn a_pair_compared_to_the_end_is_known_as_different_at_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let e = drive(tmp.path(), "diskE");
+    let mut data = vec![5u8; 100_000];
+    fs::create_dir_all(e.join("원본")).unwrap();
+    fs::create_dir_all(e.join("복사")).unwrap();
+    fs::write(e.join("원본/v.jpg"), &data).unwrap();
+    fs::write(e.join("원본/w.jpg"), vec![6u8; 90_000]).unwrap();
+    sleep(Duration::from_millis(30));
+    data[70_000] = 9;
+    fs::write(e.join("복사/v.jpg"), &data).unwrap();
+    fs::write(e.join("복사/w.jpg"), vec![6u8; 90_000]).unwrap();
+    let db = Db::open(tmp.path().join("app/library.db")).unwrap();
+    let conn = db.conn().unwrap();
+    volumes::add_source(&conn, &e).unwrap();
+    scanner::scan_all(&db, &ScanOptions { min_image_bytes: 0, min_image_side: 0, ..Default::default() }, &StopFlag::new(), &quiet).unwrap();
+    let vol: i64 = conn.query_row("SELECT volume_id FROM sources LIMIT 1", [], |r| r.get(0)).unwrap();
+    let r = |d: &str| FolderRef { volume_id: vol, rel_dir: d.into() };
+    let rows = folders::align(&conn, &r("원본"), &[r("복사")]).unwrap();
+    assert!(rows.iter().all(|x| x.kind == "same"), "by fingerprint: {rows:#?}");
+    assert_eq!(folders::find(&conn).unwrap().sets.len(), 1);
+    // A photo cannot be discarded without the original's file that stays.
+    let lone = folders::Choice { keep_file: None, copy_file: rows[0].files[1].as_ref().unwrap().id, discard: true };
+    let rep = folders::swap(&db, &r("원본"), &[folders::SwapGroup { copy: r("복사"), choices: vec![lone] }], &StopFlag::new(), &quiet).unwrap();
+    assert_eq!((rep.discarded, rep.failed), (0, 1), "{rep:?}");
+    // Checked: w is the same to the end, v is not — and the index knows from then on.
+    let pair = |n: usize| -> (i64, i64) { (rows[n].files[0].as_ref().unwrap().id, rows[n].files[1].as_ref().unwrap().id) };
+    assert_eq!(folders::check_pair(&conn, pair(1).0, pair(1).1).unwrap().at, None);
+    assert_eq!(folders::check_pair(&conn, pair(0).0, pair(0).1).unwrap().at, Some(70_000));
+    let rows = folders::align(&conn, &r("원본"), &[r("복사")]).unwrap();
+    assert_eq!(rows.iter().map(|x| x.kind.as_str()).collect::<Vec<_>>(), ["differs", "same"]);
+    assert!(folders::find(&conn).unwrap().sets.is_empty(), "no longer a 100 % copy");
+    // The original's v is the good one: the copy's goes to the quarantine (and can come back).
+    let choice = folders::Choice { keep_file: Some(pair(0).0), copy_file: pair(0).1, discard: true };
+    let rep = folders::swap(&db, &r("원본"), &[folders::SwapGroup { copy: r("복사"), choices: vec![choice] }], &StopFlag::new(), &quiet).unwrap();
+    assert_eq!((rep.discarded, rep.replaced, rep.failed), (1, 0, 0), "{rep:?}");
+    assert!(!e.join("복사/v.jpg").exists() && e.join("원본/v.jpg").is_file());
+    let undo = media_core::journal::undo_batch(&conn, &rep.batch_id).unwrap();
+    assert_eq!((undo.restored, undo.failed), (1, 0));
+    assert_eq!(fs::read(e.join("복사/v.jpg")).unwrap()[70_000], 9, "it can come back");
+    // Discarded again: everything left in the copy folder is in the original. Such a folder is
+    // listed however small a part of the original it is.
+    let choice = folders::Choice { keep_file: Some(pair(0).0), copy_file: pair(0).1, discard: true };
+    folders::swap(&db, &r("원본"), &[folders::SwapGroup { copy: r("복사"), choices: vec![choice] }], &StopFlag::new(), &quiet).unwrap();
+    blob(&e.join("원본/x1.jpg"), 71);
+    blob(&e.join("원본/x2.jpg"), 72);
+    blob(&e.join("복사/w2.jpg"), 73);
+    blob(&e.join("복사/w3.jpg"), 74);
+    fs::copy(e.join("복사/w2.jpg"), e.join("원본/w2.jpg")).unwrap();
+    fs::copy(e.join("복사/w3.jpg"), e.join("원본/w3.jpg")).unwrap();
+    scanner::scan_all(&db, &ScanOptions { min_image_bytes: 0, min_image_side: 0, ..Default::default() }, &StopFlag::new(), &quiet).unwrap();
+    let near = folders::find(&conn).unwrap().near;
+    assert_eq!(near.len(), 1, "3 of the original's 6 — far from 95 %, but all of the copy: {near:#?}");
+    let o = &near[0].others[0];
+    assert_eq!((near[0].base.rel_dir.as_str(), o.info.rel_dir.as_str(), o.shared, o.only_here, o.differs), ("원본", "복사", 3, 0, 0));
+    assert!(o.ratio < 0.51);
+    let gone = folders::remove(&db, &[Pick { keep: r("원본"), copy: r("복사"), partial: true }], true, &StopFlag::new(), &quiet).unwrap();
+    assert_eq!((gone.files, gone.unique_left, gone.folders, gone.different), (3, 0, 1, 0), "{gone:?}");
+    assert_eq!(walk(&e.join("원본")).len(), 6);
+}
+
+#[test]
+fn of_two_differing_pictures_the_damaged_one_is_told() {
+    let tmp = tempfile::tempdir().unwrap();
+    let e = drive(tmp.path(), "diskE");
+    jpeg(&e.join("원본/p.jpg"), 1, "2020:01:01 10:00:00");
+    // The copy: the same picture, its second half overwritten (same size).
+    let mut bytes = fs::read(e.join("원본/p.jpg")).unwrap();
+    let half = bytes.len() / 2;
+    bytes[half..].fill(0);
+    fs::create_dir_all(e.join("복사")).unwrap();
+    fs::write(e.join("복사/p.jpg"), &bytes).unwrap();
+    let db = Db::open(tmp.path().join("app/library.db")).unwrap();
+    let conn = db.conn().unwrap();
+    volumes::add_source(&conn, &e).unwrap();
+    scanner::scan_all(&db, &ScanOptions { min_image_bytes: 0, min_image_side: 0, ..Default::default() }, &StopFlag::new(), &quiet).unwrap();
+    let id = |rel: &str| -> i64 { conn.query_row("SELECT id FROM files WHERE rel_path = ?", [rel], |r| r.get(0)).unwrap() };
+    let d = folders::check_pair(&conn, id("원본/p.jpg"), id("복사/p.jpg")).unwrap();
+    assert_eq!(d.at, Some(half as u64));
+    assert_eq!((d.whole_a, d.whole_b), (Some(true), Some(false)), "the copy has an empty stretch the original does not");
+    // Seen from the other side it is the same file that is damaged.
+    let back = folders::check_pair(&conn, id("복사/p.jpg"), id("원본/p.jpg")).unwrap();
+    assert_eq!((back.whole_a, back.whole_b), (Some(false), Some(true)));
+    // Two files that merely differ (a byte changed): nothing to tell from the bytes.
+    let mut edited = fs::read(e.join("원본/p.jpg")).unwrap();
+    edited[half] ^= 0xFF;
+    fs::write(e.join("복사/p.jpg"), &edited).unwrap();
+    let d = folders::check_pair(&conn, id("원본/p.jpg"), id("복사/p.jpg")).unwrap();
+    assert_eq!((d.at, d.whole_a, d.whole_b), (Some(half as u64), None, None));
+    // Cut short instead of overwritten: no end marker.
+    fs::write(e.join("복사/p.jpg"), &fs::read(e.join("원본/p.jpg")).unwrap()[..half]).unwrap();
+    let d = folders::check_pair(&conn, id("원본/p.jpg"), id("복사/p.jpg")).unwrap();
+    assert_eq!((d.at, d.whole_a, d.whole_b), (Some(half as u64), Some(true), Some(false)));
 }
