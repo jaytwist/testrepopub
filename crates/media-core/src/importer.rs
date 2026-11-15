@@ -136,6 +136,9 @@ pub fn run(db: &Db, card: &Path, settings: &ImportSettings, opts: &ScanOptions, 
             filter: new_on_card(pv.volume_id),
             uncertain_folder: Some("_날짜확인필요".into()),
             remove_empty_dirs: false,
+            // The same structure as the library: year / year-month / trip, received, …
+            layout: "library".into(),
+            library: Default::default(),
         };
         let plan = organizer::plan(db, &options, stop, progress)?;
         let ex = organizer::execute(db, &plan, stop, progress)?;

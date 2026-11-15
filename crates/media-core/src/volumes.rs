@@ -102,6 +102,14 @@ mod platform {
         identify_root(&root_str)
     }
 
+    pub fn free_space(path: &Path) -> Option<u64> {
+        use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+        let w = wide(path.as_os_str());
+        let mut free: u64 = 0;
+        unsafe { GetDiskFreeSpaceExW(PCWSTR(w.as_ptr()), Some(&mut free), None, None) }.ok()?;
+        Some(free)
+    }
+
     /// NTFS / ReFS update a folder's time when an entry is added, removed or renamed; FAT and
     /// exFAT (cards, many USB drives) do not reliably.
     pub fn dir_times_reliable(root: &Path) -> bool {
@@ -201,6 +209,13 @@ mod platform {
     pub fn dir_times_reliable(_root: &Path) -> bool {
         true
     }
+
+    pub fn free_space(path: &Path) -> Option<u64> {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+        let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+        (unsafe { libc::statvfs(c.as_ptr(), &mut s) } == 0).then(|| s.f_bavail as u64 * s.f_frsize as u64)
+    }
 }
 
 pub fn identify(path: &Path) -> Result<VolumeInfo> {
@@ -209,6 +224,15 @@ pub fn identify(path: &Path) -> Result<VolumeInfo> {
 
 /// Currently mounted volumes, keyed by uid. On non-Windows this is empty and
 /// `refresh` instead re-identifies each known mount path.
+/// Free bytes on the drive holding `path`, if the system says.
+pub fn free_space(path: &Path) -> Option<u64> {
+    platform::free_space(&existing_ancestor_of(path))
+}
+
+fn existing_ancestor_of(path: &Path) -> PathBuf {
+    path.ancestors().find(|a| a.exists()).map(Path::to_path_buf).unwrap_or_else(|| path.to_path_buf())
+}
+
 /// Whether quick checks (unchanged folder time = unchanged folder) are safe on this drive.
 /// `MO_FULL_SCANS=1` turns them off.
 pub fn dir_times_reliable(root: &Path) -> bool {

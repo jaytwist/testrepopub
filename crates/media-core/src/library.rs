@@ -1,0 +1,565 @@
+//! The library layout: where every photo and video belongs in the one organised library, as
+//! `year / year-month / event`, decided from what is already indexed (nothing is read again).
+//!
+//! * **Events** keep the name of the folder they came from (`2015-08-14 제주도` → `제주도`); the
+//!   topmost meaningful folder that covers at most `event_span_days` is the event, and folders
+//!   inside it stay as they are (`유럽여행/파리`). Collections spanning longer (`Family`, phone
+//!   backups) are not events: their photos are sorted by date like loose ones.
+//! * **Loose** photos go to `year/year-month`, or to the trip they belong to (`Honolulu 여행`);
+//!   screenshots to `…/스크린샷`; photos received from messengers / downloads to
+//!   `받은 사진/year/year-month`; undated ones to `_날짜확인필요/<folder>`.
+//! * Videos of `big_video_bytes` or more go under `큰 동영상/`.
+//! * **Pairs** travel together: a RAW goes into `RAW/` under its JPG, a Live Photo's video stays
+//!   next to its photo, an edited version next to its original.
+//! * **Copies**: of identical files one is kept — preferably one already on the library drive,
+//!   which is moved; a file only on another drive is copied (that drive is left as it is). Other
+//!   copies on the library drive are removed (quarantine, undoable); on other drives left alone.
+
+use std::collections::{HashMap, HashSet};
+
+use anyhow::Result;
+use once_cell::sync::Lazy;
+use regex::Regex;
+use rusqlite::{Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
+
+use crate::db::{self, FileRow};
+use crate::dedupe::{self, DupRules};
+use crate::meta;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct LibraryOptions {
+    pub big_video_bytes: i64,
+    /// A folder whose photos span at most this many days is one event (kept whole).
+    pub event_span_days: i64,
+    /// Remove identical copies on the library drive (one is kept).
+    pub remove_copies: bool,
+    /// Remove resized / recompressed versions on the library drive when the original is kept.
+    pub remove_smaller_versions: bool,
+}
+
+impl Default for LibraryOptions {
+    fn default() -> Self {
+        Self { big_video_bytes: 2 * 1024 * 1024 * 1024, event_span_days: 62, remove_copies: true, remove_smaller_versions: true }
+    }
+}
+
+/// The user's correction for one source folder, remembered across plans.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct FolderRule {
+    pub volume_id: i64,
+    /// Volume-relative folder, `/` separated.
+    pub rel_dir: String,
+    /// "event" (always an event, even if long; `name` renames it), "loose" (never an event),
+    /// "skip" (leave this folder where it is).
+    pub kind: String,
+    pub name: Option<String>,
+}
+
+pub fn load_rules(conn: &Connection) -> Result<Vec<FolderRule>> {
+    let v: Option<String> = conn.query_row("SELECT value FROM settings WHERE key = 'library_rules'", [], |r| r.get(0)).optional()?;
+    Ok(v.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default())
+}
+
+pub fn save_rules(conn: &Connection, rules: &[FolderRule]) -> Result<()> {
+    conn.execute(
+        "INSERT INTO settings(key, value) VALUES ('library_rules', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [serde_json::to_string(rules)?],
+    )?;
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Act {
+    Move,
+    Copy,
+    /// A copy on another drive, or a folder the user chose to skip: not touched.
+    Leave,
+    /// A copy on the library drive: removed (quarantined) once its kept twin is in place.
+    Remove,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Placement {
+    pub act: Act,
+    /// Folder inside the library, `/` separated ("" for Leave / Remove).
+    pub rel_dir: String,
+    /// Why it goes there: event, loose, trip, received, screenshot, undated, raw, live, edited,
+    /// copy, version, skip.
+    pub tag: &'static str,
+    /// The event (or trip) name, when there is one.
+    pub event: Option<String>,
+    /// The source folder (volume-relative) the event or file came from.
+    pub from_dir: String,
+    /// For Remove: the file kept instead.
+    pub kept: Option<i64>,
+}
+
+// ---------------------------------------------------------------------------------------------
+// Folder names
+// ---------------------------------------------------------------------------------------------
+
+const GENERIC: &[&str] = &[
+    "dcim", "misc", "private", "avchd", "bdmv", "stream", "clip", "m4root", "camera", "camera roll", "camera uploads", "photos", "photo",
+    "pictures", "picture", "images", "image", "img", "사진", "그림", "사진 모음", "내 사진", "download", "downloads", "다운로드",
+    "kakaotalk", "kakao", "카카오톡", "카카오톡 받은 파일", "whatsapp", "whatsapp images", "whatsapp video", "telegram", "telegram images",
+    "line", "instagram", "screenshots", "screenshot", "스크린샷", "화면 캡처", "screen recordings", "new folder", "새 폴더", "untitled folder",
+    "untitled", "무제", "backup", "backups", "백업", "raw", "raws", "jpg", "jpeg", "heic", "video", "videos", "movies", "동영상", "영상",
+    "export", "exports", "edited", "edit", "보정", "편집", "takeout", "google photos", "google 포토", "icloud photos", "icloud", "onedrive",
+    "dropbox", "google drive", "desktop", "바탕 화면", "documents", "문서", "users", "user", "home", "media", "files", "data", "temp", "tmp",
+    "받은 사진", "큰 동영상", "_날짜확인필요", "기타", "etc", "misc", "all", "sdcard", "internal storage", "phone", "iphone", "android",
+];
+
+/// Leading date (and an optional range) in a folder name: `2015-08-14 제주도`, `20150814_제주`,
+/// `2015.08 여행`, `2015-08-14~16 제주`, `2015`.
+static RE_LEAD_DATE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"^\s*((?:19|20)\d{2})(?:[-_. ]?(0[1-9]|1[0-2])(?:[-_. ]?(0[1-9]|[12]\d|3[01]))?)?(?:\s*[~\-]\s*\d{1,4}(?:[-_. ]\d{1,2}){0,2})?(?:[\s_\-.,:)]+|$)",
+    )
+    .unwrap()
+});
+static RE_CAMERA_DIR: Lazy<Regex> = Lazy::new(|| Regex::new(r"^\d{3}[A-Z0-9_]{5}$").unwrap());
+static RE_PHOTOS_FROM: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)^photos from \d{4}$").unwrap());
+
+/// The event name a folder stands for, or None when the name says nothing (camera / app /
+/// generic folders, dates alone, numbers).
+pub fn event_name(folder: &str) -> Option<String> {
+    let f = folder.trim();
+    if f.is_empty() || RE_CAMERA_DIR.is_match(f) || RE_PHOTOS_FROM.is_match(f) || GENERIC.contains(&f.to_lowercase().as_str()) {
+        return None;
+    }
+    let rest = match RE_LEAD_DATE.find(f) {
+        Some(m) => &f[m.end()..],
+        None => f,
+    };
+    let rest = rest.trim_matches(|c: char| c.is_whitespace() || "-_.,~()[]".contains(c));
+    if rest.is_empty() || rest.chars().all(|c| c.is_ascii_digit() || " -_.".contains(c)) {
+        return None;
+    }
+    if GENERIC.contains(&rest.to_lowercase().as_str()) {
+        return None;
+    }
+    Some(safe_name(rest))
+}
+
+/// (year, month) written at the start of a folder name, if any.
+pub fn folder_month(folder: &str) -> Option<(i32, u32)> {
+    let c = RE_LEAD_DATE.captures(folder)?;
+    let y: i32 = c.get(1)?.as_str().parse().ok()?;
+    let m: u32 = c.get(2)?.as_str().parse().ok()?;
+    Some((y, m))
+}
+
+/// A folder name Windows accepts: no reserved characters or names, no trailing dot / space,
+/// at most 60 characters.
+pub fn safe_name(s: &str) -> String {
+    let mut out: String = s
+        .chars()
+        .map(|c| if c.is_control() || "<>:\"/\\|?*".contains(c) { '_' } else { c })
+        .take(60)
+        .collect::<String>()
+        .trim_end_matches(['.', ' '])
+        .trim()
+        .to_string();
+    let upper = out.to_uppercase();
+    let reserved = ["CON", "PRN", "AUX", "NUL"].contains(&upper.as_str())
+        || (upper.len() == 4 && (upper.starts_with("COM") || upper.starts_with("LPT")) && upper.as_bytes()[3].is_ascii_digit());
+    if reserved {
+        out.push('_');
+    }
+    if out.is_empty() {
+        out = "_".into();
+    }
+    out
+}
+
+fn month_dir(ts: i64) -> Option<String> {
+    let d = meta::from_ts(ts)?;
+    use chrono::Datelike;
+    Some(format!("{:04}/{:04}-{:02}", d.year(), d.year(), d.month()))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Layout
+// ---------------------------------------------------------------------------------------------
+
+struct F {
+    id: i64,
+    vol: i64,
+    rel: String,
+    kind: String,
+    size: i64,
+    taken: Option<i64>,
+    trusted: bool,
+    content: Option<(String, i64)>,
+}
+
+impl F {
+    fn dir(&self) -> &str {
+        self.rel.rfind('/').map(|i| &self.rel[..i]).unwrap_or("")
+    }
+    /// (drive, folder, lower-cased name without extension). A RAW already filed in a `RAW`
+    /// subfolder counts as beside the JPG in the folder above, so organizing twice changes nothing.
+    fn stem_key(&self) -> (i64, String, String) {
+        let name = self.rel.rsplit('/').next().unwrap_or("");
+        let stem = name.rfind('.').map(|i| &name[..i]).unwrap_or(name);
+        let mut dir = self.dir();
+        if self.kind == "raw" && dir.rsplit('/').next().is_some_and(|d| d.eq_ignore_ascii_case("raw")) {
+            dir = dir.rfind('/').map(|i| &dir[..i]).unwrap_or("");
+        }
+        (self.vol, dir.to_string(), stem.to_lowercase())
+    }
+}
+
+/// Where each of `ids` belongs in the library on volume `lib_vol`.
+pub fn layout(conn: &Connection, lib_vol: i64, ids: &[i64], opts: &LibraryOptions, rules: &[FolderRule]) -> Result<HashMap<i64, Placement>> {
+    let wanted: HashSet<i64> = ids.iter().copied().collect();
+    let files: Vec<F> = {
+        let mut st = conn.prepare(
+            "SELECT id, volume_id, rel_path, kind, size, taken_at, date_source, COALESCE(prehash, hash)
+             FROM files WHERE missing = 0 AND quarantined = 0",
+        )?;
+        let rows = st
+            .query_map([], |r| {
+                let src: String = r.get(6)?;
+                let key: Option<String> = r.get(7)?;
+                let size: i64 = r.get(4)?;
+                Ok(F {
+                    id: r.get(0)?,
+                    vol: r.get(1)?,
+                    rel: r.get::<_, String>(2)?.replace('\\', "/"),
+                    kind: r.get(3)?,
+                    size,
+                    taken: r.get(5)?,
+                    trusted: meta::confidence(&src) != "low",
+                    content: key.map(|k| (k, size)),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter().filter(|f| wanted.contains(&f.id)).collect()
+    };
+    let by_id: HashMap<i64, usize> = files.iter().enumerate().map(|(i, f)| (f.id, i)).collect();
+    let mut labels: HashMap<i64, Vec<String>> = HashMap::new();
+    {
+        let mut st = conn.prepare("SELECT file_id, label FROM labels")?;
+        for r in st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+            let (id, l) = r?;
+            if wanted.contains(&id) {
+                labels.entry(id).or_default().push(l);
+            }
+        }
+    }
+    let has = |id: i64, p: &dyn Fn(&str) -> bool| labels.get(&id).is_some_and(|ls| ls.iter().any(|l| p(l)));
+
+    // 1. Copies: keep one per content (preferably on the library drive), by the duplicate ranking.
+    let mut act: HashMap<i64, (Act, Option<i64>, &'static str)> = HashMap::new();
+    let mut groups: HashMap<(String, i64), Vec<i64>> = HashMap::new();
+    for f in &files {
+        if let Some(c) = &f.content {
+            groups.entry(c.clone()).or_default().push(f.id);
+        }
+    }
+    let dup_rules = DupRules::load(conn)?;
+    for members in groups.values().filter(|m| m.len() > 1) {
+        let mut rows: Vec<FileRow> = members.iter().filter_map(|id| db::get_file(conn, *id).ok().flatten()).collect();
+        dedupe::rank_members(&mut rows, &labels, &dup_rules);
+        // Identical bytes: keep the one on the library drive, then the one filed under the most
+        // meaningful folders (an event rather than "backup"), then the duplicate ranking.
+        let meaning = |r: &FileRow| -> usize {
+            let rel = r.rel_path.replace('\\', "/");
+            let dir = rel.rfind('/').map(|i| rel[..i].to_string()).unwrap_or_default();
+            dir.split('/').filter(|s| event_name(s).is_some()).count()
+        };
+        rows.sort_by_key(|r| ((r.volume_id != lib_vol) as u8, std::cmp::Reverse(meaning(r))));
+        let keep = rows[0].id;
+        for (i, r) in rows.iter().enumerate() {
+            let a = if i == 0 {
+                (if r.volume_id == lib_vol { Act::Move } else { Act::Copy }, None, "")
+            } else if r.volume_id == lib_vol && opts.remove_copies {
+                (Act::Remove, Some(keep), "copy")
+            } else {
+                (Act::Leave, Some(keep), "copy")
+            };
+            act.insert(r.id, a);
+        }
+    }
+    for f in &files {
+        act.entry(f.id).or_insert((if f.vol == lib_vol { Act::Move } else { Act::Copy }, None, ""));
+    }
+
+    // 2. Versions of a similar photo: resized / recompressed ones go like copies; edited ones
+    //    follow their original.
+    let mut follow: HashMap<i64, (i64, &'static str, &'static str)> = HashMap::new(); // id -> (leader, subdir, tag)
+    {
+        let mut st = conn.prepare(
+            "SELECT m.group_id, m.file_id, m.variant FROM dup_members m JOIN dup_groups g ON g.id = m.group_id
+             WHERE g.kind = 'similar_image' AND g.resolved = 0 ORDER BY m.group_id, m.rank",
+        )?;
+        let mut by_group: HashMap<i64, Vec<(i64, Option<String>)>> = HashMap::new();
+        for r in st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<String>>(2)?)))? {
+            let (g, id, v) = r?;
+            if wanted.contains(&id) {
+                by_group.entry(g).or_default().push((id, v));
+            }
+        }
+        for members in by_group.values() {
+            let Some(&(lead, _)) = members.iter().find(|(_, v)| v.is_none()) else { continue };
+            if !matches!(act.get(&lead).map(|a| a.0), Some(Act::Move | Act::Copy)) {
+                continue;
+            }
+            for (id, v) in members {
+                match v.as_deref() {
+                    Some("smaller" | "recompressed") if opts.remove_smaller_versions => {
+                        match act.get(id).map(|a| a.0) {
+                            Some(Act::Move) => {
+                                act.insert(*id, (Act::Remove, Some(lead), "version"));
+                            }
+                            Some(Act::Copy) => {
+                                act.insert(*id, (Act::Leave, Some(lead), "version"));
+                            }
+                            _ => {}
+                        }
+                    }
+                    Some("edited") => {
+                        follow.insert(*id, (lead, "", "edited"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // 3. Same name in the same folder: RAW under its JPG, a Live Photo's video beside its photo.
+    {
+        let mut by_stem: HashMap<(i64, String, String), Vec<usize>> = HashMap::new();
+        for (i, f) in files.iter().enumerate() {
+            by_stem.entry(f.stem_key()).or_default().push(i);
+        }
+        for list in by_stem.values().filter(|l| l.len() > 1) {
+            let Some(&lead) = list.iter().find(|&&i| files[i].kind == "photo") else { continue };
+            for &i in list.iter().filter(|&&i| i != lead) {
+                match files[i].kind.as_str() {
+                    "raw" => {
+                        follow.insert(files[i].id, (files[lead].id, "RAW", "raw"));
+                    }
+                    "video" => {
+                        follow.insert(files[i].id, (files[lead].id, "", "live"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // 4. Events: per folder, the dates of everything below it.
+    let mut roots: HashMap<i64, Vec<String>> = HashMap::new();
+    for s in db::list_sources(conn)? {
+        roots.entry(s.volume_id).or_default().push(s.rel_root.replace('\\', "/").trim_matches('/').to_string());
+    }
+    let root_of = |f: &F| -> String {
+        roots
+            .get(&f.vol)
+            .and_then(|rs| rs.iter().filter(|r| r.is_empty() || f.rel.starts_with(&format!("{r}/"))).max_by_key(|r| r.len()).cloned())
+            .unwrap_or_default()
+    };
+    let rule_of = |vol: i64, dir: &str| rules.iter().find(|r| r.volume_id == vol && r.rel_dir.trim_matches('/') == dir);
+    // (vol, folder) -> (min, max) trusted date of everything inside
+    let mut span: HashMap<(i64, String), (i64, i64)> = HashMap::new();
+    let segs_of = |f: &F, root: &str| -> Vec<String> {
+        let dir = f.dir();
+        let below = if root.is_empty() { dir } else { dir.strip_prefix(root).unwrap_or(dir).trim_start_matches('/') };
+        below.split('/').filter(|s| !s.is_empty()).map(String::from).collect()
+    };
+    let path_at = |root: &str, segs: &[String], i: usize| -> String {
+        let p = segs[..=i].join("/");
+        if root.is_empty() {
+            p
+        } else {
+            format!("{root}/{p}")
+        }
+    };
+    for f in &files {
+        let (Some(t), true) = (f.taken, f.trusted) else { continue };
+        let root = root_of(f);
+        let segs = segs_of(f, &root);
+        for i in 0..segs.len() {
+            let e = span.entry((f.vol, path_at(&root, &segs, i))).or_insert((t, t));
+            e.0 = e.0.min(t);
+            e.1 = e.1.max(t);
+        }
+    }
+    let max_span = opts.event_span_days * 86_400;
+    // Per folder: media files directly in it, and its meaningful subfolders. A folder holding no
+    // photos itself and only one meaningful subfolder is a wrapper ("옛날/유럽 여행"), not the event.
+    let mut direct: HashMap<(i64, String), usize> = HashMap::new();
+    let mut kids: HashMap<(i64, String), HashSet<String>> = HashMap::new();
+    for f in &files {
+        let root = root_of(f);
+        let segs = segs_of(f, &root);
+        if let Some(last) = segs.len().checked_sub(1) {
+            *direct.entry((f.vol, path_at(&root, &segs, last))).or_default() += 1;
+        }
+        for i in 1..segs.len() {
+            if event_name(&segs[i]).is_some() {
+                kids.entry((f.vol, path_at(&root, &segs, i - 1))).or_default().insert(segs[i].clone());
+            }
+        }
+    }
+    let wrapper = |vol: i64, path: &str| -> bool {
+        let key = (vol, path.to_string());
+        direct.get(&key).copied().unwrap_or(0) == 0 && kids.get(&key).map(|k| k.len()).unwrap_or(0) == 1
+    };
+
+    let mut out: HashMap<i64, Placement> = HashMap::new();
+    let mut leaders: Vec<usize> = Vec::new();
+    for (i, f) in files.iter().enumerate() {
+        let (a, kept, tag) = act[&f.id];
+        if matches!(a, Act::Leave | Act::Remove) {
+            out.insert(f.id, Placement { act: a, rel_dir: String::new(), tag, event: None, from_dir: f.dir().to_string(), kept });
+        } else if !follow.contains_key(&f.id) {
+            leaders.push(i);
+        }
+    }
+    for i in leaders {
+        let f = &files[i];
+        let (a, _, _) = act[&f.id];
+        let root = root_of(f);
+        let segs = segs_of(f, &root);
+        // Topmost meaningful folder that is one event (or that the user named one).
+        let mut chosen: Option<(usize, String, Option<(i64, i64)>)> = None;
+        let mut skip = false;
+        for k in 0..segs.len() {
+            let path = path_at(&root, &segs, k);
+            let rule = rule_of(f.vol, &path);
+            match rule.map(|r| r.kind.as_str()) {
+                Some("skip") => {
+                    skip = true;
+                    break;
+                }
+                Some("loose") => continue,
+                Some("event") => {
+                    let name = rule.and_then(|r| r.name.clone()).map(|n| safe_name(&n)).or_else(|| event_name(&segs[k])).unwrap_or_else(|| safe_name(&segs[k]));
+                    chosen = Some((k, name, span.get(&(f.vol, path)).copied()));
+                    break;
+                }
+                _ => {}
+            }
+            let Some(name) = event_name(&segs[k]) else { continue };
+            if wrapper(f.vol, &path) {
+                continue;
+            }
+            let sp = span.get(&(f.vol, path)).copied();
+            if sp.is_none_or(|(lo, hi)| hi - lo <= max_span) {
+                chosen = Some((k, name, sp));
+                break;
+            }
+        }
+        if skip {
+            out.insert(f.id, Placement { act: Act::Leave, rel_dir: String::new(), tag: "skip", event: None, from_dir: f.dir().to_string(), kept: None });
+            continue;
+        }
+        let big = f.kind == "video" && f.size >= opts.big_video_bytes;
+        let prefix = if big { "큰 동영상/" } else { "" };
+        let (rel_dir, tag, event, from_dir) = if let Some((k, name, sp)) = chosen {
+            // Month: the date written on the folder when it agrees with the photos, else the first photo.
+            let first = sp.map(|s| s.0);
+            let month = match (folder_month(&segs[k]), first) {
+                (Some((y, m)), Some(t)) => {
+                    let named = meta::to_ts(chrono::NaiveDate::from_ymd_opt(y, m, 15).and_then(|d| d.and_hms_opt(0, 0, 0)).unwrap_or_default());
+                    if (named - t).abs() <= 31 * 86_400 {
+                        Some(format!("{y:04}/{y:04}-{m:02}"))
+                    } else {
+                        month_dir(t)
+                    }
+                }
+                (_, Some(t)) => month_dir(t),
+                (Some((y, m)), None) => Some(format!("{y:04}/{y:04}-{m:02}")),
+                (None, None) => None,
+            };
+            let sub: Vec<String> = segs[k + 1..].iter().filter_map(|s| event_name(s)).collect();
+            let mut path = match month {
+                Some(m) => format!("{prefix}{m}/{name}"),
+                None => format!("{prefix}_날짜확인필요/{name}"),
+            };
+            for s in &sub {
+                path.push('/');
+                path.push_str(s);
+            }
+            (path, "event", Some(name), path_at(&root, &segs, k))
+        } else {
+            let month = if f.trusted { f.taken.and_then(month_dir) } else { None };
+            let received = has(f.id, &|l| matches!(l, "src:kakaotalk" | "src:whatsapp" | "src:telegram" | "src:line" | "src:instagram" | "src:download"));
+            let trip: Option<(String, i64)> = conn
+                .query_row(
+                    "SELECT t.title, t.start_ts FROM trip_files tf JOIN trips t ON t.id = tf.trip_id WHERE tf.file_id = ?",
+                    [f.id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            match month {
+                None => {
+                    let parent = segs.last().map(|s| safe_name(s)).unwrap_or_else(|| "기타".into());
+                    (format!("{prefix}_날짜확인필요/{parent}"), "undated", None, f.dir().to_string())
+                }
+                Some(m) if received => (format!("받은 사진/{m}"), "received", None, f.dir().to_string()),
+                Some(m) if has(f.id, &|l| l == "screenshot") => (format!("{m}/스크린샷"), "screenshot", None, f.dir().to_string()),
+                Some(m) => match trip {
+                    Some((title, start)) => {
+                        let tm = month_dir(start).unwrap_or(m);
+                        let t = safe_name(&title);
+                        (format!("{prefix}{tm}/{t}"), "trip", Some(t), f.dir().to_string())
+                    }
+                    None => (format!("{prefix}{m}"), "loose", None, f.dir().to_string()),
+                },
+            }
+        };
+        out.insert(f.id, Placement { act: a, rel_dir, tag, event, from_dir, kept: None });
+    }
+
+    // 5. Followers go where their leader goes (when the leader is placed and they are not copies).
+    for (id, (lead, subdir, tag)) in &follow {
+        if out.contains_key(id) {
+            continue; // a copy (Leave / Remove) already decided
+        }
+        let Some(&i) = by_id.get(id) else { continue };
+        let (a, _, _) = act[id];
+        let lead_dir = out.get(lead).filter(|p| matches!(p.act, Act::Move | Act::Copy)).map(|p| (p.rel_dir.clone(), p.event.clone(), p.from_dir.clone()));
+        match lead_dir {
+            Some((d, event, from)) => {
+                let rel_dir = if subdir.is_empty() { d } else { format!("{d}/{subdir}") };
+                out.insert(*id, Placement { act: a, rel_dir, tag, event, from_dir: from, kept: None });
+            }
+            None => {
+                // Leader not placed (it is a copy itself): place by date like a loose file.
+                let f = &files[i];
+                let rel_dir = f.taken.filter(|_| f.trusted).and_then(month_dir).unwrap_or_else(|| "_날짜확인필요/기타".into());
+                out.insert(*id, Placement { act: a, rel_dir, tag: "loose", event: None, from_dir: f.dir().to_string(), kept: None });
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folder_names() {
+        assert_eq!(event_name("2015-08-14 제주도").as_deref(), Some("제주도"));
+        assert_eq!(event_name("20150814_제주 여행").as_deref(), Some("제주 여행"));
+        assert_eq!(event_name("2015.08 여름휴가").as_deref(), Some("여름휴가"));
+        assert_eq!(event_name("2015-08-14~16 제주").as_deref(), Some("제주"));
+        assert_eq!(event_name("하와이 여행").as_deref(), Some("하와이 여행"));
+        for generic in ["DCIM", "100CANON", "101APPLE", "Camera Roll", "카카오톡 받은 파일", "Photos from 2019", "2019", "2019-05", "20190512", "새 폴더", "RAW", "0001"] {
+            assert_eq!(event_name(generic), None, "{generic}");
+        }
+        assert_eq!(folder_month("2015-08-14 제주도"), Some((2015, 8)));
+        assert_eq!(folder_month("제주도"), None);
+        assert_eq!(safe_name("a:b?c."), "a_b_c");
+        assert_eq!(safe_name("CON"), "CON_");
+        assert_eq!(safe_name(&"가".repeat(80)).chars().count(), 60);
+    }
+}

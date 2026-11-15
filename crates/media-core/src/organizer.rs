@@ -43,6 +43,10 @@ pub struct OrganizeOptions {
     /// Files whose date is only a guess (folder name / file time) go to this folder instead.
     pub uncertain_folder: Option<String>,
     pub remove_empty_dirs: bool,
+    /// "template" (the `template` above) or "library" (year / year-month / event, from existing
+    /// folder names — see `library`).
+    pub layout: String,
+    pub library: crate::library::LibraryOptions,
 }
 
 impl Default for OrganizeOptions {
@@ -55,6 +59,8 @@ impl Default for OrganizeOptions {
             filter: FileFilter::default(),
             uncertain_folder: Some("_날짜확인필요".into()),
             remove_empty_dirs: true,
+            layout: "template".into(),
+            library: Default::default(),
         }
     }
 }
@@ -70,6 +76,10 @@ pub enum Action {
     SkipDuplicate,
     /// Drive not connected.
     SkipOffline,
+    /// Library: a copy on another drive (or a skipped folder) — left as it is.
+    Leave,
+    /// Library: a copy on the library drive — quarantined once its kept twin is in place.
+    Remove,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -81,6 +91,13 @@ pub struct PlanItem {
     pub renamed: bool,
     pub cross_volume: bool,
     pub size: i64,
+    /// Library: folder inside the library (for the folder tree), why it goes there, its event,
+    /// the folder it comes from, and for Remove the file kept instead.
+    pub group: String,
+    pub tag: String,
+    pub event: Option<String>,
+    pub from: String,
+    pub kept: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -96,6 +113,19 @@ pub struct PlanSummary {
     pub bytes: i64,
     pub uncertain_dates: u64,
     pub folders: u64,
+    /// Library: copies on other drives left alone, copies on the library drive removed.
+    pub leave: u64,
+    pub remove: u64,
+    pub remove_bytes: i64,
+    /// Bytes copied from other drives (needs that much free space on the library drive).
+    pub copy_bytes: i64,
+    pub big_videos: u64,
+    pub received: u64,
+    /// RAW / Live Photo videos / edited versions kept with their photo.
+    pub paired: u64,
+    pub events: u64,
+    /// Other files (documents, project files…) left behind in folders photos move out of.
+    pub leftover_files: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -223,6 +253,59 @@ fn same_bytes(ha: Option<&str>, a: &Path, hb: Option<&str>, b: &Path) -> bool {
     matches!((ha, hb), (Ok(x), Ok(y)) if x == y)
 }
 
+/// Sidecar files: edits and metadata other programs keep beside a photo.
+pub fn is_sidecar_name(lower: &str) -> bool {
+    [".xmp", ".aae", ".thm", ".json"].iter().any(|e| lower.ends_with(e))
+}
+
+/// Sidecars of `src` among the names in its folder, each with where it goes next to `dst`
+/// (renamed along when the photo was: `IMG_1.xmp` → `IMG_1 (2).xmp`).
+fn sidecars(src: &Path, dst: &Path, names: &[String]) -> Vec<(PathBuf, PathBuf)> {
+    let (Some(name), Some(dir), Some(dname), Some(ddir)) =
+        (src.file_name().map(|n| n.to_string_lossy().into_owned()), src.parent(), dst.file_name().map(|n| n.to_string_lossy().into_owned()), dst.parent())
+    else {
+        return Vec::new();
+    };
+    let stem = name.rfind('.').map(|i| &name[..i]).unwrap_or(&name).to_string();
+    let dstem = dname.rfind('.').map(|i| &dname[..i]).unwrap_or(&dname).to_string();
+    let mut wanted: Vec<(String, String)> = Vec::new(); // (lower-cased candidate, destination name)
+    // `IMG_1.xmp` beside `IMG_1.CR2` and `IMG_1.JPG` holds the RAW's edits: it goes with the RAW.
+    const RAW: &[&str] = &["cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2", "dng", "raf", "orf", "rw2", "pef", "srw", "x3f", "3fr", "iiq"];
+    let is_raw = RAW.contains(&crate::media::ext_of(&name).as_str());
+    let raw_beside = !is_raw && names.iter().any(|n| {
+        let l = n.to_lowercase();
+        l.strip_prefix(&format!("{}.", stem.to_lowercase())).is_some_and(|e| RAW.contains(&e))
+    });
+    for ext in ["xmp", "XMP", "aae", "AAE", "thm", "THM"] {
+        if raw_beside && ext.eq_ignore_ascii_case("xmp") {
+            continue;
+        }
+        wanted.push((format!("{stem}.{ext}").to_lowercase(), format!("{dstem}.{ext}")));
+    }
+    wanted.push((format!("{name}.xmp").to_lowercase(), format!("{dname}.xmp")));
+    for p in meta::takeout_json_paths(src) {
+        if let Some(n) = p.file_name().map(|n| n.to_string_lossy().into_owned()) {
+            let renamed = if let Some(rest) = n.strip_prefix(&name) { format!("{dname}{rest}") } else { n.replacen(&stem, &dstem, 1) };
+            wanted.push((n.to_lowercase(), renamed));
+        }
+    }
+    let mut out: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut taken: HashSet<String> = HashSet::new();
+    for (cand, to) in wanted {
+        if let Some(real) = names.iter().find(|n| n.to_lowercase() == cand) {
+            if taken.insert(real.to_lowercase()) {
+                // Keep the real file's own ending (`.AAE` stays `.AAE`).
+                let to = match (real.to_lowercase().strip_prefix(&stem.to_lowercase()), real.get(stem.len()..)) {
+                    (Some(_), Some(tail)) if real.len() >= stem.len() => format!("{dstem}{tail}"),
+                    _ => to,
+                };
+                out.push((dir.join(real), ddir.join(to)));
+            }
+        }
+    }
+    out
+}
+
 /// Files in a folder (lower-cased name -> size); empty if the folder does not exist yet.
 fn list_dir(dir: &Path) -> HashMap<String, i64> {
     std::fs::read_dir(dir)
@@ -268,6 +351,17 @@ pub fn plan(db: &Db, opts: &OrganizeOptions, stop: &StopFlag, progress: Progress
 
     let trips = crate::places::trip_titles(&conn)?;
     let persons = crate::people::folder_names(&conn)?;
+    let library = opts.layout == "library";
+    let placements = if library {
+        // Same-size files get their 64 KiB fingerprint (once), so copies are recognised.
+        crate::identity::backfill_prehashes(&conn)?;
+        let lib_vol: i64 = conn.query_row("SELECT id FROM volumes WHERE uid = ?", [&tvol.uid], |r| r.get(0)).unwrap_or(-1);
+        crate::library::layout(&conn, lib_vol, &ids, &opts.library, &crate::library::load_rules(&conn)?)?
+    } else {
+        HashMap::new()
+    };
+    let mut events: HashSet<String> = HashSet::new();
+    let mut from_dirs: HashSet<PathBuf> = HashSet::new();
     let mut items = Vec::with_capacity(ids.len());
     let mut summary = PlanSummary::default();
     // dst key -> (size, src path, known hash) of the file that claimed it first in this plan.
@@ -294,20 +388,58 @@ pub fn plan(db: &Db, opts: &OrganizeOptions, stop: &StopFlag, progress: Progress
             summary.uncertain_dates += 1;
         }
         let ctx = TemplateCtx { file: &f, labels, trip: trips.get(id).map(String::as_str), person: persons.get(id).map(String::as_str) };
-        let rel_dir = match (&opts.uncertain_folder, uncertain) {
-            (Some(u), true) if !u.trim().is_empty() => format!("{}/{}", sanitize(u.trim()), render_template(&opts.template, &ctx)),
+        let place = placements.get(id);
+        if library {
+            let Some(p) = place else { continue };
+            if matches!(p.act, crate::library::Act::Leave | crate::library::Act::Remove) {
+                let remove = p.act == crate::library::Act::Remove;
+                if remove {
+                    summary.remove += 1;
+                    summary.remove_bytes += f.size;
+                } else {
+                    summary.leave += 1;
+                }
+                items.push(PlanItem {
+                    file_id: f.id,
+                    src: src.to_string_lossy().into_owned(),
+                    dst: String::new(),
+                    action: if remove { Action::Remove } else { Action::Leave },
+                    renamed: false,
+                    cross_volume: false,
+                    size: f.size,
+                    group: String::new(),
+                    tag: p.tag.into(),
+                    event: None,
+                    from: p.from_dir.clone(),
+                    kept: p.kept,
+                });
+                continue;
+            }
+        }
+        let rel_dir = match (place, &opts.uncertain_folder, uncertain) {
+            (Some(p), _, _) => p.rel_dir.clone(),
+            (None, Some(u), true) if !u.trim().is_empty() => format!("{}/{}", sanitize(u.trim()), render_template(&opts.template, &ctx)),
             _ => render_template(&opts.template, &ctx),
         };
         let dir = volumes::join_rel(&target, &rel_dir);
         let base_name = target_name(&f, opts.rename);
+        let copy = match place {
+            Some(p) => p.act == crate::library::Act::Copy,
+            None => opts.mode == Mode::Copy,
+        };
         let mut item = PlanItem {
             file_id: f.id,
             src: src.to_string_lossy().into_owned(),
             dst: String::new(),
-            action: if opts.mode == Mode::Move { Action::Move } else { Action::Copy },
+            action: if copy { Action::Copy } else { Action::Move },
             renamed: false,
             cross_volume: f.volume_id_uid_differs(&conn, &tvol.uid),
             size: f.size,
+            group: rel_dir.clone(),
+            tag: place.map(|p| p.tag.to_string()).unwrap_or_default(),
+            event: place.and_then(|p| p.event.clone()),
+            from: place.map(|p| p.from_dir.clone()).unwrap_or_default(),
+            kept: None,
         };
         if !f.online {
             item.action = Action::SkipOffline;
@@ -355,10 +487,36 @@ pub fn plan(db: &Db, opts: &OrganizeOptions, stop: &StopFlag, progress: Progress
         item.dst = dst.to_string_lossy().into_owned();
         match item.action {
             Action::Move => summary.moves += 1,
-            Action::Copy => summary.copies += 1,
+            Action::Copy => {
+                summary.copies += 1;
+                summary.copy_bytes += f.size;
+            }
             Action::InPlace => summary.in_place += 1,
             Action::SkipDuplicate => summary.skip_duplicate += 1,
             Action::SkipOffline => summary.skip_offline += 1,
+            Action::Leave | Action::Remove => {}
+        }
+        if let Some(p) = place {
+            match p.tag {
+                "received" => summary.received += 1,
+                "raw" | "live" | "edited" => summary.paired += 1,
+                _ => {}
+            }
+            if p.rel_dir.starts_with("큰 동영상/") {
+                summary.big_videos += 1;
+            }
+            if let Some(e) = &p.event {
+                events.insert(format!("{}|{e}", p.rel_dir));
+            }
+            if item.action == Action::Move {
+                if let Some(parent) = src.parent() {
+                    from_dirs.insert(parent.to_path_buf());
+                }
+                // The event folder itself too (its photos may all be in subfolders).
+                if p.event.is_some() && !p.from_dir.is_empty() {
+                    from_dirs.insert(volumes::join_rel(Path::new(&f.mount), &p.from_dir));
+                }
+            }
         }
         if matches!(item.action, Action::Move | Action::Copy) {
             summary.bytes += f.size;
@@ -373,6 +531,22 @@ pub fn plan(db: &Db, opts: &OrganizeOptions, stop: &StopFlag, progress: Progress
         items.push(item);
     }
     summary.folders = folders.len() as u64;
+    summary.events = events.len() as u64;
+    // Files that are not photos / videos (nor their sidecars) stay behind in the folders photos
+    // move out of: count them so the preview can say so.
+    for d in &from_dirs {
+        summary.leftover_files += std::fs::read_dir(d)
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+                    .filter(|e| {
+                        let n = e.file_name().to_string_lossy().to_lowercase();
+                        crate::media::kind_for_ext(&crate::media::ext_of(&n)).is_none() && !is_sidecar_name(&n)
+                    })
+                    .count() as u64
+            })
+            .unwrap_or(0);
+    }
     progress(Progress::new("organize:plan", "done", total, total, ""));
     Ok(Plan { id: uuid::Uuid::new_v4().simple().to_string(), options: opts.clone(), items, summary })
 }
@@ -395,6 +569,12 @@ pub struct ExecReport {
     pub done: u64,
     pub failed: u64,
     pub bytes: i64,
+    /// Sidecar files (.xmp / .aae / .thm / .json) moved or copied with their photo.
+    pub sidecars: u64,
+    /// Library: copies on the library drive quarantined, and ones kept (twin not in place, or protected).
+    pub removed: u64,
+    pub removed_bytes: i64,
+    pub remove_skipped: u64,
     pub errors: Vec<String>,
     pub cancelled: bool,
 }
@@ -410,9 +590,31 @@ pub fn execute(db: &Db, plan: &Plan, stop: &StopFlag, progress: ProgressFn) -> R
     let tvol_id = volumes::upsert(&conn, &tvol)?;
 
     let work: Vec<&PlanItem> = plan.items.iter().filter(|i| matches!(i.action, Action::Move | Action::Copy)).collect();
-    let verb = if plan.options.mode == Mode::Move { "이동" } else { "복사" };
-    let batch = journal::new_batch(&conn, "organize", &format!("{} → {} ({}개 {verb})", plan.options.template, target.display(), work.len()))?;
+    // Copies from other drives need room on the library drive (with a little margin).
+    if plan.summary.copy_bytes > 0 {
+        if let Some(free) = volumes::free_space(&target) {
+            let need = plan.summary.copy_bytes as u64 + 512 * 1024 * 1024;
+            if free < need {
+                bail!(
+                    "공간이 부족합니다: 복사할 {:.1} GB, 남은 공간 {:.1} GB",
+                    plan.summary.copy_bytes as f64 / 1e9,
+                    free as f64 / 1e9
+                );
+            }
+        }
+    }
+    let library = plan.options.layout == "library";
+    let what = if library {
+        let s = &plan.summary;
+        format!("라이브러리로 모으기 → {} (이동 {} · 복사 {} · 사본 정리 {})", target.display(), s.moves, s.copies, s.remove)
+    } else {
+        let verb = if plan.options.mode == Mode::Move { "이동" } else { "복사" };
+        format!("{} → {} ({}개 {verb})", plan.options.template, target.display(), work.len())
+    };
+    let batch = journal::new_batch(&conn, "organize", &what)?;
     let mut rep = ExecReport { batch_id: batch.clone(), ..Default::default() };
+    // Folder listings for finding sidecars (one read per source folder).
+    let mut listings: HashMap<PathBuf, Vec<String>> = HashMap::new();
     let mut touched_dirs: HashSet<PathBuf> = HashSet::new();
     let source_roots: Vec<PathBuf> = db::list_sources(&conn)?.into_iter().map(|s| PathBuf::from(s.abs_path)).collect();
     let total = work.len() as u64;
@@ -443,15 +645,38 @@ pub fn execute(db: &Db, plan: &Plan, stop: &StopFlag, progress: ProgressFn) -> R
             }
             let dst = PathBuf::from(&it.dst);
             let dst_rel = volumes::rel_of(&tvol.root, &dst)?;
-            match plan.options.mode {
-                Mode::Move => {
-                    journal::move_indexed(&conn, &batch, &f, &dst, tvol_id, &dst_rel)?;
-                    if let Some(p) = src.parent() {
-                        touched_dirs.insert(p.to_path_buf());
-                    }
+            let copy = it.action == Action::Copy;
+            // The folder's names, read before anything in it moves (so a RAW beside the JPG is seen).
+            if let Some(dir) = src.parent() {
+                listings.entry(dir.to_path_buf()).or_insert_with(|| {
+                    std::fs::read_dir(dir).map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default()
+                });
+            }
+            if copy {
+                journal::copy_indexed(&conn, &batch, &f, &dst, tvol_id, &dst_rel)?;
+            } else {
+                journal::move_indexed(&conn, &batch, &f, &dst, tvol_id, &dst_rel)?;
+                if let Some(p) = src.parent() {
+                    touched_dirs.insert(p.to_path_buf());
                 }
-                Mode::Copy => {
-                    journal::copy_indexed(&conn, &batch, &f, &dst, tvol_id, &dst_rel)?;
+            }
+            // .xmp / .aae / .thm / Takeout .json beside the photo travel with it.
+            if let Some(names) = src.parent().and_then(|d| listings.get_mut(d)) {
+                for (side, side_dst) in sidecars(&src, &dst, names) {
+                    match journal::move_sidecar(&conn, &batch, f.id, &side, &side_dst, copy) {
+                        Ok(()) => {
+                            rep.sidecars += 1;
+                            if !copy {
+                                let gone = side.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                                names.retain(|n| *n != gone);
+                            }
+                        }
+                        Err(e) => {
+                            if rep.errors.len() < 200 {
+                                rep.errors.push(format!("{}: {e}", side.display()));
+                            }
+                        }
+                    }
                 }
             }
             Ok(())
@@ -470,6 +695,41 @@ pub fn execute(db: &Db, plan: &Plan, stop: &StopFlag, progress: ProgressFn) -> R
         }
     }
     conn.execute_batch("COMMIT")?;
+    // Copies on the library drive: removed (quarantined, in this same undoable batch) once the
+    // kept twin is really in place. Protected files (♥, original, keep folders) stay.
+    let removes: Vec<&PlanItem> = plan.items.iter().filter(|i| i.action == Action::Remove).collect();
+    if !removes.is_empty() && !rep.cancelled {
+        let ids: Vec<i64> = removes.iter().map(|i| i.file_id).collect();
+        let protected: HashSet<i64> = crate::protect::check(&conn, &ids)?.into_iter().map(|b| b.id).collect();
+        for it in removes {
+            let kept_ok = it
+                .kept
+                .and_then(|k| db::get_file(&conn, k).ok().flatten())
+                .is_some_and(|k| !k.missing && !k.quarantined && k.abs_path().is_file());
+            if !kept_ok || protected.contains(&it.file_id) {
+                rep.remove_skipped += 1;
+                continue;
+            }
+            let Some(f) = db::get_file(&conn, it.file_id)? else { continue };
+            if f.quarantined || f.missing || !f.online {
+                continue;
+            }
+            match journal::quarantine(&conn, &batch, &f) {
+                Ok(()) => {
+                    rep.removed += 1;
+                    rep.removed_bytes += f.size;
+                    if let Some(p) = f.abs_path().parent() {
+                        touched_dirs.insert(p.to_path_buf());
+                    }
+                }
+                Err(e) => {
+                    if rep.errors.len() < 200 {
+                        rep.errors.push(format!("{}: {e}", it.src));
+                    }
+                }
+            }
+        }
+    }
     if plan.options.remove_empty_dirs {
         for d in touched_dirs {
             // Never remove a source root itself or anything above it.

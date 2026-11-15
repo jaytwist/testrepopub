@@ -14,6 +14,7 @@ pub mod faces;
 pub mod identity;
 pub mod importer;
 pub mod journal;
+pub mod library;
 pub mod labels;
 pub mod media;
 pub mod meta;

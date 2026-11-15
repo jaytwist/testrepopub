@@ -174,6 +174,22 @@ fn record(
     Ok(())
 }
 
+/// Move (or copy) a sidecar file (.xmp, .aae, …) with its photo `file_id`; undone together.
+pub fn move_sidecar(conn: &Connection, batch: &str, file_id: i64, src: &Path, dst: &Path, copy: bool) -> Result<()> {
+    if dst.exists() {
+        bail!("이미 있음: {}", dst.display());
+    }
+    if let Some(p) = dst.parent() {
+        fs::create_dir_all(p)?;
+    }
+    if copy {
+        fs::copy(src, dst)?;
+    } else {
+        move_file(src, dst)?;
+    }
+    record(conn, batch, if copy { "sidecar_copy" } else { "sidecar_move" }, file_id, src, dst, 0, "", 0, "", None)
+}
+
 /// Soft-delete one indexed file into its volume's quarantine folder.
 pub fn quarantine(conn: &Connection, batch: &str, file: &db::FileRow) -> Result<()> {
     if !file.online {
@@ -365,6 +381,16 @@ pub fn undo_batch(conn: &Connection, batch_id: &str) -> Result<UndoReport> {
                         if let Ok(v) = volumes::identify(&existing_ancestor(parent)) {
                             prune_empty_dirs(parent, &v.root);
                         }
+                    }
+                }
+                "sidecar_move" => {
+                    if dst.exists() && !src.exists() {
+                        move_file(&dst, &src)?;
+                    }
+                }
+                "sidecar_copy" => {
+                    if dst.exists() {
+                        fs::remove_file(&dst)?;
                     }
                 }
                 other => return Err(anyhow!("unknown op {other}")),

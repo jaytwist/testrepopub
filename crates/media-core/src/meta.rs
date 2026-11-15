@@ -7,7 +7,7 @@
 //!   4. File modification time  -> "mtime"
 
 use std::cell::RefCell;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveDateTime, TimeZone, Timelike};
 use nom_exif::{ExifTag, MediaKind, MediaParser, MediaSource, TrackInfoTag};
@@ -183,12 +183,59 @@ pub fn extract(path: &Path, kind: Kind, mtime: i64) -> Meta {
     if matches!(m.orientation, Some(5..=8)) {
         std::mem::swap(&mut m.width, &mut m.height);
     }
+    // Google Takeout: the photo itself often has no date, the JSON beside it does.
+    if m.taken_at.is_none() {
+        if let Some(t) = takeout_json(path) {
+            m.taken_at = Some(t.taken);
+            m.date_source = "takeout".into();
+            if m.lat.is_none() {
+                if let Some((la, lo)) = t.gps {
+                    m.lat = Some(la);
+                    m.lon = Some(lo);
+                }
+            }
+        }
+    }
     if m.taken_at.is_none() {
         let (ts, src) = infer_date(path, mtime);
         m.taken_at = Some(ts);
         m.date_source = src.to_string();
     }
     m
+}
+
+pub struct Takeout {
+    pub taken: i64,
+    pub gps: Option<(f64, f64)>,
+}
+
+/// The JSON Google Takeout writes next to a photo: `IMG.jpg.json`, newer
+/// `IMG.jpg.supplemental-metadata.json`, both cut to 51 characters for long names.
+pub fn takeout_json_paths(path: &Path) -> Vec<PathBuf> {
+    let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else { return Vec::new() };
+    let dir = path.parent().unwrap_or(Path::new(""));
+    let cut = |s: String| -> String { s.chars().take(46).collect::<String>() + ".json" };
+    let mut out = vec![
+        format!("{name}.json"),
+        format!("{name}.supplemental-metadata.json"),
+        cut(format!("{name}.supplemental-metadata")),
+        cut(name.clone()),
+    ];
+    out.dedup();
+    out.into_iter().map(|n| dir.join(n)).collect()
+}
+
+fn takeout_json(path: &Path) -> Option<Takeout> {
+    let p = takeout_json_paths(path).into_iter().find(|p| p.is_file())?;
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(p).ok()?).ok()?;
+    let ts = v.get("photoTakenTime")?.get("timestamp")?;
+    let taken = ts.as_str().and_then(|s| s.parse::<i64>().ok()).or_else(|| ts.as_i64())?;
+    if taken <= 0 {
+        return None;
+    }
+    let geo = v.get("geoData").or_else(|| v.get("geoDataExif"));
+    let gps = geo.and_then(|g| Some((g.get("latitude")?.as_f64()?, g.get("longitude")?.as_f64()?))).filter(|(a, b)| *a != 0.0 || *b != 0.0);
+    Some(Takeout { taken, gps })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -291,7 +338,7 @@ pub fn infer_date(path: &Path, mtime: i64) -> (i64, &'static str) {
 
 pub fn confidence(date_source: &str) -> &'static str {
     match date_source {
-        "exif" | "video" | "user" => "high",
+        "exif" | "video" | "user" | "takeout" => "high",
         "filename" => "medium",
         _ => "low",
     }
