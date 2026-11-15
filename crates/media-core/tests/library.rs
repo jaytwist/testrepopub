@@ -98,11 +98,11 @@ fn library_layout_end_to_end() {
     assert_eq!(dst("Hawaii 2018/IMG_x.jpg"), "2018/2018-07/Hawaii 2018/IMG_x.jpg", "Takeout album with the JSON date");
     assert_eq!(by_src("diskC/Pictures/c_only.jpg").action, Action::Copy);
     assert_eq!(dst("diskC/Pictures/c_only.jpg"), "2022/2022-02/c_only.jpg");
-    assert!(plan.summary.leftover_files >= 1, "notes.txt stays behind: {:?}", plan.summary);
 
     let rep = organizer::execute(&db, &plan, &stop, &quiet).unwrap();
     assert_eq!((rep.failed, rep.removed), (0, 1), "{:?}", rep.errors);
     assert!(rep.sidecars >= 3, "xmp, aae, json moved: {}", rep.sidecars);
+    assert!(rep.leftover_files >= 1, "notes.txt stays behind: {rep:?}");
     assert!(lib.join("2024/2024-06/RAW/IMG_1.xmp").is_file(), "xmp goes with the RAW");
     let found: Vec<_> = walkdir_files(&e).into_iter().filter(|p| p.contains("IMG_7")).collect();
     assert!(lib.join("2024/2024-06/IMG_7.AAE").is_file(), "{found:?} {:?}", rep.errors);

@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
+use std::collections::HashMap;
 use anyhow::{Context, Result};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
@@ -754,6 +755,20 @@ pub fn list_sources(conn: &Connection) -> Result<Vec<SourceRow>> {
 pub fn get_file(conn: &Connection, id: i64) -> Result<Option<FileRow>> {
     let sql = format!("SELECT {FILE_COLS} FROM files f JOIN volumes v ON v.id = f.volume_id WHERE f.id = ?");
     Ok(conn.query_row(&sql, [id], FileRow::from_row).optional()?)
+}
+
+/// Every indexed file (not missing, not quarantined), keyed by id: one query instead of one per
+/// file when a whole-library pass needs the rows.
+pub fn all_files(conn: &Connection) -> Result<HashMap<i64, FileRow>> {
+    let sql = format!("SELECT {FILE_COLS} FROM files f JOIN volumes v ON v.id = f.volume_id WHERE f.missing = 0 AND f.quarantined = 0");
+    let mut st = conn.prepare(&sql)?;
+    let rows = st.query_map([], FileRow::from_row)?;
+    let mut out = HashMap::new();
+    for r in rows {
+        let f = r?;
+        out.insert(f.id, f);
+    }
+    Ok(out)
 }
 
 pub fn query_files(conn: &Connection, filter: &FileFilter, offset: i64, limit: i64) -> Result<Vec<FileRow>> {

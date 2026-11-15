@@ -70,6 +70,62 @@ pub fn save_rules(conn: &Connection, rules: &[FolderRule]) -> Result<()> {
     Ok(())
 }
 
+fn load_setting<T: serde::de::DeserializeOwned + Default>(conn: &Connection, key: &str) -> Result<T> {
+    let v: Option<String> = conn.query_row("SELECT value FROM settings WHERE key = ?", [key], |r| r.get(0)).optional()?;
+    Ok(v.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default())
+}
+
+fn save_setting<T: Serialize>(conn: &Connection, key: &str, value: &T) -> Result<()> {
+    conn.execute(
+        "INSERT INTO settings(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![key, serde_json::to_string(value)?],
+    )?;
+    Ok(())
+}
+
+/// "Merge these library folders": what is planned into `from` itself (and its `RAW` folder)
+/// goes into `into` instead. Other folders below `from` are folders of their own in the preview
+/// and stay where they are.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Merge {
+    pub from: String,
+    pub into: String,
+}
+
+pub fn load_merges(conn: &Connection) -> Result<Vec<Merge>> {
+    load_setting(conn, "library_merges")
+}
+
+pub fn save_merges(conn: &Connection, merges: &[Merge]) -> Result<()> {
+    save_setting(conn, "library_merges", &merges)
+}
+
+/// Where a library folder ends up after the merges (followed through chains, A → B → C).
+pub fn merged(rel_dir: &str, merges: &[Merge]) -> String {
+    let (mut base, raw) = match rel_dir.strip_suffix("/RAW") {
+        Some(b) => (b.to_string(), true),
+        None => (rel_dir.to_string(), false),
+    };
+    for _ in 0..16 {
+        let Some(m) = merges.iter().find(|m| m.from == base && m.into != m.from) else { break };
+        base = m.into.clone();
+    }
+    if raw {
+        base.push_str("/RAW");
+    }
+    base
+}
+
+/// Contents (fingerprints) the user deleted from the library for good: copies of them left on
+/// other drives are not brought back.
+pub fn load_excluded(conn: &Connection) -> Result<Vec<String>> {
+    load_setting(conn, "library_excluded")
+}
+
+pub fn save_excluded(conn: &Connection, keys: &[String]) -> Result<()> {
+    save_setting(conn, "library_excluded", &keys)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Act {
@@ -110,7 +166,7 @@ const GENERIC: &[&str] = &[
     "export", "exports", "edited", "edit", "보정", "편집", "takeout", "google photos", "google 포토", "icloud photos", "icloud", "onedrive",
     "dropbox", "google drive", "desktop", "바탕 화면", "documents", "문서", "users", "user", "home", "media", "files", "data", "temp", "tmp",
     "받은 사진", "큰 동영상", "_날짜확인필요", "기타", "etc", "misc", "all", "sdcard", "internal storage", "phone", "iphone", "android",
-    "폰사진", "폰 사진", "휴대폰", "휴대폰 사진", "핸드폰", "핸드폰 사진", "스마트폰", "카메라", "캠코더", "camcorder", "phone photos", "mobile",
+    "폰", "폰사진", "폰 사진", "휴대폰", "휴대폰 사진", "핸드폰", "핸드폰 사진", "스마트폰", "카메라", "캠코더", "camcorder", "phone photos", "mobile",
     "사진 백업", "옛날사진", "옛날 사진", "old photos", "정리", "미정리", "정리 안 됨", "unsorted", "inbox", "import", "imports", "가져오기",
 ];
 
@@ -220,6 +276,9 @@ struct F {
     taken: Option<i64>,
     trusted: bool,
     content: Option<(String, i64)>,
+    /// No fingerprint yet while another file has the same size: it may be a copy — left alone
+    /// until the fingerprint is read (in the background).
+    unverified: bool,
 }
 
 impl F {
@@ -240,7 +299,10 @@ impl F {
 }
 
 /// Where each of `ids` belongs in the library on volume `lib_vol`.
-pub fn layout(conn: &Connection, lib_vol: i64, ids: &[i64], opts: &LibraryOptions, rules: &[FolderRule]) -> Result<HashMap<i64, Placement>> {
+/// `lib_root` is the library folder relative to its drive (`사진`): a copy already filed there is
+/// the one kept.
+pub fn layout(conn: &Connection, lib_vol: i64, lib_root: &str, ids: &[i64], opts: &LibraryOptions, rules: &[FolderRule]) -> Result<HashMap<i64, Placement>> {
+    let lib_root = lib_root.replace('\\', "/").trim_matches('/').to_string();
     let wanted: HashSet<i64> = ids.iter().copied().collect();
     let files: Vec<F> = {
         let mut st = conn.prepare(
@@ -260,13 +322,32 @@ pub fn layout(conn: &Connection, lib_vol: i64, ids: &[i64], opts: &LibraryOption
                     size,
                     taken: r.get(5)?,
                     trusted: meta::confidence(&src) != "low",
-                    content: key.map(|k| (k, size)),
+                    // '' = the fingerprint could not be read: never the same as anything.
+                    unverified: key.is_none(),
+                    content: key.filter(|k| !k.is_empty()).map(|k| (k, size)),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        rows.into_iter().filter(|f| wanted.contains(&f.id)).collect()
+        let mut sizes: HashMap<i64, u32> = HashMap::new();
+        for f in &rows {
+            *sizes.entry(f.size).or_default() += 1;
+        }
+        rows.into_iter()
+            .filter(|f| wanted.contains(&f.id))
+            .map(|mut f| {
+                f.unverified = f.unverified && sizes.get(&f.size).copied().unwrap_or(0) > 1;
+                f
+            })
+            .collect()
     };
     let by_id: HashMap<i64, usize> = files.iter().enumerate().map(|(i, f)| (f.id, i)).collect();
+    // Rows for the copy ranking and trips, loaded once (not one query per file).
+    let all = db::all_files(conn)?;
+    let trips: HashMap<i64, (String, i64)> = {
+        let mut st = conn.prepare("SELECT tf.file_id, t.title, t.start_ts FROM trip_files tf JOIN trips t ON t.id = tf.trip_id")?;
+        let m = st.query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?.collect::<rusqlite::Result<HashMap<i64, (String, i64)>>>()?;
+        m
+    };
     let mut labels: HashMap<i64, Vec<String>> = HashMap::new();
     {
         let mut st = conn.prepare("SELECT file_id, label FROM labels")?;
@@ -281,24 +362,33 @@ pub fn layout(conn: &Connection, lib_vol: i64, ids: &[i64], opts: &LibraryOption
 
     // 1. Copies: keep one per content (preferably on the library drive), by the duplicate ranking.
     let mut act: HashMap<i64, (Act, Option<i64>, &'static str)> = HashMap::new();
+    // Deleted from the library for good: copies elsewhere stay where they are.
+    let excluded: HashSet<String> = load_excluded(conn)?.into_iter().collect();
+    for f in files.iter().filter(|f| f.content.as_ref().is_some_and(|c| excluded.contains(&c.0))) {
+        act.insert(f.id, (Act::Leave, None, "excluded"));
+    }
     let mut groups: HashMap<(String, i64), Vec<i64>> = HashMap::new();
     for f in &files {
         if let Some(c) = &f.content {
-            groups.entry(c.clone()).or_default().push(f.id);
+            if !excluded.contains(&c.0) {
+                groups.entry(c.clone()).or_default().push(f.id);
+            }
         }
     }
     let dup_rules = DupRules::load(conn)?;
     for members in groups.values().filter(|m| m.len() > 1) {
-        let mut rows: Vec<FileRow> = members.iter().filter_map(|id| db::get_file(conn, *id).ok().flatten()).collect();
+        let mut rows: Vec<FileRow> = members.iter().filter_map(|id| all.get(id).cloned()).collect();
         dedupe::rank_members(&mut rows, &labels, &dup_rules);
-        // Identical bytes: keep the one on the library drive, then the one filed under the most
-        // meaningful folders (an event rather than "backup"), then the duplicate ranking.
+        // Identical bytes: keep the one on the library drive — one already in the library folder
+        // first — then the one filed under the most meaningful folders (an event rather than
+        // "backup"), then the duplicate ranking.
         let meaning = |r: &FileRow| -> usize {
             let rel = r.rel_path.replace('\\', "/");
             let dir = rel.rfind('/').map(|i| rel[..i].to_string()).unwrap_or_default();
             dir.split('/').filter(|s| event_name(s).is_some()).count()
         };
-        rows.sort_by_key(|r| ((r.volume_id != lib_vol) as u8, std::cmp::Reverse(meaning(r))));
+        let filed = |r: &FileRow| r.volume_id == lib_vol && (lib_root.is_empty() || r.rel_path.replace('\\', "/").starts_with(&format!("{lib_root}/")));
+        rows.sort_by_key(|r| ((r.volume_id != lib_vol) as u8, !filed(r) as u8, std::cmp::Reverse(meaning(r))));
         let keep = rows[0].id;
         for (i, r) in rows.iter().enumerate() {
             let a = if i == 0 {
@@ -310,6 +400,9 @@ pub fn layout(conn: &Connection, lib_vol: i64, ids: &[i64], opts: &LibraryOption
             };
             act.insert(r.id, a);
         }
+    }
+    for f in files.iter().filter(|f| f.unverified) {
+        act.insert(f.id, (Act::Leave, None, "unverified"));
     }
     for f in &files {
         act.entry(f.id).or_insert((if f.vol == lib_vol { Act::Move } else { Act::Copy }, None, ""));
@@ -536,13 +629,7 @@ pub fn layout(conn: &Connection, lib_vol: i64, ids: &[i64], opts: &LibraryOption
         } else {
             let month = if f.trusted { f.taken.and_then(month_dir) } else { None };
             let received = has(f.id, &|l| matches!(l, "src:kakaotalk" | "src:whatsapp" | "src:telegram" | "src:line" | "src:instagram" | "src:download"));
-            let trip: Option<(String, i64)> = conn
-                .query_row(
-                    "SELECT t.title, t.start_ts FROM trip_files tf JOIN trips t ON t.id = tf.trip_id WHERE tf.file_id = ?",
-                    [f.id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?;
+            let trip: Option<(String, i64)> = trips.get(&f.id).cloned();
             match month {
                 None => {
                     // Named like an event folder ("2024 People" → "People"), so planning again keeps it.
@@ -611,6 +698,11 @@ mod tests {
         assert_eq!(event_name("옛날 백업"), None);
         assert_eq!(event_name("Photos Backup 2"), None);
         assert_eq!(event_name("사진 복사본"), None);
+        assert_eq!(event_name("폰"), None);
+        let m = vec![Merge { from: "2019/2019-05".into(), into: "2019/2019-12".into() }];
+        assert_eq!(merged("2019/2019-05", &m), "2019/2019-12");
+        assert_eq!(merged("2019/2019-05/RAW", &m), "2019/2019-12/RAW");
+        assert_eq!(merged("2019/2019-05/제주도", &m), "2019/2019-05/제주도", "another folder of its own stays");
         assert_eq!(safe_name("a:b?c."), "a_b_c");
         assert_eq!(safe_name("CON"), "CON_");
         assert_eq!(safe_name(&"가".repeat(80)).chars().count(), 60);

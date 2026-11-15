@@ -155,7 +155,11 @@ export interface PlanSummary {
   total: number; moves: number; copies: number; in_place: number; skip_duplicate: number; skip_offline: number;
   renamed: number; cross_volume: number; bytes: number; uncertain_dates: number; folders: number;
   leave: number; remove: number; remove_bytes: number; copy_bytes: number; big_videos: number; received: number;
-  paired: number; events: number; leftover_files: number;
+  paired: number; events: number; leftover_files: number; excluded: number;
+  /** Library: same-size files whose fingerprint is not read yet (left alone this time). */
+  unverified: number;
+  /** How long each planning step took: [name, ms]. */
+  timing: [string, number][];
 }
 /** One destination folder of a library plan. */
 export interface TreeNode {
@@ -171,10 +175,14 @@ export interface CopyFolder { dir: string; count: number; bytes: number; version
 export interface CopyPair { file_id: number; src: string; size: number; tag: string; kept_id: number; kept_src: string; kept_dst: string }
 export interface KeepItem { file_id: number; group: string; action: PlanItem["action"]; copies: number }
 export interface DiskSpace { free: number; total: number; reserve: number }
+/** Library folder `from` merged into `into`. */
+export interface Merge { from: string; into: string }
+export interface FolderDeletePreview { count: number; bytes: number; not_copied: number; protected: Blocked[] }
+export interface FolderDeleteReport { batch_id: string; deleted: number; bytes: number; kept_protected: number; not_copied: number; failed: number; errors: string[] }
 export interface ExecReport {
   batch_id: string; done: number; failed: number; bytes: number; sidecars: number; removed: number; removed_bytes: number;
   remove_skipped: number; copies_batch: string; versions_batch: string; versions: number; purged: number; purged_bytes: number;
-  purge_kept: number; space_skipped: number; space_skipped_bytes: number; errors: string[]; cancelled: boolean;
+  purge_kept: number; space_skipped: number; space_skipped_bytes: number; leftover_files: number; errors: string[]; cancelled: boolean;
 }
 export interface FolderRule { volume_id: number; rel_dir: string; kind: "event" | "loose" | "skip"; name: string | null }
 export interface PlanView { id: string; summary: PlanSummary; options: OrganizeOptions }
@@ -194,7 +202,7 @@ export interface UpdateProgress { downloaded: number; total: number | null }
 export interface LaneStatus {
   running: boolean; paused: boolean; reason: "user" | "job" | "battery" | null; done: number; total: number;
   eta_secs: number; current: string; provider: string; pending_online: number; pending_offline: number;
-  analyzed: number; faces_available: boolean; faces_found: number; last_error: string | null;
+  analyzed: number; faces_available: boolean; faces_found: number; faces_enabled: boolean; last_error: string | null;
   timed_files: number; read_ms: number; faces_ms: number; reused: number;
 }
 export interface AnalysisOptions { auto: boolean; people: boolean; gpu: boolean; pause_on_battery: boolean }
@@ -246,6 +254,8 @@ export const api = {
   undismiss: (ids: number[], kind: string) => invoke<number>("undismiss", { ids, kind }),
   analysisStatus: () => invoke<LaneStatus>("analysis_status"),
   analysisPause: (paused: boolean) => invoke<void>("analysis_pause", { paused }),
+  /** Face finding on / off for this session (on again at the next start). */
+  setFacesEnabled: (on: boolean) => invoke<void>("set_faces_enabled", { on }),
   analysisStart: () => invoke<void>("analysis_start"),
   getAnalysisOptions: () => invoke<AnalysisOptions>("get_analysis_options"),
   setAnalysisOptions: (options: AnalysisOptions) => invoke<void>("set_analysis_options", { options }),
@@ -296,6 +306,14 @@ export const api = {
     invoke<CopyPair[]>("year_copy_pairs", { planId, year, dir, offset, limit }),
   yearKeep: (planId: string, year: string, offset: number, limit: number) => invoke<KeepItem[]>("year_keep", { planId, year, offset, limit }),
   diskSpace: (path: string) => invoke<DiskSpace | null>("disk_space", { path }),
+  groupItems: (planId: string, groups: string[], offset: number, limit: number) => invoke<KeepItem[]>("group_items", { planId, groups, offset, limit }),
+  getLibraryMerges: () => invoke<Merge[]>("get_library_merges"),
+  setLibraryMerges: (merges: Merge[]) => invoke<void>("set_library_merges", { merges }),
+  libraryExcludedCount: () => invoke<number>("library_excluded_count"),
+  clearLibraryExcluded: () => invoke<void>("clear_library_excluded"),
+  libraryDeletePreview: (planId: string, groups: string[]) => invoke<FolderDeletePreview>("library_delete_preview", { planId, groups }),
+  startLibraryDelete: (planId: string, groups: string[], keepProtected: boolean) =>
+    invoke<void>("start_library_delete", { planId, groups, keepProtected }),
   planTree: (planId: string) => invoke<TreeNode[]>("plan_tree", { planId }),
   getLibraryRules: () => invoke<FolderRule[]>("get_library_rules"),
   setLibraryRules: (rules: FolderRule[]) => invoke<void>("set_library_rules", { rules }),

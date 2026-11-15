@@ -168,15 +168,32 @@ pub fn apply_copy(conn: &Connection, from: i64, volume_id: i64, rel: &str, name:
 /// those can have a copy): fingerprint them once — one 64 KiB read each — so the backup check
 /// and copy recognition see them. Connected drives only; returns how many were done.
 pub fn backfill_prehashes(conn: &Connection) -> Result<usize> {
+    let stop = crate::StopFlag::new();
+    let mut done = 0;
+    loop {
+        let n = backfill_prehashes_with(conn, 5000, &stop, &|| false)?;
+        done += n;
+        if n == 0 {
+            return Ok(done);
+        }
+    }
+}
+
+/// Up to `limit` missing fingerprints, read in folder order with two reads at a time (a hard
+/// disk is slower with more), checking `stop` / `paused` between small chunks. A file that cannot
+/// be read gets a fingerprint of its own (`unreadable-<id>`): not read again, and never taken for
+/// a copy of anything.
+pub fn backfill_prehashes_with(conn: &Connection, limit: usize, stop: &crate::StopFlag, paused: &dyn Fn() -> bool) -> Result<usize> {
     use rayon::prelude::*;
     let todo: Vec<(i64, std::path::PathBuf, u64)> = {
         let mut st = conn.prepare(
             "SELECT f.id, v.mount, f.rel_path, f.size FROM files f JOIN volumes v ON v.id = f.volume_id
              WHERE f.prehash IS NULL AND f.missing = 0 AND f.quarantined = 0 AND v.online = 1
-               AND EXISTS (SELECT 1 FROM files g WHERE g.id != f.id AND g.size = f.size AND g.missing = 0 AND g.quarantined = 0)",
+               AND EXISTS (SELECT 1 FROM files g WHERE g.id != f.id AND g.size = f.size AND g.missing = 0 AND g.quarantined = 0)
+             ORDER BY f.volume_id, f.rel_path LIMIT ?",
         )?;
         let rows = st
-            .query_map([], |r| {
+            .query_map([limit.min(i64::MAX as usize) as i64], |r| {
                 let mount: String = r.get(1)?;
                 let rel: String = r.get(2)?;
                 Ok((r.get(0)?, volumes::join_rel(Path::new(&mount), &rel), r.get::<_, i64>(3)? as u64))
@@ -184,12 +201,26 @@ pub fn backfill_prehashes(conn: &Connection) -> Result<usize> {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     };
-    let done: Vec<(i64, String)> = todo.par_iter().filter_map(|(id, p, size)| journal::prehash_file(p, *size).ok().map(|h| (*id, h))).collect();
-    let mut st = conn.prepare("UPDATE files SET prehash = ? WHERE id = ?")?;
-    for (id, h) in &done {
-        st.execute(params![h, id])?;
+    if todo.is_empty() {
+        return Ok(0);
     }
-    Ok(done.len())
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
+    let mut st = conn.prepare("UPDATE files SET prehash = ? WHERE id = ?")?;
+    let mut done = 0;
+    for chunk in todo.chunks(64) {
+        if stop.is_stopped() || paused() {
+            break;
+        }
+        let hashes: Vec<(i64, String)> =
+            pool.install(|| chunk.par_iter().map(|(id, p, size)| (*id, journal::prehash_file(p, *size).unwrap_or_else(|_| format!("unreadable-{id}")))).collect());
+        conn.execute_batch("BEGIN")?;
+        for (id, h) in &hashes {
+            st.execute(params![h, id])?;
+        }
+        conn.execute_batch("COMMIT")?;
+        done += hashes.len();
+    }
+    Ok(done)
 }
 
 /// The user label that marks "this copy is the original".

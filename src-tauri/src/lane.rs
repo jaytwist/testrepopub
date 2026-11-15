@@ -33,6 +33,9 @@ pub struct LaneStatus {
     pub faces_available: bool,
     /// Faces found so far (diagnostics on the People screen).
     pub faces_found: i64,
+    /// Face finding switched on for this session (on at every start; the user can turn it off
+    /// while organizing — photos analysed meanwhile get their faces when it is back on).
+    pub faces_enabled: bool,
     /// Since the app started: photos analysed, average ms reading a photo, average ms on faces,
     /// and results reused from copies / JPGs instead of analysing.
     pub timed_files: u64,
@@ -48,6 +51,8 @@ pub struct Lane {
     user_paused: AtomicBool,
     job_active: AtomicBool,
     on_battery: AtomicBool,
+    /// Face finding turned off by the user (this session only).
+    faces_off: AtomicBool,
     pub pause: PauseFlag,
     pub stop: StopFlag,
     status: Mutex<LaneStatus>,
@@ -107,6 +112,8 @@ impl Lane {
         let mut s = self.status.lock().unwrap();
         s.paused = reason.is_some();
         s.reason = reason.map(String::from);
+        s.faces_enabled = !self.faces_off.load(Ordering::Relaxed);
+        s.faces_available = face_runtime(app).available();
         let snapshot = s.clone();
         drop(s);
         let _ = app.emit("analysis-status", snapshot);
@@ -128,7 +135,7 @@ impl Lane {
         let opts = Self::options(app);
         let mut s = self.status.lock().unwrap().clone();
         if let Ok(conn) = st.db.conn() {
-            if let Ok(p) = analysis::pending(&conn, people_active(app, &opts)) {
+            if let Ok(p) = analysis::pending(&conn, people_active(app, &opts) && !self.faces_off.load(Ordering::Relaxed)) {
                 s.pending_online = p.online;
                 s.pending_offline = p.offline;
                 s.analyzed = p.analyzed;
@@ -136,11 +143,36 @@ impl Lane {
         }
         s.running = self.running.load(Ordering::Relaxed);
         s.faces_available = face_runtime(app).available();
+        s.faces_enabled = !self.faces_off.load(Ordering::Relaxed);
         if let Ok(conn) = st.db.conn() {
             s.faces_found = conn.query_row("SELECT COUNT(*) FROM faces", [], |r| r.get(0)).unwrap_or(0);
         }
         (s.timed_files, s.read_ms, s.faces_ms, s.reused) = analysis::TIMING.snapshot();
         s
+    }
+
+    /// Turn face finding on or off for this session. A pass in progress is stopped and started
+    /// again with the new setting.
+    pub fn set_faces_enabled(self: &Arc<Self>, app: &AppHandle, on: bool) {
+        if self.faces_off.swap(!on, Ordering::SeqCst) == !on {
+            return;
+        }
+        self.status.lock().unwrap().faces_enabled = on;
+        let lane = self.clone();
+        let app = app.clone();
+        std::thread::spawn(move || {
+            if lane.running.load(Ordering::SeqCst) {
+                lane.stop.stop();
+                for _ in 0..600 {
+                    if !lane.running.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+            lane.kick(&app, false);
+            let _ = app.emit("analysis-status", lane.status(&app));
+        });
     }
 
     /// Drop the cached face engine (people feature toggled or GPU setting changed).
@@ -183,8 +215,23 @@ impl Lane {
             let st = app.state::<AppState>();
             let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).saturating_sub(1).max(1);
             loop {
+                // Fingerprints missing for same-size files (indexed by older versions): read in
+                // the background so copies are recognised; planning no longer reads the drives.
+                if let Ok(conn) = st.db.conn() {
+                    {
+                        let mut s = lane.status.lock().unwrap();
+                        s.current = "사본 확인용 지문 읽는 중".into();
+                    }
+                    while !lane.stop.is_stopped() && !lane.pause.is_paused() {
+                        match media_core::identity::backfill_prehashes_with(&conn, 2000, &lane.stop, &|| lane.pause.is_paused()) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    }
+                }
                 let opts = Self::options(&app);
-                let engine = match lane.engine(&app, &opts) {
+                let engine = if lane.faces_off.load(Ordering::Relaxed) { Ok(None) } else { lane.engine(&app, &opts) };
+                let engine = match engine {
                     Ok(e) => {
                         lane.status.lock().unwrap().last_error = None;
                         e
@@ -237,6 +284,9 @@ impl Lane {
                 {
                     let mut s = lane.status.lock().unwrap();
                     s.running = true;
+                    // Live updates carry these too (not only the full status query).
+                    s.faces_enabled = !lane.faces_off.load(Ordering::Relaxed);
+                    s.faces_available = face_runtime(&app).available();
                     s.provider = engine.as_ref().and_then(|e| e.lock().ok().map(|e| e.provider.clone())).unwrap_or_else(|| "-".into());
                 }
                 let res = analysis::run(&st.db, &st.thumbs, engine.as_deref(), threads, &lane.stop, &lane.pause, &progress);

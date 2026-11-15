@@ -583,3 +583,11 @@ kbd { font: 11px/1 ui-monospace, Consolas, monospace; border: 1px solid var(--li
 .keep-tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .keep-badge { position: absolute; left: 4px; bottom: 4px; font-size: 10px; padding: 1px 5px; border-radius: 4px; background: var(--bad); color: #fff; }
 .keep-badge.copyin { left: auto; right: 4px; background: var(--accent); }
+.lib-node.picked { background: var(--accent-soft); }
+.lib-node-main input[type="checkbox"] { margin: 0; }
+.sel-bar { position: sticky; top: 8px; z-index: 5; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 10px 14px; margin: 8px 0; border-radius: 10px; background: var(--panel); border: 1px solid var(--accent); box-shadow: var(--shadow); }
+.sel-bar .spacer { flex: 1; }
+.sel-preview { width: min(1100px, calc(100vw - 32px)); max-height: calc(100vh - 60px); overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
+.sel-preview h3 { margin: 0; }
+button.keep-tile { border: 0; padding: 0; cursor: pointer; }
+.plan-timing { margin: 2px 0 8px; }

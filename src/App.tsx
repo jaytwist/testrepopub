@@ -309,7 +309,7 @@ export default function App() {
               </div>
             ))}
           </nav>
-          {lane && (lane.running || lane.pending_online > 0) && (
+          {lane && (lane.running || lane.pending_online > 0 || !lane.faces_enabled) && (
             <div className="lane-card" title="썸네일·선명도 등 사진 정보를 뒤에서 만드는 중">
               <div className="row-between">
                 <span className="small"><b>사진 분석</b> {lane.running && !lane.paused && <span className="spinner tiny" />}</span>
@@ -321,6 +321,12 @@ export default function App() {
               </div>
               {lane.running && lane.total > 0 && (
                 <div className="bar"><div className="bar-fill" style={{ width: `${Math.min(100, (lane.done / lane.total) * 100)}%` }} /></div>
+              )}
+              {lane.faces_available && (
+                <label className="check-row small" title="얼굴 찾기는 분석 시간의 대부분을 차지합니다. 정리하는 동안 꺼 두면 썸네일·비슷한 사진 찾기만 빠르게 하고, 다시 켜면 그 사진들의 얼굴을 이어서 찾습니다. 앱을 다시 켜면 켜진 상태로 시작합니다.">
+                  <input type="checkbox" checked={lane.faces_enabled} onChange={(e) => api.setFacesEnabled(e.target.checked)} />
+                  인물 찾기 {lane.faces_enabled ? "켜짐" : "꺼짐 — 켜면 이어서"}
+                </label>
               )}
               <span className="muted small">
                 {lane.paused && lane.reason ? LANE_REASON[lane.reason] : lane.running

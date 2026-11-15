@@ -1103,6 +1103,72 @@ struct DiskSpace {
     reserve: u64,
 }
 
+/// Files planned into the chosen library folders (preview of a selection).
+#[tauri::command]
+fn group_items(state: State<AppState>, plan_id: String, groups: Vec<String>, offset: usize, limit: usize) -> CmdResult<Vec<organizer::KeepItem>> {
+    with_plan(&state, &plan_id, |p| organizer::group_items(p, &groups, offset, limit))
+}
+
+#[tauri::command]
+fn get_library_merges(state: State<AppState>) -> CmdResult<Vec<media_core::library::Merge>> {
+    let conn = state.db.conn().map_err(err)?;
+    media_core::library::load_merges(&conn).map_err(err)
+}
+
+#[tauri::command]
+fn set_library_merges(state: State<AppState>, merges: Vec<media_core::library::Merge>) -> CmdResult<()> {
+    let conn = state.db.conn().map_err(err)?;
+    media_core::library::save_merges(&conn, &merges).map_err(err)
+}
+
+/// How many deleted photos are kept out of the library (their copies elsewhere not brought back).
+#[tauri::command]
+fn library_excluded_count(state: State<AppState>) -> CmdResult<usize> {
+    let conn = state.db.conn().map_err(err)?;
+    Ok(media_core::library::load_excluded(&conn).map_err(err)?.len())
+}
+
+#[tauri::command]
+fn clear_library_excluded(state: State<AppState>) -> CmdResult<()> {
+    let conn = state.db.conn().map_err(err)?;
+    media_core::library::save_excluded(&conn, &[]).map_err(err)
+}
+
+#[derive(Serialize)]
+struct FolderDeletePreview {
+    count: usize,
+    bytes: i64,
+    not_copied: u64,
+    /// ♥ / original / keep folder (the last copy does not count: deleting it is the point).
+    protected: Vec<media_core::protect::Blocked>,
+}
+
+#[tauri::command]
+fn library_delete_preview(state: State<AppState>, plan_id: String, groups: Vec<String>) -> CmdResult<FolderDeletePreview> {
+    let t = with_plan(&state, &plan_id, |p| organizer::delete_targets(p, &groups))?;
+    let conn = state.db.conn().map_err(err)?;
+    let protected = media_core::protect::check(&conn, &t.ids).map_err(err)?.into_iter().filter(|b| b.reason != "last_copy").collect();
+    Ok(FolderDeletePreview { count: t.ids.len(), bytes: t.bytes, not_copied: t.not_copied, protected })
+}
+
+/// Delete library folders for good (see `organizer::delete_folders`).
+#[tauri::command]
+fn start_library_delete(app: AppHandle, state: State<AppState>, plan_id: String, groups: Vec<String>, keep_protected: bool) -> CmdResult<()> {
+    let plan = state.plans.lock().unwrap().get(&plan_id).cloned().ok_or("계획이 만료되었습니다. 다시 미리보기를 실행하세요")?;
+    spawn_job(&app, &state, "library:delete", move |st, progress| {
+        let r = organizer::delete_folders(&st.db, &plan, &groups, keep_protected, &st.stop, progress)?;
+        st.plans.lock().unwrap().remove(&plan.id);
+        Ok(r)
+    })
+}
+
+/// Face finding on / off for this session.
+#[tauri::command]
+fn set_faces_enabled(app: AppHandle, state: State<AppState>, on: bool) -> CmdResult<()> {
+    state.lane.set_faces_enabled(&app, on);
+    Ok(())
+}
+
 #[tauri::command]
 fn disk_space(path: String) -> CmdResult<Option<DiskSpace>> {
     Ok(media_core::volumes::disk_space(Path::new(&path))
@@ -1383,6 +1449,14 @@ pub fn run() {
             year_copy_pairs,
             year_keep,
             disk_space,
+            set_faces_enabled,
+            group_items,
+            get_library_merges,
+            set_library_merges,
+            library_excluded_count,
+            clear_library_excluded,
+            library_delete_preview,
+            start_library_delete,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Media Organizer");

@@ -190,8 +190,12 @@ export default function People() {
       )}
       {!off && lane && (
         <div className={`people-diag ${lane.last_error ? "bad" : ""}`}>
+          <label className="check-row" title="정리하는 동안 꺼 두면 분석이 훨씬 빨라집니다. 다시 켜면 그동안 분석한 사진의 얼굴을 이어서 찾습니다.">
+            <input type="checkbox" checked={lane.faces_enabled} onChange={(e) => api.setFacesEnabled(e.target.checked)} />
+            인물 찾기
+          </label>
           <span>
-            얼굴 분석: {pending > 0 ? <>남은 사진 <b>{fmtCount(pending)}</b>장{lane.running ? (lane.paused ? " (쉬는 중)" : " · 진행 중") : " · 대기"}</> : "모두 끝남"}
+            얼굴 분석: {!lane.faces_enabled ? "꺼 둠 (켜면 이어서)" : pending > 0 ? <>남은 사진 <b>{fmtCount(pending)}</b>장{lane.running ? (lane.paused ? " (쉬는 중)" : " · 진행 중") : " · 대기"}</> : "모두 끝남"}
           </span>
           <span>찾은 얼굴 <b>{fmtCount(lane.faces_found)}</b>개</span>
           <span>엔진: {lane.provider === "DirectML" ? "그래픽카드(DirectML)" : lane.provider === "CPU" ? "CPU" : lane.faces_available ? "아직 시작 전" : "AI 파일 없음"}</span>

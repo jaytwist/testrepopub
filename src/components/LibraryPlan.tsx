@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
-import { confirm, open } from "@tauri-apps/plugin-dialog";
+import { confirm, message, open } from "@tauri-apps/plugin-dialog";
 import {
   api, fmtBytes, fmtCount, thumbUrl,
-  type CopyFolder, type CopyPair, type DiskSpace, type ExecReport, type FolderRule, type ImportSettings, type KeepItem,
-  type LibraryOptions, type PlanView, type TreeNode, type YearBucket,
+  type CopyFolder, type CopyPair, type DiskSpace, type ExecReport, type FolderDeleteReport, type FolderRule, type GridItem,
+  type ImportSettings, type KeepItem, type LibraryOptions, type Merge, type PlanView, type TreeNode, type YearBucket,
 } from "../api";
+import Viewer from "./Viewer";
 import { useJob } from "../App";
 
 const GB = 1024 * 1024 * 1024;
@@ -54,10 +55,18 @@ export default function LibraryPlan() {
   const [planning, setPlanning] = useState(false);
   const [quarantineOnly, setQuarantineOnly] = useState(false);
   const [lastRunYear, setLastRunYear] = useState<string | null>(null);
+  // Folders picked in 「옮길 곳」, in the order picked (the first is where merges go).
+  const [sel, setSel] = useState<string[]>([]);
+  const [merges, setMerges] = useState<Merge[]>([]);
+  const [excluded, setExcluded] = useState(0);
+  const [previewing, setPreviewing] = useState(false);
+  const [deleted, setDeleted] = useState<FolderDeleteReport | null>(null);
 
   useEffect(() => {
     api.getImportSettings().then(setSettings).catch((e) => setErr(String(e)));
     api.getLibraryRules().then(setRules).catch(() => {});
+    api.getLibraryMerges().then(setMerges).catch(() => {});
+    api.libraryExcludedCount().then(setExcluded).catch(() => {});
   }, []);
 
   // "E:" on Windows; elsewhere the library folder itself.
@@ -102,6 +111,16 @@ export default function LibraryPlan() {
         }).catch((e) => setErr(String(e)));
         if (p.options.target_dir) api.diskSpace(p.options.target_dir).then(setSpace).catch(() => setSpace(null));
       } else setErr(lastDone.error ?? "미리보기를 만들지 못했습니다");
+    }
+    if (lastDone.job === "library:delete") {
+      setPlan(null);
+      setTree([]);
+      if (lastDone.ok) {
+        setDeleted(lastDone.result as FolderDeleteReport);
+        setSel([]);
+        api.libraryExcludedCount().then(setExcluded).catch(() => {});
+        preview(undefined, true);
+      } else setErr(lastDone.error ?? "삭제하지 못했습니다");
     }
     if (lastDone.job === "organize:run") {
       setPlan(null);
@@ -173,6 +192,63 @@ export default function LibraryPlan() {
     }
   };
 
+  const toggleSel = (group: string) => setSel((s) => (s.includes(group) ? s.filter((g) => g !== group) : [...s, group]));
+  const selNodes = sel.map((g) => tree.find((n) => n.group === g)).filter((n): n is TreeNode => !!n);
+  const selCount = selNodes.reduce((a, n) => a + n.count, 0);
+  const selBytes = selNodes.reduce((a, n) => a + n.bytes, 0);
+
+  /** Later picks go into the first one. Remembered: planning again keeps the merge. */
+  const mergeSel = async () => {
+    if (sel.length < 2) return;
+    const [into, ...from] = sel;
+    const ok = await confirm(
+      `${from.map((g) => `「${g}」`).join(", ")}을(를)\n「${into}」 안으로 합칩니다.\n\n` +
+        "지금은 계획만 바뀝니다 — 실제로 옮기는 것은 그 해를 Push할 때입니다. 옮긴 뒤에는 「작업 기록」에서 되돌릴 수 있습니다.",
+      { title: "폴더 합치기", kind: "info", okLabel: "합치기", cancelLabel: "취소" },
+    );
+    if (!ok) return;
+    const next = [...merges.filter((m) => !from.includes(m.from)), ...from.map((f) => ({ from: f, into }))];
+    setMerges(next);
+    await api.setLibraryMerges(next);
+    setSel([]);
+    preview();
+  };
+
+  /** Delete the picked folders' photos on the library drive for good. */
+  const deleteSel = async () => {
+    if (!plan || sel.length === 0) return;
+    const pv = await api.libraryDeletePreview(plan.id, sel).catch((e) => { setErr(String(e)); return null; });
+    if (!pv) return;
+    if (pv.count === 0 && pv.not_copied === 0) return;
+    const lines = [
+      pv.count > 0
+        ? `폴더 ${sel.length}개의 사진·영상 ${fmtCount(pv.count)}개 (${fmtBytes(pv.bytes)})를 ${drive}에서 영구 삭제합니다. 사본도 함께 지웁니다.`
+        : `폴더 ${sel.length}개: ${drive}에는 지울 사진이 없습니다.`,
+      pv.not_copied ? `다른 드라이브에서 가져오려던 ${fmtCount(pv.not_copied)}개는 가져오지 않습니다(그 드라이브에는 그대로).` : "",
+      "",
+      "되돌릴 수 없습니다. 다른 드라이브(C: 등)에 있는 같은 사진은 그대로 두고, 다시 가져오지 않습니다.",
+    ].filter((l, i, a) => l || (i > 0 && a[i - 1])).join("\n");
+    let keepProtected = true;
+    if (pv.protected.length > 0) {
+      const leave = `보호된 ${fmtCount(pv.protected.length)}개는 남기고 삭제`;
+      const answer = await message(`${lines}\n\n그중 ${fmtCount(pv.protected.length)}개는 ♥·원본 지정·항상 남길 폴더로 보호되어 있습니다.`, {
+        title: "폴더 영구 삭제", kind: "warning", buttons: { yes: leave, no: "보호된 것까지 모두 삭제", cancel: "취소" },
+      });
+      if (answer === leave || answer === "Yes") keepProtected = true;
+      else if (answer === "보호된 것까지 모두 삭제" || answer === "No") keepProtected = false;
+      else return;
+    } else if (!(await confirm(lines, { title: "폴더 영구 삭제", kind: "warning", okLabel: "영구 삭제", cancelLabel: "취소" }))) {
+      return;
+    }
+    try {
+      setDeleted(null);
+      await api.startLibraryDelete(plan.id, sel, keepProtected);
+      setRunning("library:delete");
+    } catch (e) {
+      setErr(String(e));
+    }
+  };
+
   const shownYears = useMemo(
     () => (byCopies ? [...years].sort((a, b) => Number(a.done) - Number(b.done) || b.remove_bytes - a.remove_bytes) : years),
     [years, byCopies],
@@ -216,6 +292,18 @@ export default function LibraryPlan() {
       </div>
       {err && <div className="alert bad">{err}</div>}
       {result && <RunResult label={result.label} rep={result.rep} drive={drive} />}
+      {deleted && (
+        <div className={`alert ${deleted.failed ? "bad" : "ok"}`}>
+          폴더 영구 삭제:{" "}
+          {[
+            deleted.deleted ? `${fmtCount(deleted.deleted)}개 (${fmtBytes(deleted.bytes)}) 삭제` : "",
+            deleted.kept_protected ? `보호된 ${fmtCount(deleted.kept_protected)}개 남김` : "",
+            deleted.not_copied ? `다른 드라이브의 ${fmtCount(deleted.not_copied)}개는 가져오지 않음` : "",
+          ].filter(Boolean).join(" · ") || "바뀐 것 없음"}
+          {deleted.failed ? ` · 실패 ${fmtCount(deleted.failed)}개` : ""}
+          {deleted.errors?.length > 0 && <details><summary>자세히</summary><pre>{deleted.errors.join("\n")}</pre></details>}
+        </div>
+      )}
 
       <div className="btn-row">
         <button className="btn primary" disabled={!!running} onClick={() => preview()}>
@@ -227,11 +315,31 @@ export default function LibraryPlan() {
       {s && plan && (
         <div className="plan">
           <SpaceBar space={space} drive={drive} year={cur} purge={!quarantineOnly} />
-          {s.leftover_files > 0 && (
-            <div className="muted small">사진·동영상이 아닌 파일 {fmtCount(s.leftover_files)}개(문서 등)는 원래 폴더에 그대로 남습니다.</div>
+          {s.unverified > 0 && (
+            <div className="alert">
+              사본인지 아직 확인하지 못한 파일 {fmtCount(s.unverified)}개는 이번에는 그대로 둡니다(지우지도 옮기지도 않음).
+              예전 버전으로 색인된 파일이라 뒤에서 지문(파일 앞부분)을 읽는 중입니다 — 아래 분석 막대가 끝나면 다시 미리보기하세요.
+            </div>
           )}
+          <PlanTiming timing={s.timing} />
           {s.skip_offline > 0 && <div className="alert">연결되지 않은 드라이브의 파일 {fmtCount(s.skip_offline)}개는 이번 계획에서 빠졌습니다.</div>}
 
+          {sel.length > 0 && (
+            <div className="sel-bar">
+              <span>
+                <b>폴더 {sel.length}개</b> 선택 · {fmtCount(selCount)}개 · {fmtBytes(selBytes)}
+                <span className="muted small"> · 기준: <span className="mono">{sel[0]}</span></span>
+              </span>
+              <span className="spacer" />
+              <button className="btn small" onClick={() => setPreviewing(true)}>미리보기</button>
+              <button className="btn small" disabled={sel.length < 2 || !!running} onClick={mergeSel}
+                title="나중에 고른 폴더들을 처음 고른 폴더(기준) 안으로 합칩니다">
+                합치기{sel.length >= 2 ? ` (${sel.length - 1}개 → 기준)` : ""}
+              </button>
+              <button className="btn small danger" disabled={!!running} onClick={deleteSel}>영구 삭제</button>
+              <button className="btn small ghost" onClick={() => setSel([])}>선택 해제</button>
+            </div>
+          )}
           <div className="year-layout">
             <div className="year-list">
               <div className="year-list-head">
@@ -269,6 +377,8 @@ export default function LibraryPlan() {
                 setRenaming={setRenaming}
                 saveRule={saveRule}
                 runFolder={runFolder}
+                sel={sel}
+                toggleSel={toggleSel}
                 quarantineOnly={quarantineOnly}
                 setQuarantineOnly={setQuarantineOnly}
                 push={() => pushYear(cur)}
@@ -276,10 +386,29 @@ export default function LibraryPlan() {
             )}
           </div>
 
-          {rules.length > 0 && (
+          {previewing && plan && <SelectionPreview planId={plan.id} groups={sel} onClose={() => setPreviewing(false)} />}
+
+          {(rules.length > 0 || merges.length > 0 || excluded > 0) && (
             <div className="muted small">
-              폴더 고침 {rules.length}개 기억 중 ·{" "}
-              <button className="link" onClick={async () => { setRules([]); await api.setLibraryRules([]); preview(); }}>모두 지우기</button>
+              {rules.length > 0 && (
+                <>
+                  폴더 고침 {rules.length}개 기억 중 ·{" "}
+                  <button className="link" onClick={async () => { setRules([]); await api.setLibraryRules([]); preview(); }}>지우기</button>
+                </>
+              )}
+              {merges.length > 0 && (
+                <>
+                  {rules.length > 0 && " · "}합침 {merges.length}개 기억 중 ·{" "}
+                  <button className="link" onClick={async () => { setMerges([]); await api.setLibraryMerges([]); preview(); }}>지우기</button>
+                </>
+              )}
+              {excluded > 0 && (
+                <>
+                  {(rules.length > 0 || merges.length > 0) && " · "}영구 삭제한 사진 {fmtCount(excluded)}개는 다른 드라이브에서 다시 가져오지 않음 ·{" "}
+                  <button className="link" title="지우면 다음 미리보기에서 다른 드라이브의 같은 사진을 다시 가져옵니다"
+                    onClick={async () => { await api.clearLibraryExcluded(); setExcluded(0); preview(); }}>기억 지우기</button>
+                </>
+              )}
             </div>
           )}
         </div>
@@ -300,6 +429,7 @@ function RunResult({ label, rep, drive }: { label: string; rep: ExecReport; driv
       {rep.purge_kept ? ` · 내용이 달라 ${fmtCount(rep.purge_kept)}개는 지우지 않고 격리함에 둠` : ""}
       {rep.space_skipped ? ` · 공간이 모자라 ${fmtCount(rep.space_skipped)}개 (${fmtBytes(rep.space_skipped_bytes)})는 아직 복사 안 함 — 다른 해를 정리한 뒤 다시 실행하세요` : ""}
       {rep.failed ? ` · 실패 ${fmtCount(rep.failed)}개` : ""}
+      {rep.leftover_files ? ` · 사진·영상이 아닌 파일 ${fmtCount(rep.leftover_files)}개는 원래 폴더에 남음` : ""}
       {rep.cancelled ? " · 중간에 멈춤 (다시 실행하면 남은 것만)" : ""}
       <div className="muted small">옮긴 것은 「작업 기록」에서 되돌릴 수 있습니다.</div>
       {rep.errors?.length > 0 && <details><summary>자세히 ({rep.errors.length})</summary><pre>{rep.errors.join("\n")}</pre></details>}
@@ -339,9 +469,10 @@ function YearDetail(props: {
   planId: string; y: YearBucket; nodes: TreeNode[]; drive: string; running: boolean;
   renaming: { node: TreeNode; name: string } | null; setRenaming: (r: { node: TreeNode; name: string } | null) => void;
   saveRule: (n: TreeNode, kind: FolderRule["kind"], name?: string | null) => void; runFolder: (group: string) => void;
+  sel: string[]; toggleSel: (group: string) => void;
   quarantineOnly: boolean; setQuarantineOnly: (v: boolean) => void; push: () => void;
 }) {
-  const { planId, y, nodes, drive, running, renaming, setRenaming, saveRule, runFolder } = props;
+  const { planId, y, nodes, drive, running, renaming, setRenaming, saveRule, runFolder, sel, toggleSel } = props;
   const [tab, setTab] = useState<Tab>("where");
   const work = y.moves + y.copies + y.remove + y.versions;
   return (
@@ -365,8 +496,11 @@ function YearDetail(props: {
           {nodes.map((n) => {
             const isEvent = n.tag === "event" && n.from_dir;
             return (
-              <div key={n.group} className={`lib-node ${n.moves + n.copies === 0 ? "done" : ""}`}>
+              <div key={n.group} className={`lib-node ${n.moves + n.copies === 0 ? "done" : ""} ${sel.includes(n.group) ? "picked" : ""}`}>
                 <div className="lib-node-main">
+                  <input type="checkbox" checked={sel.includes(n.group)} onChange={() => toggleSel(n.group)}
+                    title="고르기 — 미리보기·합치기(처음 고른 폴더가 기준)·영구 삭제" />
+                  {sel[0] === n.group ? <span className="pill ok">기준</span> : sel.includes(n.group) ? <span className="pill">{sel.indexOf(n.group) + 1}</span> : null}
                   {renaming?.node.group === n.group ? (
                     <span className="inline-form">
                       <input autoFocus value={renaming.name} onChange={(e) => setRenaming({ node: n, name: e.target.value })}
@@ -525,5 +659,76 @@ function KeepTab({ planId, year, total }: { planId: string; year: string; total:
       ))}
       {items.length < total && <button className="btn small" onClick={more}>더 보기 ({fmtCount(total - items.length)}개 남음)</button>}
     </div>
+  );
+}
+
+/** "계획 12초 — 사본·배치 4초 · …": where planning time goes (to tell what is slow on this PC). */
+function PlanTiming({ timing }: { timing: [string, number][] }) {
+  if (!timing?.length) return null;
+  const sec = (ms: number) => (ms >= 10_000 ? `${Math.round(ms / 1000)}초` : `${(ms / 1000).toFixed(1)}초`);
+  const total = timing.find(([n]) => n === "전체");
+  const steps = timing.filter(([n]) => n !== "전체");
+  if (total && total[1] < 1000) return <div className="muted small plan-timing">계획 1초 미만</div>;
+  return (
+    <div className="muted small plan-timing">
+      계획 {total ? sec(total[1]) : ""} — {steps.map(([n, ms]) => `${n} ${sec(ms)}`).join(" · ")}
+    </div>
+  );
+}
+
+/** Photos of the picked folders, by folder; a click opens the photo big (← → through them). */
+function SelectionPreview({ planId, groups, onClose }: { planId: string; groups: string[]; onClose: () => void }) {
+  const [items, setItems] = useState<KeepItem[] | null>(null);
+  const [view, setView] = useState<{ items: GridItem[]; index: number } | null>(null);
+  useEffect(() => {
+    api.groupItems(planId, groups, 0, 2000).then(setItems).catch(() => setItems([]));
+  }, [planId, groups]);
+  const byGroup = useMemo(() => {
+    const m = new Map<string, KeepItem[]>();
+    for (const g of groups) m.set(g, []);
+    for (const it of items ?? []) (m.get(it.group) ?? m.set(it.group, []).get(it.group)!).push(it);
+    return [...m.entries()];
+  }, [items, groups]);
+  const openAt = async (id: number) => {
+    const ids = (items ?? []).map((i) => i.file_id);
+    const rows = await api.grid({ ids }, 0, ids.length).catch(() => [] as GridItem[]);
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    const list = ids.map((i) => byId.get(i)).filter((x): x is GridItem => x != null);
+    const index = list.findIndex((x) => x.id === id);
+    if (index >= 0) setView({ items: list, index });
+  };
+  return (
+    <>
+    <div className="send-back" onClick={onClose}>
+      <div className="card sel-preview" onClick={(e) => e.stopPropagation()}>
+        <div className="row-between">
+          <h3>선택한 폴더 미리보기</h3>
+          <button className="btn small ghost" onClick={onClose}>닫기</button>
+        </div>
+        {!items && <div className="muted small">불러오는 중…</div>}
+        {byGroup.map(([g, its], i) => (
+          <div key={g} className="keep-group">
+            <div className="small keep-group-head">
+              {i === 0 && groups.length > 1 && <span className="pill ok">기준</span>} <span className="mono">{g}</span>
+              <span className="muted"> · {fmtCount(its.length)}개</span>
+            </div>
+            <div className="keep-grid">
+              {its.map((it) => (
+                <button key={it.file_id} className="keep-tile" onClick={() => openAt(it.file_id)}>
+                  <img src={thumbUrl(it.file_id)} loading="lazy" alt="" />
+                  {it.copies > 0 && <span className="keep-badge">사본 {it.copies}</span>}
+                  {it.action === "copy" && <span className="keep-badge copyin">복사</span>}
+                </button>
+              ))}
+            </div>
+          </div>
+        ))}
+        {items && items.length >= 2000 && <div className="muted small">처음 2,000개만 보여 줍니다.</div>}
+      </div>
+    </div>
+    {view && (
+      <Viewer items={view.items} index={view.index} onIndex={(index) => setView((v) => (v ? { ...v, index } : v))} onClose={() => setView(null)} />
+    )}
+    </>
   );
 }

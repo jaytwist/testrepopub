@@ -310,10 +310,11 @@ pub fn scan_with(db: &Db, source_id: i64, sub: Option<&str>, opts: &ScanOptions,
     stats.walk_ms = started.elapsed().as_millis() as u64;
     let reading = std::time::Instant::now();
 
-    // 2. Diff against the index.
+    // 2. Diff against the index. A quarantined row does not count: a file found at its old
+    //    place (put back by hand, or a new copy) is a live file again.
     let existing: HashMap<String, (i64, i64, i64)> = {
         let mut st = conn.prepare(
-            "SELECT rel_path, id, size, mtime FROM files WHERE volume_id = ?1
+            "SELECT rel_path, id, size, mtime FROM files WHERE volume_id = ?1 AND quarantined = 0
              AND (?2 = '' OR substr(rel_path, 1, length(?2) + 1) = ?2 || '/')",
         )?;
         let rows = st

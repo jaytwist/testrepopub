@@ -128,6 +128,13 @@ pub struct PlanSummary {
     pub events: u64,
     /// Other files (documents, project files…) left behind in folders photos move out of.
     pub leftover_files: u64,
+    /// Library: files whose fingerprint is not read yet while another file has the same size —
+    /// they may be copies, so they are left alone until it is read (in the background).
+    pub unverified: u64,
+    /// How long each step of planning took (name, ms).
+    pub timing: Vec<(String, u64)>,
+    /// Library: photos the user deleted for good whose copies on other drives are not brought back.
+    pub excluded: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -136,6 +143,9 @@ pub struct Plan {
     pub options: OrganizeOptions,
     pub items: Vec<PlanItem>,
     pub summary: PlanSummary,
+    /// Library: the year of each file (worked out once; the year views use it on every click).
+    #[serde(skip)]
+    pub years: HashMap<i64, String>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -340,6 +350,13 @@ pub fn plan(db: &Db, opts: &OrganizeOptions, stop: &StopFlag, progress: Progress
     let tvol = volumes::identify_lenient(&target)?;
 
     let conn = db.conn()?;
+    let clock = std::time::Instant::now();
+    let mut timing: Vec<(String, u64)> = Vec::new();
+    let mut lap = |name: &str, t: &mut std::time::Instant| {
+        timing.push((name.to_string(), t.elapsed().as_millis() as u64));
+        *t = std::time::Instant::now();
+    };
+    let mut t = std::time::Instant::now();
     volumes::refresh(&conn)?;
     let ids = db::query_ids(&conn, &opts.filter)?;
     let mut labels_of: HashMap<i64, Vec<String>> = HashMap::new();
@@ -354,32 +371,73 @@ pub fn plan(db: &Db, opts: &OrganizeOptions, stop: &StopFlag, progress: Progress
     let trips = crate::places::trip_titles(&conn)?;
     let persons = crate::people::folder_names(&conn)?;
     let library = opts.layout == "library";
-    let placements = if library {
-        // Same-size files get their 64 KiB fingerprint (once), so copies are recognised.
-        crate::identity::backfill_prehashes(&conn)?;
+    lap("목록", &mut t);
+    // Planning reads nothing from the drives: fingerprints missing for same-size files are read
+    // in the background (`identity::backfill_prehashes`); until then those files stay put.
+    let mut placements = if library {
         let lib_vol: i64 = conn.query_row("SELECT id FROM volumes WHERE uid = ?", [&tvol.uid], |r| r.get(0)).unwrap_or(-1);
-        crate::library::layout(&conn, lib_vol, &ids, &opts.library, &crate::library::load_rules(&conn)?)?
+        let lib_root = volumes::rel_of(&tvol.root, &target).unwrap_or_default();
+        crate::library::layout(&conn, lib_vol, &lib_root, &ids, &opts.library, &crate::library::load_rules(&conn)?)?
     } else {
         HashMap::new()
     };
+    // Folders the user merged: everything planned into one goes into the other.
+    if library {
+        let merges = crate::library::load_merges(&conn)?;
+        if !merges.is_empty() {
+            for p in placements.values_mut() {
+                if !p.rel_dir.is_empty() {
+                    p.rel_dir = crate::library::merged(&p.rel_dir, &merges);
+                }
+            }
+        }
+    }
+    lap("사본·배치", &mut t);
     // Copies the user protected (♥, original, keep folder) stay where they are: not counted as
     // work, so a year with only those left shows as done.
     let protected: HashSet<i64> = {
         let rm: Vec<i64> = placements.iter().filter(|(_, p)| p.act == crate::library::Act::Remove).map(|(id, _)| *id).collect();
         if rm.is_empty() { HashSet::new() } else { crate::protect::check(&conn, &rm)?.into_iter().map(|b| b.id).collect() }
     };
+    lap("보호 확인", &mut t);
     let mut events: HashSet<String> = HashSet::new();
-    let mut from_dirs: HashSet<PathBuf> = HashSet::new();
     let mut items = Vec::with_capacity(ids.len());
     let mut summary = PlanSummary::default();
-    // dst key -> (size, src path, known hash) of the file that claimed it first in this plan.
+    // Fingerprints (size + first 64 KiB) decide "same file" while planning; nothing is read.
+    let prehash: HashMap<i64, String> = {
+        let mut st = conn.prepare("SELECT id, COALESCE(prehash, hash) FROM files WHERE COALESCE(prehash, hash) IS NOT NULL AND COALESCE(prehash, hash) != ''")?;
+        let m = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<HashMap<i64, String>>>()?;
+        m
+    };
+    let same = |a: (i64, Option<&String>), b: (i64, Option<&String>)| a.0 == b.0 && a.1.is_some() && a.1 == b.1;
+    let uids: HashMap<i64, String> = {
+        let mut st = conn.prepare("SELECT id, uid FROM volumes")?;
+        let m = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<HashMap<i64, String>>>()?;
+        m
+    };
+    // dst key -> (size, src path, fingerprint) of the file that claimed it first in this plan.
     let mut claimed: HashMap<String, (i64, PathBuf, Option<String>)> = HashMap::new();
     let mut folders: HashSet<String> = HashSet::new();
-    // What already sits in each destination folder (lower-cased name -> size), read once per
-    // folder instead of a disk lookup per file.
-    let mut on_disk: HashMap<String, HashMap<String, i64>> = HashMap::new();
+    // What already sits in each destination folder (lower-cased name -> size, fingerprint).
+    // Library: from the index (the library folder is a source), so no folder is listed on disk;
+    // a file that is there but not indexed makes that one move fail safely (nothing overwritten).
+    let mut on_disk: HashMap<String, HashMap<String, (i64, Option<String>)>> = HashMap::new();
+    if library {
+        let tvol_id: Option<i64> = conn.query_row("SELECT id FROM volumes WHERE uid = ?", [&tvol.uid], |r| r.get(0)).ok();
+        if let Some(vid) = tvol_id {
+            let mut st = conn.prepare("SELECT v.mount, f.rel_path, f.size, f.id FROM files f JOIN volumes v ON v.id = f.volume_id WHERE f.volume_id = ? AND f.missing = 0 AND f.quarantined = 0")?;
+            let rows = st.query_map([vid], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?)))?;
+            for r in rows {
+                let (mount, rel, size, id) = r?;
+                let abs = volumes::join_rel(Path::new(&mount), &rel);
+                let (Some(dir), Some(name)) = (abs.parent(), abs.file_name()) else { continue };
+                on_disk.entry(key(dir)).or_default().insert(name.to_string_lossy().to_lowercase(), (size, prehash.get(&id).cloned()));
+            }
+        }
+    }
     let total = ids.len() as u64;
     let empty = Vec::new();
+    let rows = db::all_files(&conn)?;
     for (i, id) in ids.iter().enumerate() {
         if stop.is_stopped() {
             bail!("cancelled");
@@ -387,7 +445,7 @@ pub fn plan(db: &Db, opts: &OrganizeOptions, stop: &StopFlag, progress: Progress
         if i % 500 == 0 {
             progress(Progress::new("organize:plan", "plan", i as u64, total, ""));
         }
-        let Some(f) = db::get_file(&conn, *id)? else { continue };
+        let Some(f) = rows.get(id) else { continue };
         let labels = labels_of.get(id).unwrap_or(&empty);
         summary.total += 1;
         let src = f.abs_path();
@@ -409,6 +467,10 @@ pub fn plan(db: &Db, opts: &OrganizeOptions, stop: &StopFlag, progress: Progress
                 if remove {
                     summary.remove += 1;
                     summary.remove_bytes += f.size;
+                } else if p.tag == "unverified" {
+                    summary.unverified += 1;
+                } else if p.tag == "excluded" {
+                    summary.excluded += 1;
                 } else {
                     summary.leave += 1;
                 }
@@ -447,7 +509,7 @@ pub fn plan(db: &Db, opts: &OrganizeOptions, stop: &StopFlag, progress: Progress
             dst: String::new(),
             action: if copy { Action::Copy } else { Action::Move },
             renamed: false,
-            cross_volume: f.volume_id_uid_differs(&conn, &tvol.uid),
+            cross_volume: uids.get(&f.volume_id).is_none_or(|u| *u != tvol.uid),
             size: f.size,
             group: rel_dir.clone(),
             tag: place.map(|p| p.tag.to_string()).unwrap_or_default(),
@@ -473,20 +535,33 @@ pub fn plan(db: &Db, opts: &OrganizeOptions, stop: &StopFlag, progress: Progress
                 item.action = Action::InPlace;
                 break cand;
             }
+            let mine = (f.size, prehash.get(&f.id));
             if let Some((csize, csrc, chash)) = claimed.get(&k) {
                 // Two identical files from different drives: keep one, skip the other.
-                if *csize == f.size && same_bytes(chash.as_deref(), csrc, f.hash.as_deref(), &src) {
+                let dup = if library {
+                    same((*csize, chash.as_ref()), mine)
+                } else {
+                    *csize == f.size && same_bytes(chash.as_deref(), csrc, f.hash.as_deref(), &src)
+                };
+                if dup {
                     item.action = Action::SkipDuplicate;
                     break cand;
                 }
                 n += 1;
                 continue;
             }
-            let listing = on_disk.entry(key(&dir)).or_insert_with(|| list_dir(&dir));
-            if let Some(size) = listing.get(&name.to_lowercase()).copied() {
-                // Same bytes already there? Then this file is a duplicate: skip it.
-                let same = size == f.size && same_bytes(None, &cand, f.hash.as_deref(), &src);
-                if same {
+            let listing = on_disk.entry(key(&dir)).or_insert_with(|| {
+                if library {
+                    HashMap::new()
+                } else {
+                    list_dir(&dir).into_iter().map(|(k, s)| (k, (s, None))).collect()
+                }
+            });
+            if let Some((size, ph)) = listing.get(&name.to_lowercase()).cloned() {
+                // Same file already there? Then this one is a duplicate: skip it (it stays where
+                // it is, so nothing is lost if the fingerprints only look alike).
+                let dup = if library { same((size, ph.as_ref()), mine) } else { size == f.size && same_bytes(None, &cand, f.hash.as_deref(), &src) };
+                if dup {
                     item.action = Action::SkipDuplicate;
                     break cand;
                 }
@@ -497,7 +572,8 @@ pub fn plan(db: &Db, opts: &OrganizeOptions, stop: &StopFlag, progress: Progress
         };
         item.renamed = n > 0;
         if item.action != Action::SkipDuplicate {
-            claimed.insert(key(&dst), (f.size, src.clone(), f.hash.clone()));
+            let fp = if library { prehash.get(&f.id).cloned() } else { f.hash.clone() };
+            claimed.insert(key(&dst), (f.size, src.clone(), fp));
         }
         item.dst = dst.to_string_lossy().into_owned();
         match item.action {
@@ -523,15 +599,6 @@ pub fn plan(db: &Db, opts: &OrganizeOptions, stop: &StopFlag, progress: Progress
             if let Some(e) = &p.event {
                 events.insert(format!("{}|{e}", p.rel_dir));
             }
-            if item.action == Action::Move {
-                if let Some(parent) = src.parent() {
-                    from_dirs.insert(parent.to_path_buf());
-                }
-                // The event folder itself too (its photos may all be in subfolders).
-                if p.event.is_some() && !p.from_dir.is_empty() {
-                    from_dirs.insert(volumes::join_rel(Path::new(&f.mount), &p.from_dir));
-                }
-            }
         }
         if matches!(item.action, Action::Move | Action::Copy) {
             summary.bytes += f.size;
@@ -547,23 +614,15 @@ pub fn plan(db: &Db, opts: &OrganizeOptions, stop: &StopFlag, progress: Progress
     }
     summary.folders = folders.len() as u64;
     summary.events = events.len() as u64;
-    // Files that are not photos / videos (nor their sidecars) stay behind in the folders photos
-    // move out of: count them so the preview can say so.
-    for d in &from_dirs {
-        summary.leftover_files += std::fs::read_dir(d)
-            .map(|rd| {
-                rd.flatten()
-                    .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
-                    .filter(|e| {
-                        let n = e.file_name().to_string_lossy().to_lowercase();
-                        crate::media::kind_for_ext(&crate::media::ext_of(&n)).is_none() && !is_sidecar_name(&n)
-                    })
-                    .count() as u64
-            })
-            .unwrap_or(0);
-    }
+    lap("목적지 확인", &mut t);
+    summary.timing = timing;
+    summary.timing.push(("전체".into(), clock.elapsed().as_millis() as u64));
     progress(Progress::new("organize:plan", "done", total, total, ""));
-    Ok(Plan { id: uuid::Uuid::new_v4().simple().to_string(), options: opts.clone(), items, summary })
+    let mut plan = Plan { id: uuid::Uuid::new_v4().simple().to_string(), options: opts.clone(), items, summary, years: HashMap::new() };
+    if library {
+        plan.years = compute_years(&plan);
+    }
+    Ok(plan)
 }
 
 /// One destination folder of a library plan, for the preview tree.
@@ -665,7 +724,7 @@ fn part_of(plan: &Plan, items: Vec<PlanItem>) -> Plan {
             _ => {}
         }
     }
-    Plan { id: plan.id.clone(), options: plan.options.clone(), items, summary }
+    Plan { id: plan.id.clone(), options: plan.options.clone(), items, summary, years: plan.years.clone() }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -705,7 +764,15 @@ fn year_rank(key: &str) -> (u8, String) {
 
 /// Year of each planned file: files landing in the library by their folder, copies to remove by
 /// the file kept instead (so a copy shows up with its original, wherever it lies now).
-fn item_years(plan: &Plan) -> HashMap<i64, String> {
+fn item_years(plan: &Plan) -> std::borrow::Cow<'_, HashMap<i64, String>> {
+    if plan.years.is_empty() {
+        std::borrow::Cow::Owned(compute_years(plan))
+    } else {
+        std::borrow::Cow::Borrowed(&plan.years)
+    }
+}
+
+fn compute_years(plan: &Plan) -> HashMap<i64, String> {
     let mut years: HashMap<i64, String> = plan
         .items
         .iter()
@@ -877,6 +944,146 @@ pub fn year_copy_pairs(plan: &Plan, key: &str, dir: &str, offset: usize, limit: 
         .collect()
 }
 
+/// Files planned into the given library folders (for the preview of a selection).
+pub fn group_items(plan: &Plan, groups: &[String], offset: usize, limit: usize) -> Vec<KeepItem> {
+    let want: HashSet<&str> = groups.iter().map(String::as_str).collect();
+    let mut copies: HashMap<i64, u32> = HashMap::new();
+    for it in plan.items.iter().filter(|i| i.action == Action::Remove) {
+        if let Some(k) = it.kept {
+            *copies.entry(k).or_default() += 1;
+        }
+    }
+    let mut v: Vec<&PlanItem> = plan
+        .items
+        .iter()
+        .filter(|i| matches!(i.action, Action::Move | Action::Copy | Action::InPlace | Action::SkipDuplicate) && want.contains(i.group.as_str()))
+        .collect();
+    v.sort_by(|a, b| a.group.cmp(&b.group).then(a.dst.cmp(&b.dst)));
+    v.into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|i| KeepItem { file_id: i.file_id, group: i.group.clone(), action: i.action, copies: copies.get(&i.file_id).copied().unwrap_or(0) })
+        .collect()
+}
+
+/// What deleting library folders for good means: the files on the library drive planned into
+/// them and their copies there (deleted), and the photos only on other drives that would have
+/// been copied in (left there, not brought back).
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct DeleteTargets {
+    /// On the library drive: deleted.
+    pub ids: Vec<i64>,
+    pub bytes: i64,
+    /// Photos planned to be copied from other drives: not copied (and not later either).
+    pub not_copied: u64,
+    /// Ids whose content is excluded once deleted: the copies-in (left on their drive).
+    pub copy_in_ids: Vec<i64>,
+}
+
+pub fn delete_targets(plan: &Plan, groups: &[String]) -> DeleteTargets {
+    let want: HashSet<&str> = groups.iter().map(String::as_str).collect();
+    let mut t = DeleteTargets::default();
+    let mut on_lib: HashSet<i64> = HashSet::new();
+    for it in plan.items.iter().filter(|i| want.contains(i.group.as_str())) {
+        match it.action {
+            Action::Copy => {
+                t.not_copied += 1;
+                t.copy_in_ids.push(it.file_id);
+            }
+            Action::Move | Action::InPlace | Action::SkipDuplicate if !it.cross_volume => {
+                on_lib.insert(it.file_id);
+                t.ids.push(it.file_id);
+                t.bytes += it.size;
+            }
+            _ => {}
+        }
+    }
+    // Their copies on the library drive go with them.
+    for it in plan.items.iter().filter(|i| i.action == Action::Remove && i.kept.is_some_and(|k| on_lib.contains(&k))) {
+        t.ids.push(it.file_id);
+        t.bytes += it.size;
+    }
+    t
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct FolderDeleteReport {
+    pub batch_id: String,
+    pub deleted: u64,
+    pub bytes: i64,
+    /// ♥ / original / keep-folder files left in place (when asked to keep protected files).
+    pub kept_protected: u64,
+    /// Photos on other drives no longer copied in (and not brought back later).
+    pub not_copied: u64,
+    pub failed: u64,
+    pub errors: Vec<String>,
+}
+
+/// Delete library folders for good (see `delete_targets`). With `keep_protected`, files marked ♥
+/// / original / in a keep folder stay ("the last copy" does not count here: deleting the photos
+/// is the point). Their contents are remembered so copies on other drives are not copied back in.
+pub fn delete_folders(db: &Db, plan: &Plan, groups: &[String], keep_protected: bool, stop: &StopFlag, progress: ProgressFn) -> Result<FolderDeleteReport> {
+    let conn = db.conn()?;
+    let mut t = delete_targets(plan, groups);
+    let mut rep = FolderDeleteReport { not_copied: t.not_copied, ..Default::default() };
+    let protected: HashSet<i64> = if keep_protected {
+        crate::protect::check(&conn, &t.ids)?.into_iter().filter(|b| b.reason != "last_copy").map(|b| b.id).collect()
+    } else {
+        HashSet::new()
+    };
+    rep.kept_protected = protected.len() as u64;
+    t.ids.retain(|id| !protected.contains(id));
+    // Every photo involved needs a fingerprint to be remembered (a photo with no same-size twin
+    // was never fingerprinted): read the missing ones now — a few, chosen by the user.
+    for id in t.ids.iter().chain(t.copy_in_ids.iter()) {
+        let has: bool = conn
+            .query_row("SELECT COALESCE(prehash, hash) IS NOT NULL FROM files WHERE id = ?", [*id], |r| r.get(0))
+            .unwrap_or(true);
+        if !has {
+            if let Some(f) = db::get_file(&conn, *id)? {
+                if let Ok(h) = journal::prehash_file(&f.abs_path(), f.size as u64) {
+                    conn.execute("UPDATE files SET prehash = ? WHERE id = ?", rusqlite::params![h, id])?;
+                }
+            }
+        }
+    }
+    let key_of = |id: i64| -> Option<String> {
+        conn.query_row("SELECT COALESCE(prehash, hash) FROM files WHERE id = ?", [id], |r| r.get::<_, Option<String>>(0)).ok().flatten()
+    };
+    let kept_keys: HashSet<String> = protected.iter().filter_map(|id| key_of(*id)).collect();
+    // Fingerprints read before deleting (the rows go with the files).
+    let mut keys: Vec<String> = t.ids.iter().chain(t.copy_in_ids.iter()).filter_map(|id| key_of(*id)).filter(|k| !kept_keys.contains(k)).collect();
+    if !t.ids.is_empty() {
+        let label = format!("폴더 {}개 영구 삭제", groups.len());
+        let d = journal::delete_files(db, &t.ids, true, Some(&label), stop, progress)?;
+        rep.batch_id = d.batch_id.clone();
+        rep.failed = d.failed;
+        rep.errors = d.errors;
+        if !d.batch_id.is_empty() {
+            let p = journal::purge_batch_with(&conn, &d.batch_id, stop, progress)?;
+            rep.deleted = p.deleted;
+            rep.bytes = p.bytes;
+            rep.failed += p.failed + p.kept;
+            rep.errors.extend(p.errors);
+        }
+    }
+    // Only what is really gone is excluded (a file that could not be deleted keeps its content in).
+    let still_there: HashSet<String> = t
+        .ids
+        .iter()
+        .filter(|id| conn.query_row("SELECT 1 FROM files WHERE id = ? AND quarantined = 0", [**id], |_| Ok(())).is_ok())
+        .filter_map(|id| key_of(*id))
+        .collect();
+    keys.retain(|k| !still_there.contains(k));
+    let mut all = crate::library::load_excluded(&conn)?;
+    let have: HashSet<String> = all.iter().cloned().collect();
+    keys.sort();
+    keys.dedup();
+    all.extend(keys.into_iter().filter(|k| !have.contains(k)));
+    crate::library::save_excluded(&conn, &all)?;
+    Ok(rep)
+}
+
 /// Files the library keeps for one year, by library folder (for the thumbnails), with how many
 /// copies of each go.
 #[derive(Clone, Debug, Serialize)]
@@ -905,14 +1112,6 @@ pub fn year_keep(plan: &Plan, key: &str, offset: usize, limit: usize) -> Vec<Kee
         .take(limit)
         .map(|i| KeepItem { file_id: i.file_id, group: i.group.clone(), action: i.action, copies: copies.get(&i.file_id).copied().unwrap_or(0) })
         .collect()
-}
-
-impl FileRow {
-    fn volume_id_uid_differs(&self, conn: &rusqlite::Connection, uid: &str) -> bool {
-        conn.query_row("SELECT uid FROM volumes WHERE id = ?", [self.volume_id], |r| r.get::<_, String>(0))
-            .map(|u| u != uid)
-            .unwrap_or(true)
-    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -945,6 +1144,8 @@ pub struct ExecReport {
     /// Copies from other drives not made for lack of room (planning again lists them).
     pub space_skipped: u64,
     pub space_skipped_bytes: i64,
+    /// Other files (documents…) left in the folders photos moved out of.
+    pub leftover_files: u64,
     pub errors: Vec<String>,
     pub cancelled: bool,
 }
@@ -1109,6 +1310,8 @@ pub fn execute_with(db: &Db, plan: &Plan, xo: &ExecOptions, stop: &StopFlag, pro
     // Room for copies from other drives: measured once they start (after the copies above were
     // deleted), always leaving a reserve free.
     let mut room: Option<i64> = None;
+    let mut leftover = 0u64;
+    let mut counted: HashSet<PathBuf> = HashSet::new();
 
     // Index updates are committed every few hundred files instead of one by one (much faster on
     // big libraries). A crash loses at most that many index updates; the next scan recognises
@@ -1150,10 +1353,39 @@ pub fn execute_with(db: &Db, plan: &Plan, xo: &ExecOptions, stop: &StopFlag, pro
             let dst_rel = volumes::rel_of(&tvol.root, &dst)?;
             let copy = it.action == Action::Copy;
             // The folder's names, read before anything in it moves (so a RAW beside the JPG is seen).
+            // The event folder too (its photos may all be in subfolders): counted, not used.
+            if !copy && it.event.is_some() && !it.from.is_empty() {
+                let ev = volumes::join_rel(Path::new(&f.mount), &it.from);
+                if Some(ev.as_path()) != src.parent() && counted.insert(ev.clone()) {
+                    leftover += std::fs::read_dir(&ev)
+                        .map(|rd| {
+                            rd.flatten()
+                                .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+                                .filter(|e| {
+                                    let n = e.file_name().to_string_lossy().to_lowercase();
+                                    crate::media::kind_for_ext(&crate::media::ext_of(&n)).is_none() && !is_sidecar_name(&n)
+                                })
+                                .count() as u64
+                        })
+                        .unwrap_or(0);
+                }
+            }
             if let Some(dir) = src.parent() {
-                listings.entry(dir.to_path_buf()).or_insert_with(|| {
-                    std::fs::read_dir(dir).map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default()
-                });
+                if !listings.contains_key(dir) {
+                    let names: Vec<String> =
+                        std::fs::read_dir(dir).map(|rd| rd.flatten().filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false)).map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
+                    // Files that are not photos / videos (nor sidecars) stay behind: say how many.
+                    if !copy && counted.insert(dir.to_path_buf()) {
+                        leftover += names
+                            .iter()
+                            .filter(|n| {
+                                let n = n.to_lowercase();
+                                crate::media::kind_for_ext(&crate::media::ext_of(&n)).is_none() && !is_sidecar_name(&n)
+                            })
+                            .count() as u64;
+                    }
+                    listings.insert(dir.to_path_buf(), names);
+                }
             }
             if copy {
                 journal::copy_indexed(&conn, &batch, &f, &dst, tvol_id, &dst_rel)?;
@@ -1206,6 +1438,7 @@ pub fn execute_with(db: &Db, plan: &Plan, xo: &ExecOptions, stop: &StopFlag, pro
             }
         }
     }
+    rep.leftover_files = leftover;
     journal::finish_batch(&conn, &batch)?;
     if work.is_empty() {
         conn.execute("DELETE FROM batches WHERE id = ? AND op_count = 0", [&batch])?;
