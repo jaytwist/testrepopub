@@ -283,9 +283,10 @@ export default function App() {
     };
   }, []);
 
+  // Counted again when work finished — not on every page change: the numbers are the same.
   useEffect(() => {
     api.libraryStats().then(setStats).catch(() => {});
-  }, [version, page]);
+  }, [version]);
 
   useEffect(() => {
     if (!toast) return;

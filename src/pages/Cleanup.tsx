@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import {
-  api, fmtBytes, fmtCount, onAnalysisDone,
+  api, fmtBytes, fmtCount, onAnalysisDone, withLast,
   type CleanupSummary, type DupSummary, type FileFilter, type GroupBy, type TriageKind,
 } from "../api";
 import { useJob, useNav } from "../App";
@@ -60,8 +60,9 @@ export default function Cleanup() {
   const [triage, setTriage] = useState<{ kind: TriageKind; variant?: "safe" | "edited"; title: string } | null>(null);
 
   const load = useCallback(() => {
-    api.cleanupSummary().then(setS).catch((e) => setErr(String(e)));
-    api.dupSummary().then(setDups).catch(() => setDups([]));
+    // What the page showed last time first, the fresh numbers when they arrive.
+    withLast("cleanup-summary", api.cleanupSummary, setS).catch((e) => setErr(String(e)));
+    withLast("dup-summary", api.dupSummary, setDups).catch(() => setDups([]));
     api.batches()
       .then((bs) => setFreed(bs.filter((b) => (b.kind === "delete" || b.kind === "dedupe") && b.state !== "undone").reduce((a, b) => a + b.bytes, 0)))
       .catch(() => {});

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import {
-  api, fmtBytes, fmtCount, fmtDate,
+  api, fmtBytes, fmtCount, fmtDate, withLast,
   type CopyFolderInfo, type CopyFolderPick, type CopyFolderReport, type CopyFolders as Found, type CopyFolderSet,
   type FolderProps, type NearFolderSet,
 } from "../api";
@@ -74,7 +74,8 @@ export default function CopyFolders({ onTotals }: { onTotals?: (exact: number, n
   const [result, setResult] = useState<CopyFolderReport | null>(null);
 
   const load = useCallback(() => {
-    api.copyFolders(bar).then(setFound).catch((e) => setErr(String(e)));
+    // The list shown last time for this bar at once; the backend recomputes only when files changed.
+    withLast(`copy-folders:${bar}`, () => api.copyFolders(bar), setFound).catch((e) => setErr(String(e)));
   }, [bar]);
   const changeBar = (b: number) => {
     setBar(b);

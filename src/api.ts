@@ -1,6 +1,56 @@
 // Typed wrappers around the Tauri commands in src-tauri/src/lib.rs.
-import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke as rawInvoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+
+/** Something that took long: a command (`call`) or the screen not reacting (`stall`). */
+export interface SlowEntry { at: number; what: string; ms: number; kind: "call" | "stall" }
+const slow: SlowEntry[] = [];
+function noteSlow(e: SlowEntry) {
+  slow.push(e);
+  if (slow.length > 100) slow.shift();
+}
+/** The last hundred slow commands and screen stalls of this run (Settings shows them). */
+export const slowLog = (): SlowEntry[] => [...slow];
+export const clearSlowLog = () => {
+  slow.length = 0;
+};
+
+/** Every command goes through here: one that takes half a second or more is remembered. */
+function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  const started = performance.now();
+  return rawInvoke<T>(cmd, args).finally(() => {
+    const ms = performance.now() - started;
+    if (ms >= 500) noteSlow({ at: Date.now(), what: cmd, ms: Math.round(ms), kind: "call" });
+  });
+}
+
+// The screen's own heartbeat: a tick that comes 300 ms or more late means the page could not
+// react for that long (a heavy redraw, too much arriving at once).
+let lastBeat = performance.now();
+setInterval(() => {
+  const now = performance.now();
+  const late = now - lastBeat - 100;
+  lastBeat = now;
+  if (late >= 300 && document.visibilityState === "visible") noteSlow({ at: Date.now(), what: "화면 멈춤", ms: Math.round(late), kind: "stall" });
+}, 100);
+
+const kept = new Map<string, unknown>();
+/**
+ * What `fetch` returned last time under `key` is handed to `onData` at once — a page opens with
+ * what it showed before — and the fresh result follows. Results that arrive after a newer
+ * request for the same key are dropped.
+ */
+const asked = new Map<string, number>();
+export function withLast<T>(key: string, fetch: () => Promise<T>, onData: (d: T) => void): Promise<void> {
+  const old = kept.get(key) as T | undefined;
+  if (old !== undefined) onData(old);
+  const mine = (asked.get(key) ?? 0) + 1;
+  asked.set(key, mine);
+  return fetch().then((d) => {
+    kept.set(key, d);
+    if (asked.get(key) === mine) onData(d);
+  });
+}
 
 export interface FileFilter {
   kind?: string | null;
@@ -381,7 +431,9 @@ export const api = {
   folderCompare: (keep: FolderRef, copy: FolderRef) => invoke<FolderCompare>("folder_compare", { keep, copy }),
   folderProps: (folder: FolderRef) => invoke<FolderProps>("folder_props", { folder }),
   folderAlign: (keep: FolderRef, copies: FolderRef[]) => invoke<AlignRow[]>("folder_align", { keep, copies }),
-  folderFirstDifference: (a: number, b: number) => invoke<FirstDifference>("folder_first_difference", { a, b }),
+  /** With a `ticket` (the photo in view), a comparison gives up as soon as a newer ticket is out. */
+  folderFirstDifference: (a: number, b: number, ticket?: number) => invoke<FirstDifference>("folder_first_difference", { a, b, ticket: ticket ?? null }),
+  cancelFolderCheck: (ticket: number) => invoke<void>("cancel_folder_check", { ticket }),
   startFolderSwap: (keep: FolderRef, groups: SwapGroup[]) => invoke<void>("start_folder_swap", { keep, groups }),
   foldersReviewed: () => invoke<string[]>("folders_reviewed"),
   setFolderReviewed: (key: string, on: boolean) => invoke<string[]>("set_folder_reviewed", { key, on }),

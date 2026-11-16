@@ -46,7 +46,12 @@ export default function FolderWalk({ sets, index, onIndex, onClose, onToggle, on
 }) {
   const { running, setRunning, lastDone } = useJob();
   const set = sets[index];
-  const folders = useMemo(() => (set ? [set.keep, ...set.copies] : []), [set]);
+  // Which set is open, as text: the list behind is rebuilt whenever anything on the page
+  // updates, and a new object for the same set must not start the walk over.
+  const setId = set ? [set.key, set.keep.rel_dir, ...set.copies.map((c) => c.rel_dir)].join("|") : "";
+  const setNow = useRef(set);
+  setNow.current = set;
+  const folders = useMemo(() => (setNow.current ? [setNow.current.keep, ...setNow.current.copies] : []), [setId]); // eslint-disable-line react-hooks/exhaustive-deps
   const [rows, setRows] = useState<AlignRow[] | null>(null);
   const [filter, setFilter] = useState<Filter>("all");
   const [cursor, setCursor] = useState(0);
@@ -69,8 +74,11 @@ export default function FolderWalk({ sets, index, onIndex, onClose, onToggle, on
   const [err, setErr] = useState<string | null>(null);
   const [view, setView] = useState<GridItem[] | null>(null);
   const asked = useRef(new Set<number>());
+  /** Tickets of the comparisons asked for by the photo in view: the newest one wins. */
+  const ticket = useRef(Date.now());
 
   const load = useCallback((keepPlace: boolean) => {
+    const set = setNow.current;
     if (!set) return;
     api.folderAlign(ref(set.keep), set.copies.map(ref)).then((r) => {
       setRows(r);
@@ -82,7 +90,7 @@ export default function FolderWalk({ sets, index, onIndex, onClose, onToggle, on
       setChoices(new Map());
       setHistory([]);
     }).catch((e) => setErr(String(e)));
-  }, [set]);
+  }, [setId]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     setRows(null);
     setResult(null);
@@ -136,40 +144,58 @@ export default function FolderWalk({ sets, index, onIndex, onClose, onToggle, on
   }, [suggested, choices]);
   const chosen = rowIndex != null ? picked.get(rowIndex) : undefined;
 
-  // Large pictures and details of the photo in view (and the next one, so paging is instant).
+  // Large pictures and details only of a photo the user stays on: while paging through, the
+  // thumbnail stands in (it is there at once) and nothing is asked for that is passed by. The
+  // next photo is fetched ahead once this one has been in view for a moment.
   useEffect(() => {
-    for (const i of [rowIndex, shown[at + 1]]) {
+    const fetchRow = (i: number | undefined) => {
       for (const f of (i != null ? rows?.[i]?.files : null) ?? []) {
         if (!f || asked.current.has(f.id)) continue;
         asked.current.add(f.id);
         api.previewPath(f.id).then((p) => setSrcs((s) => ({ ...s, [f.id]: fileUrl(p) }))).catch(() => setSrcs((s) => ({ ...s, [f.id]: thumbUrl(f.id) })));
         api.fileDetail(f.id).then((d) => setDetails((s) => ({ ...s, [f.id]: d }))).catch(() => {});
       }
-    }
+    };
+    const now = setTimeout(() => fetchRow(rowIndex), 120);
+    const ahead = setTimeout(() => fetchRow(shown[at + 1]), 600);
+    return () => {
+      clearTimeout(now);
+      clearTimeout(ahead);
+    };
   }, [rowIndex, at, shown, rows]);
 
   // The photo in view is compared to the end, copy by copy: the index calls two files the
   // same when their size and first 64 KiB agree, and a file damaged further in passes that.
   // (Large videos are left to the set-wide check: reading them takes a while.)
-  const check = useCallback(async (a: AlignFile, b: AlignFile) => {
+  const check = useCallback(async (a: AlignFile, b: AlignFile, ticket?: number) => {
     const key = `${a.id}:${b.id}`;
-    const d = await api.folderFirstDifference(a.id, b.id);
+    const d = await api.folderFirstDifference(a.id, b.id, ticket);
     setDiffs((s) => ({ ...s, [key]: d }));
     return d;
   }, []);
+  // Only for a photo the user stays on (a quarter of a second), one comparison at a time; on
+  // moving to another photo the one under way is told to give up — paging fast through a set
+  // must not leave dozens of files being read behind it.
   useEffect(() => {
     const first = row?.files[0];
     if (!first || sweeping.current) return;
-    let found = false;
-    (async () => {
+    let alive = true;
+    const timer = setTimeout(async () => {
+      let found = false;
       for (const f of row!.files.slice(1)) {
+        if (!alive) return;
         if (!f || diffs[`${first.id}:${f.id}`] || Math.max(first.size, f.size) > 64 << 20) continue;
-        const d = await check(first, f).catch(() => null);
+        const d = await check(first, f, ++ticket.current).catch(() => null);
         if (d?.at != null && f.same) found = true;
       }
       // Found different although listed as the same: the index knows now — show it as such.
-      if (found) load(true);
-    })();
+      if (found && alive) load(true);
+    }, 250);
+    return () => {
+      alive = false;
+      clearTimeout(timer);
+      api.cancelFolderCheck(++ticket.current).catch(() => {});
+    };
   }, [rowIndex, rows]); // eslint-disable-line react-hooks/exhaustive-deps
   const other = row?.files.find((f, n) => n > 0 && f != null && row.files[0] != null && diffs[`${row.files[0].id}:${f.id}`]?.at != null) ?? null;
   const pair = row?.files[0] && other ? `${row.files[0].id}:${other.id}` : null;
@@ -193,7 +219,7 @@ export default function FolderWalk({ sets, index, onIndex, onClose, onToggle, on
       setCursor(0);
     }
   };
-  useEffect(() => () => { sweeping.current = false; }, [set]);
+  useEffect(() => () => { sweeping.current = false; }, [setId]);
 
   /** A copy's file can be picked unless it was compared with the original's and is the same to the end. */
   const identical = (r: AlignRow, j: number) => r.files[0] != null && r.files[j] != null && diffs[`${r.files[0]!.id}:${r.files[j]!.id}`]?.at === null;

@@ -99,6 +99,63 @@ impl Progress {
 
 pub type ProgressFn<'a> = &'a (dyn Fn(Progress) + Sync);
 
+type Job = Box<dyn FnOnce() + Send>;
+type JobStack = (std::sync::Mutex<(Vec<Job>, bool)>, std::sync::Condvar);
+
+/// A fixed number of worker threads that always take the newest job first.
+///
+/// For work asked for by what is on screen (thumbnails): however fast the user moves, only so
+/// many run at once — a hundred photos decoded at the same moment stall the disk and the whole
+/// PC — and what was asked for last, what is on screen now, is done first. Nothing is dropped:
+/// older jobs are done once the newer ones are.
+pub struct WorkStack {
+    shared: Arc<JobStack>,
+}
+
+impl WorkStack {
+    pub fn new(name: &str, workers: usize) -> Self {
+        let shared: Arc<JobStack> = Arc::new((std::sync::Mutex::new((Vec::new(), false)), std::sync::Condvar::new()));
+        for i in 0..workers.max(1) {
+            let shared = shared.clone();
+            let _ = std::thread::Builder::new().name(format!("{name}-{i}")).spawn(move || loop {
+                let job = {
+                    let mut g = shared.0.lock().unwrap_or_else(|e| e.into_inner());
+                    loop {
+                        if let Some(j) = g.0.pop() {
+                            break j;
+                        }
+                        if g.1 {
+                            return;
+                        }
+                        g = shared.1.wait(g).unwrap_or_else(|e| e.into_inner());
+                    }
+                };
+                // One job that panics must not take its worker with it.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+            });
+        }
+        Self { shared }
+    }
+
+    pub fn push(&self, job: impl FnOnce() + Send + 'static) {
+        self.shared.0.lock().unwrap_or_else(|e| e.into_inner()).0.push(Box::new(job));
+        self.shared.1.notify_one();
+    }
+
+    /// Jobs waiting (not counting those running).
+    pub fn queued(&self) -> usize {
+        self.shared.0.lock().unwrap_or_else(|e| e.into_inner()).0.len()
+    }
+}
+
+impl Drop for WorkStack {
+    fn drop(&mut self) {
+        // The workers finish what is queued, then leave.
+        self.shared.0.lock().unwrap_or_else(|e| e.into_inner()).1 = true;
+        self.shared.1.notify_all();
+    }
+}
+
 /// Run `f`; a panic inside it (a decoder choking on a damaged file, say) becomes an error
 /// instead of killing the thread — one bad file must not stop the rest.
 pub fn guarded<T>(what: &str, f: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {

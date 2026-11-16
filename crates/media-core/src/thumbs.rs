@@ -114,6 +114,11 @@ impl ThumbCache {
     }
 
     /// Thumbnail JPEG path, generating it if needed (requires the drive to be online).
+    /// The thumbnail if it was made before (no work done).
+    pub fn cached_thumb(&self, f: &FileRow) -> Option<PathBuf> {
+        self.cached("thumbs", f, "jpg")
+    }
+
     pub fn ensure_thumb(&self, f: &FileRow) -> Result<PathBuf> {
         if let Some(p) = self.cached("thumbs", f, "jpg") {
             return Ok(p);

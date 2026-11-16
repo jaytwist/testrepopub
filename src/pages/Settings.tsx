@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, fmtCount, fmtEta, onAnalysisStatus, type AnalysisOptions, type AppInfo, type LaneStatus } from "../api";
+import { api, clearSlowLog, fmtCount, fmtEta, onAnalysisStatus, slowLog, type AnalysisOptions, type AppInfo, type LaneStatus, type SlowEntry } from "../api";
 import ScanSettings from "../components/ScanSettings";
 import { confirm } from "@tauri-apps/plugin-dialog";
 
@@ -110,6 +110,8 @@ export default function Settings() {
         <ScanSettings />
       </section>
 
+      <SlowLog />
+
       <section className="card">
         <h2>앱 정보</h2>
         <div className="kv">
@@ -134,5 +136,37 @@ export default function Settings() {
         </details>
       </section>
     </div>
+  );
+}
+
+/** What took long in this run: commands of half a second or more, and moments the screen did
+ *  not react. Something to copy and send when the app felt stuck. */
+function SlowLog() {
+  const [rows, setRows] = useState<SlowEntry[]>(slowLog());
+  const [copied, setCopied] = useState(false);
+  const text = rows.map((r) => `${new Date(r.at).toLocaleTimeString("ko-KR")}\t${r.kind === "stall" ? "화면 멈춤" : r.what}\t${(r.ms / 1000).toFixed(1)}초`).join("\n");
+  return (
+    <section className="card">
+      <h2>느린 작업 기록</h2>
+      <p className="muted small">
+        앱을 켠 뒤 0.5초 넘게 걸린 명령과 화면이 0.3초 넘게 멈춘 순간입니다(최근 100건). 앱이 멈춘 것처럼 느껴졌다면 이 목록을 복사해 보내 주세요.
+      </p>
+      {rows.length === 0 ? (
+        <div className="muted small">기록된 것이 없습니다.</div>
+      ) : (
+        <div className="slow-log small mono">
+          {[...rows].reverse().map((r, i) => (
+            <div key={i} className={r.kind === "stall" ? "warn-text" : ""}>
+              {new Date(r.at).toLocaleTimeString("ko-KR")} · {r.kind === "stall" ? "화면 멈춤" : r.what} · {(r.ms / 1000).toFixed(1)}초
+            </div>
+          ))}
+        </div>
+      )}
+      <div className="btn-row">
+        <button className="btn small" onClick={() => setRows(slowLog())}>새로 고침</button>
+        <button className="btn small" disabled={rows.length === 0} onClick={() => navigator.clipboard.writeText(text).then(() => setCopied(true)).catch(() => {})}>{copied ? "복사됨" : "복사"}</button>
+        <button className="btn small ghost" onClick={() => { clearSlowLog(); setRows([]); setCopied(false); }}>지우기</button>
+      </div>
+    </section>
   );
 }

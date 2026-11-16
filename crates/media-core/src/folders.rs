@@ -305,6 +305,30 @@ pub struct Found {
     pub drive: Option<String>,
 }
 
+/// The last list found, kept until the files change: the list is asked for whenever its page
+/// opens, and a library does not change between two visits. One computation at a time — a
+/// second caller waits for the first and takes its result.
+#[derive(Default)]
+pub struct FoundCache {
+    last: std::sync::Mutex<Option<(u64, u64, Found)>>,
+}
+
+impl FoundCache {
+    /// The list for `near` as of generation `gen` (a number the caller raises whenever files
+    /// changed): from memory if that is what was computed last, else from `compute`.
+    pub fn get(&self, gen: u64, near: f64, compute: impl FnOnce() -> Result<Found>) -> Result<Found> {
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((g, n, found)) = last.as_ref() {
+            if *g == gen && *n == near.to_bits() {
+                return Ok(found.clone());
+            }
+        }
+        let found = compute()?;
+        *last = Some((gen, near.to_bits(), found.clone()));
+        Ok(found)
+    }
+}
+
 /// "거의 같은 폴더": at least this share of the bigger folder's files is in both.
 pub const NEAR: f64 = 0.95;
 
@@ -842,6 +866,12 @@ pub struct FirstDifference {
 }
 
 pub fn first_difference(conn: &Connection, a: i64, b: i64) -> Result<FirstDifference> {
+    first_difference_with(conn, a, b, &|| false)
+}
+
+/// `first_difference` that gives up (with an error) once `cancelled` says so — asked every
+/// megabyte. The user has moved on to another photo: reading this pair on is wasted disk time.
+pub fn first_difference_with(conn: &Connection, a: i64, b: i64, cancelled: &dyn Fn() -> bool) -> Result<FirstDifference> {
     use std::io::Read;
     let path = |id: i64| -> Result<PathBuf> { Ok(db::get_file(conn, id)?.ok_or_else(|| anyhow::anyhow!("파일을 찾을 수 없습니다"))?.abs_path()) };
     let (pa, pb) = (path(a)?, path(b)?);
@@ -860,6 +890,9 @@ pub fn first_difference(conn: &Connection, a: i64, b: i64) -> Result<FirstDiffer
             }
             Ok(n)
         };
+        if cancelled() {
+            anyhow::bail!("cancelled");
+        }
         let (x, y) = (fill(&mut fa, &mut ba)?, fill(&mut fb, &mut bb)?);
         let both = x.min(y);
         if let Some(i) = (0..both).find(|i| ba[*i] != bb[*i]) {
@@ -928,7 +961,12 @@ fn judge(conn: &Connection, a: i64, b: i64, d: &mut FirstDifference) {
 /// (same size, same first 64 KiB), teach the index: from then on they are different files
 /// everywhere. Returns where they first differ.
 pub fn check_pair(conn: &Connection, a: i64, b: i64) -> Result<FirstDifference> {
-    let mut d = first_difference(conn, a, b)?;
+    check_pair_with(conn, a, b, &|| false)
+}
+
+/// `check_pair` that can be given up (see `first_difference_with`); given up, it has changed nothing.
+pub fn check_pair_with(conn: &Connection, a: i64, b: i64, cancelled: &dyn Fn() -> bool) -> Result<FirstDifference> {
+    let mut d = first_difference_with(conn, a, b, cancelled)?;
     if d.at.is_some() {
         judge(conn, a, b, &mut d);
         let key = |id: i64| -> Option<String> { conn.query_row("SELECT COALESCE(prehash, hash) FROM files WHERE id = ?", [id], |r| r.get::<_, Option<String>>(0)).ok().flatten() };

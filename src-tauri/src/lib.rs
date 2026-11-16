@@ -47,11 +47,30 @@ struct AppState {
     /// Work a crash or power loss cut short last time (told to the user once, then files are
     /// checked again).
     interrupted: Mutex<Vec<String>>,
+    /// Thumbnails: a quick lane (look up, serve what is cached) and a lane that makes the
+    /// missing ones — a few at a time, the newest request first.
+    thumb_fast: media_core::WorkStack,
+    thumb_make: media_core::WorkStack,
+    /// Raised whenever files or what is known about them changed: lists computed from the
+    /// index are reused until then.
+    data_gen: std::sync::atomic::AtomicU64,
+    folders_cache: media_core::folders::FoundCache,
+    /// The comparison asked for last by the side-by-side window: an older one gives up.
+    walk_ticket: std::sync::atomic::AtomicU64,
+    /// Held while a setting is read, changed and written back.
+    settings_lock: Mutex<()>,
+}
+
+impl AppState {
+    fn changed(&self) {
+        self.data_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Recompute data derived from the per-file analysis (bursts, places, trips, people).
 /// Each step runs even if another failed (a cleanup error once kept people from ever being grouped).
 pub(crate) fn post_analysis(st: &AppState) -> anyhow::Result<()> {
+    st.changed();
     let mut conn = st.db.conn()?;
     let mut errors = Vec::new();
     if let Err(e) = media_core::cleanup::refresh(&mut conn) {
@@ -138,6 +157,7 @@ where
             let _ = conn.execute_batch("PRAGMA optimize; PRAGMA wal_checkpoint(PASSIVE);");
         }
         *st.job.locked() = None;
+        st.changed();
         st.lane.set_job_active(&app, false);
         if name == "scan" {
             st.lane.kick(&app, false);
@@ -175,7 +195,7 @@ struct AppInfo {
     interrupted: Vec<String>,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn app_info(state: State<AppState>) -> AppInfo {
     AppInfo {
         version: env!("CARGO_PKG_VERSION").into(),
@@ -187,7 +207,7 @@ fn app_info(state: State<AppState>) -> AppInfo {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn list_volumes(state: State<AppState>, refresh: bool) -> CmdResult<Vec<VolumeRow>> {
     let conn = state.db.conn().map_err(err)?;
     if refresh {
@@ -196,20 +216,20 @@ fn list_volumes(state: State<AppState>, refresh: bool) -> CmdResult<Vec<VolumeRo
     db::list_volumes(&conn).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn list_sources(state: State<AppState>) -> CmdResult<Vec<SourceRow>> {
     let conn = state.db.conn().map_err(err)?;
     db::list_sources(&conn).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn add_source(state: State<AppState>, path: String) -> CmdResult<i64> {
     let conn = state.db.conn().map_err(err)?;
     volumes::add_source(&conn, Path::new(&path)).map_err(err)
 }
 
 /// Stop tracking a folder. Index rows for files under it are removed; files on disk are untouched.
-#[tauri::command]
+#[tauri::command(async)]
 fn remove_source(state: State<AppState>, id: i64) -> CmdResult<()> {
     let conn = state.db.conn().map_err(err)?;
     volumes::remove_source(&conn, id).map_err(err)
@@ -260,25 +280,26 @@ fn start_scan(
 // Import from a camera card
 // ---------------------------------------------------------------------------------------------
 
-#[tauri::command]
+#[tauri::command(async)]
 fn list_cards() -> Vec<media_core::importer::Card> {
     media_core::importer::find_cards()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_import_settings(state: State<AppState>) -> CmdResult<media_core::importer::ImportSettings> {
     let conn = state.db.conn().map_err(err)?;
     media_core::importer::ImportSettings::load(&conn).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_import_settings(state: State<AppState>, settings: media_core::importer::ImportSettings) -> CmdResult<()> {
     let conn = state.db.conn().map_err(err)?;
+    state.changed(); // where the library is decides which folder of a set stays
     settings.save(&conn).map_err(err)
 }
 
 /// Count what is new on the card (the card is scanned; the backup drive is not).
-#[tauri::command]
+#[tauri::command(async)]
 fn start_import_preview(app: AppHandle, state: State<AppState>, mount: String) -> CmdResult<()> {
     spawn_job(&app, &state, "import:preview", move |st, progress| {
         let opts = userfiles::load_options(&st.db.conn()?)?;
@@ -287,7 +308,7 @@ fn start_import_preview(app: AppHandle, state: State<AppState>, mount: String) -
 }
 
 /// Copy the card's new photos into the backup folder (indexed while copying), then forget the card.
-#[tauri::command]
+#[tauri::command(async)]
 fn start_import(app: AppHandle, state: State<AppState>, mount: String) -> CmdResult<()> {
     spawn_job(&app, &state, "import", move |st, progress| {
         let conn = st.db.conn()?;
@@ -299,25 +320,25 @@ fn start_import(app: AppHandle, state: State<AppState>, mount: String) -> CmdRes
 }
 
 /// The card was looked at but not imported: forget it again.
-#[tauri::command]
+#[tauri::command(async)]
 fn import_cancel(state: State<AppState>, source_id: i64) -> CmdResult<()> {
     let conn = state.db.conn().map_err(err)?;
     media_core::importer::forget(&conn, source_id).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_scan_options(state: State<AppState>) -> CmdResult<ScanOptions> {
     let conn = state.db.conn().map_err(err)?;
     userfiles::load_options(&conn).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_scan_options(state: State<AppState>, options: ScanOptions) -> CmdResult<()> {
     let conn = state.db.conn().map_err(err)?;
     userfiles::save_options(&conn, &options).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn default_scan_options() -> ScanOptions {
     ScanOptions::default()
 }
@@ -332,7 +353,7 @@ struct SuggestedFolder {
 
 /// The user's own media folders (Pictures, Videos, Desktop, Downloads, Documents, OneDrive) and
 /// connected external drives: one click to add, instead of scanning all of C:.
-#[tauri::command]
+#[tauri::command(async)]
 fn suggested_folders(app: AppHandle, state: State<AppState>) -> CmdResult<Vec<SuggestedFolder>> {
     let conn = state.db.conn().map_err(err)?;
     let sources: Vec<PathBuf> = db::list_sources(&conn).map_err(err)?.into_iter().map(|s| PathBuf::from(s.abs_path)).collect();
@@ -380,19 +401,19 @@ fn suggested_folders(app: AppHandle, state: State<AppState>) -> CmdResult<Vec<Su
 // People
 // ---------------------------------------------------------------------------------------------
 
-#[tauri::command]
+#[tauri::command(async)]
 fn people_list(state: State<AppState>, include_hidden: bool) -> CmdResult<Vec<media_core::people::PersonRow>> {
     let conn = state.db.conn().map_err(err)?;
     media_core::people::list(&conn, include_hidden).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn person_faces(state: State<AppState>, person: i64) -> CmdResult<Vec<media_core::people::FaceRow>> {
     let conn = state.db.conn().map_err(err)?;
     media_core::people::faces_of(&conn, person, 2000).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn people_suggestions(state: State<AppState>) -> CmdResult<Vec<media_core::people::PairSuggestion>> {
     let conn = state.db.conn().map_err(err)?;
     media_core::people::suggestions(&conn, 5).map_err(err)
@@ -400,7 +421,7 @@ fn people_suggestions(state: State<AppState>) -> CmdResult<Vec<media_core::peopl
 
 /// Name a person. If someone else already has that name, nothing changes and their id comes
 /// back so the UI can offer to merge the two.
-#[tauri::command]
+#[tauri::command(async)]
 fn rename_person(state: State<AppState>, person: i64, name: String) -> CmdResult<Option<i64>> {
     let mut conn = state.db.conn().map_err(err)?;
     if let Some(other) = media_core::people::person_named(&conn, &name, person).map_err(err)? {
@@ -412,44 +433,44 @@ fn rename_person(state: State<AppState>, person: i64, name: String) -> CmdResult
     Ok(None)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn merge_people(state: State<AppState>, into: i64, others: Vec<i64>) -> CmdResult<()> {
     let mut conn = state.db.conn().map_err(err)?;
     media_core::people::merge(&mut conn, into, &others).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn move_faces(state: State<AppState>, faces: Vec<i64>, from: i64, to: Option<i64>) -> CmdResult<i64> {
     let mut conn = state.db.conn().map_err(err)?;
     media_core::people::move_faces(&mut conn, &faces, from, to).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn reject_faces(state: State<AppState>, faces: Vec<i64>, person: i64) -> CmdResult<()> {
     let mut conn = state.db.conn().map_err(err)?;
     media_core::people::reject(&mut conn, &faces, person).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn hide_people(state: State<AppState>, people: Vec<i64>, hidden: bool) -> CmdResult<()> {
     let conn = state.db.conn().map_err(err)?;
     media_core::people::set_hidden(&conn, &people, hidden).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_person_cover(state: State<AppState>, person: i64, face: i64) -> CmdResult<()> {
     let conn = state.db.conn().map_err(err)?;
     media_core::people::set_cover(&conn, person, face).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn answer_people_pair(state: State<AppState>, a: i64, b: i64, same: bool) -> CmdResult<()> {
     let mut conn = state.db.conn().map_err(err)?;
     media_core::people::answer_pair(&mut conn, a, b, same).map_err(err)
 }
 
 /// "Delete face data": turn the feature off and forget every face, person and crop.
-#[tauri::command]
+#[tauri::command(async)]
 fn clear_face_data(state: State<AppState>) -> CmdResult<()> {
     let mut conn = state.db.conn().map_err(err)?;
     let mut opts = analysis::load_options(&conn).map_err(err)?;
@@ -461,32 +482,32 @@ fn clear_face_data(state: State<AppState>) -> CmdResult<()> {
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn trips_summary(state: State<AppState>) -> CmdResult<media_core::places::TripsSummary> {
     let conn = state.db.conn().map_err(err)?;
     media_core::places::summary(&conn).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn cleanup_summary(state: State<AppState>) -> CmdResult<media_core::cleanup::CleanupSummary> {
     let conn = state.db.conn().map_err(err)?;
     media_core::cleanup::summary(&conn).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn burst_extra_ids(state: State<AppState>) -> CmdResult<Vec<i64>> {
     let conn = state.db.conn().map_err(err)?;
     media_core::cleanup::burst_extra_ids(&conn).map_err(err)
 }
 
 /// "Keep": never suggest these files for `kind` again.
-#[tauri::command]
+#[tauri::command(async)]
 fn dismiss(state: State<AppState>, ids: Vec<i64>, kind: String) -> CmdResult<usize> {
     let mut conn = state.db.conn().map_err(err)?;
     media_core::cleanup::dismiss(&mut conn, &ids, &kind).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn undismiss(state: State<AppState>, ids: Vec<i64>, kind: String) -> CmdResult<usize> {
     let conn = state.db.conn().map_err(err)?;
     media_core::cleanup::undismiss(&conn, &ids, &kind).map_err(err)
@@ -496,17 +517,17 @@ fn undismiss(state: State<AppState>, ids: Vec<i64>, kind: String) -> CmdResult<u
 // Background analysis
 // ---------------------------------------------------------------------------------------------
 
-#[tauri::command]
+#[tauri::command(async)]
 fn analysis_status(app: AppHandle, state: State<AppState>) -> LaneStatus {
     state.lane.status(&app)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn analysis_pause(app: AppHandle, state: State<AppState>, paused: bool) {
     state.lane.set_user_paused(&app, paused);
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn analysis_start(app: AppHandle, state: State<AppState>) {
     state.lane.set_user_paused(&app, false);
     // A failed face engine is loaded again (e.g. after the AI files were put in place).
@@ -514,13 +535,13 @@ fn analysis_start(app: AppHandle, state: State<AppState>) {
     state.lane.kick(&app, true);
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_analysis_options(state: State<AppState>) -> CmdResult<AnalysisOptions> {
     let conn = state.db.conn().map_err(err)?;
     analysis::load_options(&conn).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_analysis_options(app: AppHandle, state: State<AppState>, options: AnalysisOptions) -> CmdResult<()> {
     let conn = state.db.conn().map_err(err)?;
     let before = analysis::load_options(&conn).map_err(err)?;
@@ -535,12 +556,12 @@ fn set_analysis_options(app: AppHandle, state: State<AppState>, options: Analysi
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn start_thumbs(app: AppHandle, state: State<AppState>) -> CmdResult<()> {
     spawn_job(&app, &state, "thumbs", |st, progress| thumbs::warm(&st.db, &st.thumbs, &st.stop, progress))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn cancel_job(state: State<AppState>) {
     state.stop.stop();
 }
@@ -549,43 +570,43 @@ fn cancel_job(state: State<AppState>) {
 // Library browsing
 // ---------------------------------------------------------------------------------------------
 
-#[tauri::command]
+#[tauri::command(async)]
 fn library_stats(state: State<AppState>) -> CmdResult<LibraryStats> {
     let conn = state.db.conn().map_err(err)?;
     db::library_stats(&conn).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn timeline(state: State<AppState>, filter: FileFilter) -> CmdResult<Vec<MonthCount>> {
     let conn = state.db.conn().map_err(err)?;
     db::timeline_summary(&conn, &filter).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn filter_options(state: State<AppState>) -> CmdResult<FilterOptions> {
     let conn = state.db.conn().map_err(err)?;
     db::filter_options(&conn).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn filtered_stats(state: State<AppState>, filter: FileFilter) -> CmdResult<FilteredStats> {
     let conn = state.db.conn().map_err(err)?;
     db::filtered_stats(&conn, &filter).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn group_summary(state: State<AppState>, filter: FileFilter, group_by: String) -> CmdResult<Vec<GroupRow>> {
     let conn = state.db.conn().map_err(err)?;
     db::group_summary(&conn, &filter, &group_by).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn grid(state: State<AppState>, filter: FileFilter, offset: i64, limit: i64) -> CmdResult<Vec<GridItem>> {
     let conn = state.db.conn().map_err(err)?;
     db::query_grid(&conn, &filter, offset, limit.min(5000)).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn query_ids(state: State<AppState>, filter: FileFilter) -> CmdResult<Vec<i64>> {
     let conn = state.db.conn().map_err(err)?;
     db::query_ids(&conn, &filter).map_err(err)
@@ -610,7 +631,7 @@ struct FileDetail {
     dup_group_size: i64,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn file_detail(state: State<AppState>, id: i64) -> CmdResult<FileDetail> {
     let conn = state.db.conn().map_err(err)?;
     detail_of(&state, &conn, id)
@@ -624,23 +645,24 @@ struct CompareInfo {
 }
 
 /// "This copy is the original" (one per group of identical files).
-#[tauri::command]
+#[tauri::command(async)]
 fn set_original(state: State<AppState>, id: i64) -> CmdResult<()> {
     let mut conn = state.db.conn().map_err(err)?;
     media_core::identity::set_original(&mut conn, id).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_dup_rules(state: State<AppState>) -> CmdResult<dedupe::DupRules> {
     let conn = state.db.conn().map_err(err)?;
     dedupe::DupRules::load(&conn).map_err(err)
 }
 
 /// Save the duplicate keep rules and re-pick keepers; returns how many groups changed.
-#[tauri::command]
+#[tauri::command(async)]
 fn set_dup_rules(state: State<AppState>, rules: dedupe::DupRules) -> CmdResult<usize> {
     let mut conn = state.db.conn().map_err(err)?;
     rules.save(&conn).map_err(err)?;
+    state.changed();
     let changed = dedupe::apply_rules(&mut conn).map_err(err)?;
     media_core::identity::refresh_roles(&mut conn).map_err(err)?;
     Ok(changed)
@@ -648,7 +670,7 @@ fn set_dup_rules(state: State<AppState>, rules: dedupe::DupRules) -> CmdResult<u
 
 /// Folders worth a "delete from here first" rule: messenger / download folders that hold
 /// duplicate copies, most copies first.
-#[tauri::command]
+#[tauri::command(async)]
 fn dup_rule_suggestions(state: State<AppState>) -> CmdResult<Vec<(String, i64)>> {
     let conn = state.db.conn().map_err(err)?;
     let sql = format!(
@@ -673,7 +695,7 @@ fn dup_rule_suggestions(state: State<AppState>) -> CmdResult<Vec<(String, i64)>>
 }
 
 /// Photos that look like this one (resized / recompressed / edited copies), most similar first.
-#[tauri::command]
+#[tauri::command(async)]
 fn similar_to(state: State<AppState>, id: i64) -> CmdResult<Vec<i64>> {
     let conn = state.db.conn().map_err(err)?;
     media_core::compare::similar_to(&conn, id, 3).map_err(err)
@@ -816,14 +838,14 @@ async fn video_preview_path(app: AppHandle, id: i64) -> CmdResult<String> {
     .map_err(err)?
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn reveal_file(app: AppHandle, state: State<AppState>, id: i64) -> CmdResult<()> {
     let conn = state.db.conn().map_err(err)?;
     let f = db::get_file(&conn, id).map_err(err)?.ok_or("not found")?;
     app.opener().reveal_item_in_dir(f.abs_path()).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn open_file(app: AppHandle, state: State<AppState>, id: i64) -> CmdResult<()> {
     let conn = state.db.conn().map_err(err)?;
     let f = db::get_file(&conn, id).map_err(err)?.ok_or("not found")?;
@@ -856,12 +878,12 @@ fn find_vlc() -> Option<PathBuf> {
     cands.into_iter().find(|p| p.is_file())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn vlc_path() -> Option<String> {
     find_vlc().map(|p| p.to_string_lossy().into_owned())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn open_in_vlc(state: State<AppState>, id: i64) -> CmdResult<()> {
     let vlc = find_vlc().ok_or("VLC를 찾을 수 없습니다. VLC가 설치되어 있는지 확인하세요")?;
     let conn = state.db.conn().map_err(err)?;
@@ -963,26 +985,26 @@ async fn install_update(app: AppHandle) -> CmdResult<()> {
 // Labels & dates
 // ---------------------------------------------------------------------------------------------
 
-#[tauri::command]
+#[tauri::command(async)]
 fn label_counts(state: State<AppState>) -> CmdResult<Vec<LabelCount>> {
     let conn = state.db.conn().map_err(err)?;
     labels::label_counts(&conn).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn add_label(state: State<AppState>, ids: Vec<i64>, label: String) -> CmdResult<usize> {
     let mut conn = state.db.conn().map_err(err)?;
     labels::add_user_label(&mut conn, &ids, &label).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn remove_label(state: State<AppState>, ids: Vec<i64>, label: String) -> CmdResult<usize> {
     let mut conn = state.db.conn().map_err(err)?;
     labels::remove_label(&mut conn, &ids, &label).map_err(err)
 }
 
 /// `datetime` is local wall time, "YYYY-MM-DDTHH:MM" (from an <input type="datetime-local">).
-#[tauri::command]
+#[tauri::command(async)]
 fn set_date(state: State<AppState>, ids: Vec<i64>, datetime: String) -> CmdResult<usize> {
     let dt = chrono::NaiveDateTime::parse_from_str(&datetime, "%Y-%m-%dT%H:%M")
         .or_else(|_| chrono::NaiveDateTime::parse_from_str(&datetime, "%Y-%m-%dT%H:%M:%S"))
@@ -993,7 +1015,7 @@ fn set_date(state: State<AppState>, ids: Vec<i64>, datetime: String) -> CmdResul
     Ok(n)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn shift_date(state: State<AppState>, ids: Vec<i64>, delta_secs: i64) -> CmdResult<usize> {
     let mut conn = state.db.conn().map_err(err)?;
     let n = labels::shift_taken_at(&mut conn, &ids, delta_secs).map_err(err)?;
@@ -1005,32 +1027,32 @@ fn shift_date(state: State<AppState>, ids: Vec<i64>, delta_secs: i64) -> CmdResu
 // Duplicates
 // ---------------------------------------------------------------------------------------------
 
-#[tauri::command]
+#[tauri::command(async)]
 fn start_dedupe(app: AppHandle, state: State<AppState>, kind: DupKind, similarity: Option<Similarity>) -> CmdResult<()> {
     spawn_job(&app, &state, &format!("dedupe:{}", kind.as_str()), move |st, progress| {
         dedupe::run(&st.db, kind, similarity.unwrap_or(Similarity::High), &st.stop, progress)
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn dup_summary(state: State<AppState>) -> CmdResult<Vec<DupSummary>> {
     let conn = state.db.conn().map_err(err)?;
     dedupe::summary(&conn).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn dup_groups(state: State<AppState>, kind: String, offset: i64, limit: i64) -> CmdResult<Vec<DupGroup>> {
     let conn = state.db.conn().map_err(err)?;
     dedupe::list_groups(&conn, &kind, offset, limit).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_keep(state: State<AppState>, group_id: i64, file_id: i64, keep: bool) -> CmdResult<()> {
     let conn = state.db.conn().map_err(err)?;
     dedupe::set_keep(&conn, group_id, file_id, keep).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn start_dedupe_apply(app: AppHandle, state: State<AppState>, kind: String, group_ids: Option<Vec<i64>>) -> CmdResult<()> {
     spawn_job(&app, &state, "dedupe:apply", move |st, progress| dedupe::apply(&st.db, &kind, group_ids, &st.stop, progress))
 }
@@ -1046,7 +1068,7 @@ struct PlanView {
     options: OrganizeOptions,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn start_plan(app: AppHandle, state: State<AppState>, options: OrganizeOptions) -> CmdResult<()> {
     spawn_job(&app, &state, "organize:plan", move |st, progress| {
         let plan = organizer::plan(&st.db, &options, &st.stop, progress)?;
@@ -1058,7 +1080,7 @@ fn start_plan(app: AppHandle, state: State<AppState>, options: OrganizeOptions) 
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn plan_items(state: State<AppState>, plan_id: String, action: Option<String>, offset: usize, limit: usize) -> CmdResult<Vec<PlanItem>> {
     let plans = state.plans.locked();
     let plan = plans.get(&plan_id).ok_or("계획이 만료되었습니다. 다시 미리보기를 실행하세요")?;
@@ -1076,7 +1098,7 @@ fn plan_items(state: State<AppState>, plan_id: String, action: Option<String>, o
         .collect())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn start_execute(
     app: AppHandle,
     state: State<AppState>,
@@ -1114,22 +1136,22 @@ fn with_plan<T>(state: &State<AppState>, plan_id: &str, f: impl FnOnce(&Plan) ->
 }
 
 /// The library plan by year ("한 해씩").
-#[tauri::command]
+#[tauri::command(async)]
 fn library_years(state: State<AppState>, plan_id: String) -> CmdResult<Vec<organizer::YearBucket>> {
     with_plan(&state, &plan_id, organizer::year_buckets)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn year_copies(state: State<AppState>, plan_id: String, year: String) -> CmdResult<Vec<organizer::CopyFolder>> {
     with_plan(&state, &plan_id, |p| organizer::year_copies(p, &year))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn year_copy_pairs(state: State<AppState>, plan_id: String, year: String, dir: String, offset: usize, limit: usize) -> CmdResult<Vec<organizer::CopyPair>> {
     with_plan(&state, &plan_id, |p| organizer::year_copy_pairs(p, &year, &dir, offset, limit))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn year_keep(state: State<AppState>, plan_id: String, year: String, offset: usize, limit: usize) -> CmdResult<Vec<organizer::KeepItem>> {
     with_plan(&state, &plan_id, |p| organizer::year_keep(p, &year, offset, limit))
 }
@@ -1143,7 +1165,7 @@ struct DiskSpace {
 }
 
 /// One year's bursts / similar photos to review (other drives and edited versions locked).
-#[tauri::command]
+#[tauri::command(async)]
 fn year_triage_groups(
     state: State<AppState>,
     plan_id: String,
@@ -1165,7 +1187,7 @@ struct YearTriageCounts {
     unanalyzed: usize,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn year_triage_counts(state: State<AppState>, plan_id: String, year: String) -> CmdResult<YearTriageCounts> {
     let (files, lib) = with_plan(&state, &plan_id, |p| (organizer::year_files(p, &year), organizer::lib_vol(p).unwrap_or(-1)))?;
     let conn = state.db.conn().map_err(err)?;
@@ -1184,31 +1206,31 @@ fn year_triage_counts(state: State<AppState>, plan_id: String, year: String) -> 
 }
 
 /// Files planned into the chosen library folders (preview of a selection).
-#[tauri::command]
+#[tauri::command(async)]
 fn group_items(state: State<AppState>, plan_id: String, groups: Vec<String>, offset: usize, limit: usize) -> CmdResult<Vec<organizer::KeepItem>> {
     with_plan(&state, &plan_id, |p| organizer::group_items(p, &groups, offset, limit))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_library_merges(state: State<AppState>) -> CmdResult<Vec<media_core::library::Merge>> {
     let conn = state.db.conn().map_err(err)?;
     media_core::library::load_merges(&conn).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_library_merges(state: State<AppState>, merges: Vec<media_core::library::Merge>) -> CmdResult<()> {
     let conn = state.db.conn().map_err(err)?;
     media_core::library::save_merges(&conn, &merges).map_err(err)
 }
 
 /// How many deleted photos are kept out of the library (their copies elsewhere not brought back).
-#[tauri::command]
+#[tauri::command(async)]
 fn library_excluded_count(state: State<AppState>) -> CmdResult<usize> {
     let conn = state.db.conn().map_err(err)?;
     Ok(media_core::library::load_excluded(&conn).map_err(err)?.len())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn clear_library_excluded(state: State<AppState>) -> CmdResult<()> {
     let conn = state.db.conn().map_err(err)?;
     media_core::library::save_excluded(&conn, &[]).map_err(err)
@@ -1223,7 +1245,7 @@ struct FolderDeletePreview {
     protected: Vec<media_core::protect::Blocked>,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn library_delete_preview(state: State<AppState>, plan_id: String, groups: Vec<String>) -> CmdResult<FolderDeletePreview> {
     let t = with_plan(&state, &plan_id, |p| organizer::delete_targets(p, &groups))?;
     let conn = state.db.conn().map_err(err)?;
@@ -1232,7 +1254,7 @@ fn library_delete_preview(state: State<AppState>, plan_id: String, groups: Vec<S
 }
 
 /// Delete library folders for good (see `organizer::delete_folders`).
-#[tauri::command]
+#[tauri::command(async)]
 fn start_library_delete(app: AppHandle, state: State<AppState>, plan_id: String, groups: Vec<String>, keep_protected: bool) -> CmdResult<()> {
     let plan = state.plans.locked().get(&plan_id).cloned().ok_or("계획이 만료되었습니다. 다시 미리보기를 실행하세요")?;
     spawn_job(&app, &state, "library:delete", move |st, progress| {
@@ -1244,9 +1266,19 @@ fn start_library_delete(app: AppHandle, state: State<AppState>, plan_id: String,
 
 /// Folders copied whole, on the library drive ("100% 복사 폴더"): reads the index only.
 #[tauri::command(async)]
-fn copy_folders(state: State<'_, AppState>, near: Option<f64>) -> CmdResult<media_core::folders::Found> {
-    let conn = state.db.conn().map_err(err)?;
-    media_core::folders::find_with(&conn, near.unwrap_or(media_core::folders::NEAR)).map_err(err)
+fn copy_folders(state: State<'_, AppState>, near: Option<f64>, refresh: Option<bool>) -> CmdResult<media_core::folders::Found> {
+    if refresh.unwrap_or(false) {
+        state.changed();
+    }
+    let near = near.unwrap_or(media_core::folders::NEAR);
+    let gen = state.data_gen.load(std::sync::atomic::Ordering::Relaxed);
+    state
+        .folders_cache
+        .get(gen, near, || {
+            let conn = state.db.conn()?;
+            media_core::folders::find_with(&conn, near)
+        })
+        .map_err(err)
 }
 
 /// A folder's photos and videos, sub-folder by sub-folder.
@@ -1273,13 +1305,29 @@ fn folder_align(state: State<'_, AppState>, keep: media_core::folders::FolderRef
 /// Compare two files to the end: where they first differ, if they do (the index then learns
 /// that they are different files).
 #[tauri::command(async)]
-fn folder_first_difference(state: State<'_, AppState>, a: i64, b: i64) -> CmdResult<media_core::folders::FirstDifference> {
+fn folder_first_difference(state: State<'_, AppState>, a: i64, b: i64, ticket: Option<u64>) -> CmdResult<media_core::folders::FirstDifference> {
+    use std::sync::atomic::Ordering;
+    // With a ticket (the photo in view): the newest ticket wins, an older comparison gives up.
+    if let Some(t) = ticket {
+        state.walk_ticket.fetch_max(t, Ordering::Relaxed);
+    }
+    let cancelled = || ticket.is_some_and(|t| state.walk_ticket.load(Ordering::Relaxed) != t);
     let conn = state.db.conn().map_err(err)?;
-    media_core::folders::check_pair(&conn, a, b).map_err(err)
+    let d = media_core::folders::check_pair_with(&conn, a, b, &cancelled).map_err(err)?;
+    if d.at.is_some() {
+        state.changed(); // the two are known as different files now: lists change
+    }
+    Ok(d)
+}
+
+/// The side-by-side window moved on: whatever comparison it had asked for gives up.
+#[tauri::command(async)]
+fn cancel_folder_check(state: State<'_, AppState>, ticket: u64) {
+    state.walk_ticket.fetch_max(ticket, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Take the chosen files of copy folders into the folder that stays (replace or add).
-#[tauri::command]
+#[tauri::command(async)]
 fn start_folder_swap(app: AppHandle, state: State<AppState>, keep: media_core::folders::FolderRef, groups: Vec<media_core::folders::SwapGroup>) -> CmdResult<()> {
     spawn_job(&app, &state, "cleanup:swap", move |st, progress| {
         let r = media_core::folders::swap(&st.db, &keep, &groups, &st.stop, progress)?;
@@ -1289,14 +1337,15 @@ fn start_folder_swap(app: AppHandle, state: State<AppState>, keep: media_core::f
 }
 
 /// Sets the user has looked through.
-#[tauri::command]
+#[tauri::command(async)]
 fn folders_reviewed(state: State<AppState>) -> CmdResult<Vec<String>> {
     let conn = state.db.conn().map_err(err)?;
     media_core::folders::reviewed(&conn).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_folder_reviewed(state: State<AppState>, key: String, on: bool) -> CmdResult<Vec<String>> {
+    let _one = state.settings_lock.locked();
     let conn = state.db.conn().map_err(err)?;
     media_core::folders::set_reviewed(&conn, &key, on).map_err(err)
 }
@@ -1309,7 +1358,7 @@ fn folder_props(state: State<'_, AppState>, folder: media_core::folders::FolderR
 }
 
 /// Remove the chosen copy folders (each file compared with its twin before it is deleted).
-#[tauri::command]
+#[tauri::command(async)]
 fn start_remove_copy_folders(app: AppHandle, state: State<AppState>, picks: Vec<media_core::folders::Pick>, purge: bool, quick: Option<bool>) -> CmdResult<()> {
     let opts = media_core::folders::RemoveOptions { purge, quick: quick.unwrap_or(false) };
     spawn_job(&app, &state, "cleanup:folders", move |st, progress| {
@@ -1320,7 +1369,7 @@ fn start_remove_copy_folders(app: AppHandle, state: State<AppState>, picks: Vec<
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn open_folder(app: AppHandle, path: String) -> CmdResult<()> {
     if !Path::new(&path).is_dir() {
         return Err("폴더를 찾을 수 없습니다".into());
@@ -1329,41 +1378,41 @@ fn open_folder(app: AppHandle, path: String) -> CmdResult<()> {
 }
 
 /// The files that are the same photo as this one: where the original is and what the others are.
-#[tauri::command]
+#[tauri::command(async)]
 fn file_family(state: State<AppState>, id: i64) -> CmdResult<Option<media_core::identity::Family>> {
     let conn = state.db.conn().map_err(err)?;
     media_core::identity::family(&conn, id).map_err(err)
 }
 
 /// Face finding on / off for this session.
-#[tauri::command]
+#[tauri::command(async)]
 fn set_faces_enabled(app: AppHandle, state: State<AppState>, on: bool) -> CmdResult<()> {
     state.lane.set_faces_enabled(&app, on);
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn disk_space(path: String) -> CmdResult<Option<DiskSpace>> {
     Ok(media_core::volumes::disk_space(Path::new(&path))
         .map(|(free, total)| DiskSpace { free, total, reserve: media_core::volumes::space_reserve(total) }))
 }
 
 /// The library plan as destination folders.
-#[tauri::command]
+#[tauri::command(async)]
 fn plan_tree(state: State<AppState>, plan_id: String) -> CmdResult<Vec<organizer::TreeNode>> {
     let plans = state.plans.locked();
     let plan = plans.get(&plan_id).ok_or("계획이 만료되었습니다. 다시 미리보기를 실행하세요")?;
     Ok(organizer::plan_tree(plan))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_library_rules(state: State<AppState>) -> CmdResult<Vec<media_core::library::FolderRule>> {
     let conn = state.db.conn().map_err(err)?;
     media_core::library::load_rules(&conn).map_err(err)
 }
 
 /// Remember a correction for a source folder (event name, not an event, leave it out).
-#[tauri::command]
+#[tauri::command(async)]
 fn set_library_rules(state: State<AppState>, rules: Vec<media_core::library::FolderRule>) -> CmdResult<()> {
     let conn = state.db.conn().map_err(err)?;
     media_core::library::save_rules(&conn, &rules).map_err(err)
@@ -1373,13 +1422,13 @@ fn set_library_rules(state: State<AppState>, rules: Vec<media_core::library::Fol
 // History (undo / purge)
 // ---------------------------------------------------------------------------------------------
 
-#[tauri::command]
+#[tauri::command(async)]
 fn batches(state: State<AppState>) -> CmdResult<Vec<BatchRow>> {
     let conn = state.db.conn().map_err(err)?;
     journal::list_batches(&conn).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn start_undo(app: AppHandle, state: State<AppState>, batch_id: String) -> CmdResult<()> {
     spawn_job(&app, &state, "undo", move |st, _| {
         let conn = st.db.conn()?;
@@ -1389,7 +1438,7 @@ fn start_undo(app: AppHandle, state: State<AppState>, batch_id: String) -> CmdRe
 }
 
 /// Delete (quarantine) the selected files as one undoable batch.
-#[tauri::command]
+#[tauri::command(async)]
 fn start_delete(app: AppHandle, state: State<AppState>, ids: Vec<i64>, force: Option<bool>, label: Option<String>) -> CmdResult<()> {
     if ids.is_empty() {
         return Err("선택한 파일이 없습니다".into());
@@ -1399,14 +1448,14 @@ fn start_delete(app: AppHandle, state: State<AppState>, ids: Vec<i64>, force: Op
 }
 
 /// Groups to review quickly (bursts, copies, versions), with the suggested keepers.
-#[tauri::command]
+#[tauri::command(async)]
 fn triage_groups(state: State<AppState>, kind: String, variant: Option<String>, offset: i64, limit: i64) -> CmdResult<Vec<media_core::triage::TriageGroup>> {
     let conn = state.db.conn().map_err(err)?;
     media_core::triage::groups(&conn, &kind, variant.as_deref(), offset, limit).map_err(err)
 }
 
 /// Remember review decisions (kept files); removing the rest is a normal delete.
-#[tauri::command]
+#[tauri::command(async)]
 fn triage_commit(state: State<AppState>, decisions: Vec<media_core::triage::Decision>) -> CmdResult<()> {
     let mut conn = state.db.conn().map_err(err)?;
     media_core::triage::commit(&mut conn, &decisions).map_err(err)?;
@@ -1414,13 +1463,13 @@ fn triage_commit(state: State<AppState>, decisions: Vec<media_core::triage::Deci
 }
 
 /// Which of these files are protected from deletion, and why.
-#[tauri::command]
+#[tauri::command(async)]
 fn protect_check(state: State<AppState>, ids: Vec<i64>) -> CmdResult<Vec<media_core::protect::Blocked>> {
     let conn = state.db.conn().map_err(err)?;
     media_core::protect::check(&conn, &ids).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn start_purge(app: AppHandle, state: State<AppState>, batch_id: String) -> CmdResult<()> {
     spawn_job(&app, &state, "purge", move |st, progress| {
         let conn = st.db.conn()?;
@@ -1432,31 +1481,41 @@ fn start_purge(app: AppHandle, state: State<AppState>, batch_id: String) -> CmdR
 // thumb:// protocol
 // ---------------------------------------------------------------------------------------------
 
-fn thumb_response(app: &AppHandle, path: &str) -> Response<Vec<u8>> {
-    let not_found = || Response::builder().status(StatusCode::NOT_FOUND).body(Vec::new()).unwrap();
-    let jpeg = |bytes: Vec<u8>| {
-        Response::builder()
-            .header("Content-Type", "image/jpeg")
-            .header("Cache-Control", "max-age=31536000, immutable")
-            .body(bytes)
-            .unwrap()
-    };
+fn thumb_jpeg(bytes: Vec<u8>) -> Response<Vec<u8>> {
+    Response::builder().header("Content-Type", "image/jpeg").header("Cache-Control", "max-age=31536000, immutable").body(bytes).unwrap()
+}
+
+fn thumb_missing() -> Response<Vec<u8>> {
+    Response::builder().status(StatusCode::NOT_FOUND).body(Vec::new()).unwrap()
+}
+
+/// The quick part of a thumbnail request: face crops and thumbnails made before are answered
+/// at once; `Err` is a file whose thumbnail has to be made first.
+fn thumb_lookup(app: &AppHandle, path: &str) -> Result<Response<Vec<u8>>, Box<db::FileRow>> {
     let key = path.trim_matches('/');
     let st = app.state::<AppState>();
     // Face crops: thumb://f-<face id> (cached at analysis time; copies reuse the original's).
     if let Some(face) = key.strip_prefix("f-").and_then(|s| s.parse::<i64>().ok()) {
         let src = st.db.conn().ok().and_then(|c| media_core::people::src_face(&c, face).ok()).flatten();
-        return match st.thumbs.face_crop(face, src).and_then(|p| std::fs::read(p).ok()) {
-            Some(bytes) => jpeg(bytes),
-            None => not_found(),
-        };
+        return Ok(match st.thumbs.face_crop(face, src).and_then(|p| std::fs::read(p).ok()) {
+            Some(bytes) => thumb_jpeg(bytes),
+            None => thumb_missing(),
+        });
     }
-    let Some(id) = key.split('/').next().and_then(|s| s.parse::<i64>().ok()) else { return not_found() };
-    let Ok(conn) = st.db.conn() else { return not_found() };
-    let Ok(Some(f)) = db::get_file(&conn, id) else { return not_found() };
-    match st.thumbs.ensure_thumb(&f).and_then(|p| Ok(std::fs::read(p)?)) {
-        Ok(bytes) => jpeg(bytes),
-        Err(_) => not_found(),
+    let Some(id) = key.split('/').next().and_then(|s| s.parse::<i64>().ok()) else { return Ok(thumb_missing()) };
+    let Ok(conn) = st.db.conn() else { return Ok(thumb_missing()) };
+    let Ok(Some(f)) = db::get_file(&conn, id) else { return Ok(thumb_missing()) };
+    match st.thumbs.cached_thumb(&f).and_then(|p| std::fs::read(p).ok()) {
+        Some(bytes) => Ok(thumb_jpeg(bytes)),
+        None => Err(Box::new(f)),
+    }
+}
+
+/// The slow part: read the photo and make its thumbnail.
+fn thumb_make(app: &AppHandle, f: &db::FileRow) -> Response<Vec<u8>> {
+    match app.state::<AppState>().thumbs.ensure_thumb(f).and_then(|p| Ok(std::fs::read(p)?)) {
+        Ok(bytes) => thumb_jpeg(bytes),
+        Err(_) => thumb_missing(),
     }
 }
 
@@ -1486,8 +1545,17 @@ pub fn run() {
         .register_asynchronous_uri_scheme_protocol("thumb", |ctx, request, responder| {
             let app = ctx.app_handle().clone();
             let path = request.uri().path().to_string();
-            // Thumbnail generation can take ~100 ms; keep it off the webview thread.
-            std::thread::spawn(move || responder.respond(thumb_response(&app, &path)));
+            // Off the webview thread, and never more than a few at once: what is cached is
+            // served by the quick lane; what has to be made waits its turn, newest first.
+            let st = app.state::<AppState>();
+            let app = app.clone();
+            st.thumb_fast.push(move || match thumb_lookup(&app, &path) {
+                Ok(response) => responder.respond(response),
+                Err(file) => {
+                    let again = app.clone();
+                    app.state::<AppState>().thumb_make.push(move || responder.respond(thumb_make(&again, &file)));
+                }
+            });
         })
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
@@ -1505,6 +1573,12 @@ pub fn run() {
             };
             app.manage(AppState {
                 interrupted: Mutex::new(interrupted),
+                thumb_fast: media_core::WorkStack::new("thumb-look", 2),
+                thumb_make: media_core::WorkStack::new("thumb-make", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(2, 4)),
+                data_gen: std::sync::atomic::AtomicU64::new(0),
+                folders_cache: Default::default(),
+                walk_ticket: std::sync::atomic::AtomicU64::new(0),
+                settings_lock: Mutex::new(()),
                 db,
                 thumbs: ThumbCache::new(&cache_dir),
                 data_dir,
@@ -1644,6 +1718,7 @@ pub fn run() {
             folder_props,
             folder_align,
             folder_first_difference,
+            cancel_folder_check,
             start_folder_swap,
             folders_reviewed,
             set_folder_reviewed,

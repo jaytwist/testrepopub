@@ -349,6 +349,7 @@ label.cf-tag { cursor: pointer; }
 .cf-tabs .fp-tab { font-size: 14px; padding: 7px 14px; font-weight: 600; }
 .cf-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; position: sticky; bottom: 0; z-index: 5; background: var(--panel); padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 -4px 14px rgba(0, 0, 0, 0.08); }
 .cf-opts { display: grid; gap: 4px; }
+.slow-log { max-height: 220px; overflow-y: auto; border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; }
 .cf-flag { color: var(--warn); font-weight: 600; }
 .cf-seen { margin-left: 8px; }
 .fw { gap: 8px; }
