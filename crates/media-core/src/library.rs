@@ -410,6 +410,35 @@ pub fn layout(
             .collect()
     };
     let by_id: HashMap<i64, usize> = files.iter().enumerate().map(|(i, f)| (f.id, i)).collect();
+    // Photos the organizer already moved into the library, at the place each came from. Whether
+    // a folder is one event is a fact about the folder as the user made it — not about what
+    // happens to be left in it after some years were pushed: `옛날`, holding photos of many
+    // years, must not turn into "an event" once only one spring remains. (A move that was
+    // undone is no longer here: its photo is back in the folder and counts as itself.)
+    let moved_out: Vec<F> = {
+        let mut st = conn.prepare(
+            "SELECT j.src_volume, j.src_rel, f.taken_at, f.date_source FROM journal j JOIN files f ON f.id = j.file_id
+             WHERE j.op = 'move' AND j.undone = 0 AND f.missing = 0 AND f.quarantined = 0",
+        )?;
+        let rows = st
+            .query_map([], |r| {
+                let src: String = r.get(3)?;
+                Ok(F {
+                    id: 0,
+                    vol: r.get(0)?,
+                    rel: r.get::<_, String>(1)?.replace('\\', "/"),
+                    kind: String::new(),
+                    size: 0,
+                    taken: r.get(2)?,
+                    trusted: meta::confidence(&src) != "low",
+                    content: None,
+                    unverified: false,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        // Moves inside the library (merged folders) say nothing about a source folder.
+        rows.into_iter().filter(|g| !(g.vol == lib_vol && (lib_root.is_empty() || g.rel.starts_with(&format!("{lib_root}/"))))).collect()
+    };
     // Trips, loaded once (not one query per file).
     let trips: HashMap<i64, (String, i64)> = {
         let mut st = conn.prepare("SELECT tf.file_id, t.title, t.start_ts FROM trip_files tf JOIN trips t ON t.id = tf.trip_id")?;
@@ -584,7 +613,7 @@ pub fn layout(
     // Undated files (scans) count with the date written on their folder, so a folder holding
     // "2009-07 제주도" and "2023-12 유럽" is not taken for one event.
     let mid_month = |(y, m): (i32, u32)| meta::to_ts(chrono::NaiveDate::from_ymd_opt(y, m, 15).and_then(|d| d.and_hms_opt(0, 0, 0)).unwrap_or_default());
-    for f in &files {
+    for f in files.iter().chain(&moved_out) {
         let root = root_of(f);
         let segs = segs_of(f, &root);
         let t = match (f.taken, f.trusted) {
@@ -605,7 +634,7 @@ pub fn layout(
     // photos itself and only one meaningful subfolder is a wrapper ("옛날/유럽 여행"), not the event.
     let mut direct: HashMap<(i64, String), usize> = HashMap::new();
     let mut kids: HashMap<(i64, String), HashSet<String>> = HashMap::new();
-    for f in &files {
+    for f in files.iter().chain(&moved_out) {
         let root = root_of(f);
         let segs = segs_of(f, &root);
         if let Some(last) = segs.len().checked_sub(1) {
@@ -680,9 +709,8 @@ pub fn layout(
             // Already filed in the library under a month folder: it stays in that month (the
             // event's photos may have been planned from several places; what is filed is not
             // moved again because the folder now holds other photos).
-            let filed = f.vol == lib_vol
-                && (lib_root.is_empty() || f.rel.starts_with(&format!("{lib_root}/")))
-                && (0..k).rev().find_map(|j| folder_month(&segs[j])).is_some();
+            let month_at = (0..k).rev().find(|&j| folder_month(&segs[j]).is_some());
+            let filed = f.vol == lib_vol && (lib_root.is_empty() || f.rel.starts_with(&format!("{lib_root}/"))) && month_at.is_some();
             let month = match (written, first) {
                 (Some((y, m)), _) if filed => Some(format!("{y:04}/{y:04}-{m:02}")),
                 (Some((y, m)), Some(t)) => {
@@ -699,9 +727,20 @@ pub fn layout(
             };
             let sub: Vec<String> = segs[k + 1..].iter().filter_map(|s| event_name(s)).collect();
             let mut path = match month {
-                Some(m) => format!("{prefix}{m}/{name}"),
-                None => format!("{prefix}_날짜확인필요/{name}"),
+                Some(m) => format!("{prefix}{m}"),
+                None => format!("{prefix}_날짜확인필요"),
             };
+            // What is filed stays in its folder, not only in its month: the folders between
+            // the month and the event (`2015-03/옛날/제주도`) are kept, though a folder holding
+            // nothing but one event would be skipped when read as a source.
+            if let (true, Some(j)) = (filed, month_at) {
+                for s in &segs[j + 1..k] {
+                    path.push('/');
+                    path.push_str(s);
+                }
+            }
+            path.push('/');
+            path.push_str(&name);
             for s in &sub {
                 path.push('/');
                 path.push_str(s);

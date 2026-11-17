@@ -272,7 +272,8 @@ fn nothing_is_ever_lost() {
     // `MO_INVARIANT_SEEDS=200` tries that many more sequences (by hand; the default is quick).
     let extra: u64 = std::env::var("MO_INVARIANT_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let only: Option<u64> = std::env::var("MO_INVARIANT_ONLY").ok().and_then(|v| v.parse().ok());
-    for seed in [1, 7, 42, 2024, 99991].into_iter().chain(100..100 + extra).filter(|s| only.is_none_or(|o| o == *s)) {
+    // (138: pushes and undos that once left a photo filed one folder too deep.)
+    for seed in [1, 7, 42, 138, 2024, 99991].into_iter().chain(100..100 + extra).filter(|s| only.is_none_or(|o| o == *s)) {
         run(seed);
     }
 }

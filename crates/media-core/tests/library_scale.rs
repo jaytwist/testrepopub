@@ -145,4 +145,26 @@ fn library_plan_many_files() {
     let _ = organizer::subset_year(&plan, &y.key);
     println!("years {} · year views {:.2?}", years.len(), t.elapsed());
     assert!(s.remove > 0 && s.moves > 0);
+
+    // Then as if two fifths of the originals had been pushed already: they are in the library,
+    // and the journal says where each came from (the plan counts them at their old folders).
+    conn.execute("INSERT INTO batches(id, kind, description, created_at, op_count) VALUES ('scale-push', 'organize', 'scale', 0, 0)", []).unwrap();
+    let t = Instant::now();
+    let moved = conn
+        .execute(
+            "INSERT INTO journal(batch_id, op, file_id, src_abs, dst_abs, src_volume, src_rel, dst_volume, dst_rel, ts)
+             SELECT 'scale-push', 'move', id, '', '', volume_id, rel_path, volume_id,
+                    '사진/' || strftime('%Y/%Y-%m', taken_at, 'unixepoch') || '/' || name, 0
+             FROM files WHERE volume_id = ?1 AND (rel_path LIKE '옛날/%' OR rel_path LIKE 'DCIM/%') AND id % 5 < 2",
+            params![ve],
+        )
+        .unwrap();
+    conn.execute("UPDATE files SET rel_path = j.dst_rel FROM journal j WHERE j.file_id = files.id", []).unwrap();
+    println!("{moved} move records written in {:.2?}", t.elapsed());
+    let t = Instant::now();
+    let after = organizer::plan(&db, &opts, &stop, &quiet).unwrap();
+    let again = t.elapsed();
+    let a = &after.summary;
+    println!("with {moved} moved: plan {again:.2?} (was {planned:.2?}) — moves {} copies {} remove {} leave {} · timing {:?}", a.moves, a.copies, a.remove, a.leave, a.timing);
+    assert!(a.moves < s.moves, "what was pushed is not moved again");
 }
