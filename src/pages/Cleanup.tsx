@@ -6,6 +6,7 @@ import {
 } from "../api";
 import { useJob, useNav } from "../App";
 import CopyFolders from "../components/CopyFolders";
+import Damaged from "../components/Damaged";
 import Triage from "../components/Triage";
 
 type Tier = "safe" | "quick" | "check";
@@ -30,6 +31,7 @@ type Action =
   | { label: string; triage: { kind: TriageKind; variant?: "safe" | "edited" } }
   | { label: string; library: { filter: FileFilter; groupBy?: GroupBy; review?: string; selectAll?: boolean; selectBurstExtras?: boolean } }
   | { label: string; applyExact: true }
+  | { label: string; damaged: true }
   | { label: string; go: "duplicates" };
 
 const TIERS: { id: Tier; title: string; note: string }[] = [
@@ -58,6 +60,7 @@ export default function Cleanup() {
     setNearBytes(near);
   }, []);
   const [triage, setTriage] = useState<{ kind: TriageKind; variant?: "safe" | "edited"; title: string } | null>(null);
+  const [damaged, setDamaged] = useState(false);
 
   const load = useCallback(() => {
     // What the page showed last time first, the fresh numbers when they arrive.
@@ -82,6 +85,7 @@ export default function Cleanup() {
     try {
       if ("triage" in a) setTriage({ ...a.triage, title: c.title });
       else if ("go" in a) nav.go(a.go);
+      else if ("damaged" in a) setDamaged(true);
       else if ("applyExact" in a) {
         const ok = await confirm(
           `같은 드라이브에 또 있는 사본 ${fmtCount(c.count)}개(${fmtBytes(c.bytes)})를 정리할까요?\n\n` +
@@ -161,9 +165,9 @@ export default function Cleanup() {
         },
         {
           key: "damaged", tier: "check", icon: "⚠", title: "깨진 것 같은 파일", count: s.damaged.count, bytes: s.damaged.bytes, unit: "개",
-          why: `중간에서 잘렸거나 내용에 빈 구간이 있는 사진·영상입니다(복구 프로그램이 만든 폴더에 많습니다). 열어 보고, 같은 사진의 온전한 복사본이 있는지 확인한 뒤 정리하세요.${s.damage_unchecked > 0 ? ` 아직 검사하지 않은 파일이 ${fmtCount(s.damage_unchecked)}개 있습니다.` : ""}`,
-          primary: { label: "모아서 보기", library: { filter: { suggest: "damaged" }, groupBy: "month" } },
-          secondary: [{ label: "한 장씩 검토", library: { filter: { suggest: "damaged" }, groupBy: "month", review: "damaged" } }],
+          why: `중간에서 잘렸거나 내용에 빈 구간이 있거나 열 수 없는 사진·영상입니다(복구 프로그램이 만든 폴더에 많습니다). 한 화면에 모아 보고, 고른 것만 영구 삭제할 수 있습니다.${s.damage_unchecked > 0 ? ` 아직 검사하지 않은 파일이 ${fmtCount(s.damage_unchecked)}개 있습니다.` : ""}`,
+          primary: { label: "확인하고 지우기", damaged: true },
+          secondary: [{ label: "라이브러리에서 보기", library: { filter: { suggest: "damaged" }, groupBy: "month" } }],
           find: s.damage_unchecked > 0 ? { kind: "damage", label: `${fmtCount(s.damage_unchecked)}개 검사하기` } : undefined,
         },
         {
@@ -284,6 +288,7 @@ export default function Cleanup() {
         </p>
       )}
 
+      {damaged && <Damaged onClose={() => { setDamaged(false); load(); }} />}
       {triage && <Triage kind={triage.kind} variant={triage.variant} title={triage.title} onClose={() => { setTriage(null); load(); }} />}
     </div>
   );

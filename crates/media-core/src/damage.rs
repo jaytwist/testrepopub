@@ -337,3 +337,153 @@ pub fn run(db: &Db, stop: &StopFlag, progress: ProgressFn) -> Result<DamageRepor
     let _ = db::schema_version(&conn);
     Ok(rep)
 }
+
+// ---------------------------------------------------------------------------------------------
+// Looking at them, and deleting the ones the user chose
+// ---------------------------------------------------------------------------------------------
+
+/// Photo formats the app always reads itself: one of these that could not be opened is broken
+/// (a RAW or HEIC file that could not be opened may only be of a kind the app does not know).
+const ALWAYS_READABLE: &str = "('jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'tif', 'tiff')";
+const NOT_OPENED: &str = "열 수 없음: 사진을 읽는 중에 오류가 났습니다";
+
+/// Photos the analysis could not open join the damaged ones (they were only counted before).
+/// A photo that opens at a later try leaves the list again (`record`).
+pub fn adopt_unreadable(conn: &Connection) -> Result<usize> {
+    Ok(conn.execute(
+        &format!(
+            "INSERT OR IGNORE INTO suggestions(file_id, kind, detail)
+             SELECT a.file_id, 'damaged', ?1 FROM analysis a JOIN files f ON f.id = a.file_id
+             WHERE a.tries >= 1 AND f.kind = 'photo' AND lower(f.ext) IN {ALWAYS_READABLE} AND f.missing = 0 AND f.quarantined = 0"
+        ),
+        [NOT_OPENED],
+    )?)
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DamagedFile {
+    pub id: i64,
+    pub name: String,
+    /// The folder it is in, as a path.
+    pub folder: String,
+    pub size: i64,
+    pub kind: String,
+    /// What is wrong with it.
+    pub why: String,
+    pub taken_at: Option<i64>,
+    /// Other files with the same fingerprint (size and beginning) that are not on this list:
+    /// most likely good copies of the same photo.
+    pub other_copies: i64,
+    pub online: bool,
+    /// ♥, marked as original or in a folder to keep: not deleted from here.
+    pub protected: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct DamagedList {
+    pub files: Vec<DamagedFile>,
+    pub total: i64,
+    pub bytes: i64,
+}
+
+const LISTED: &str = "f.missing = 0 AND f.quarantined = 0 AND NOT EXISTS (SELECT 1 FROM dismissals d WHERE d.file_id = f.id AND d.kind = 'damaged')";
+
+/// The files that look damaged or could not be opened, in folder order.
+pub fn list(conn: &Connection, offset: i64, limit: i64) -> Result<DamagedList> {
+    adopt_unreadable(conn)?;
+    let (total, bytes): (i64, i64) = conn.query_row(
+        &format!("SELECT COUNT(*), COALESCE(SUM(f.size), 0) FROM files f JOIN suggestions s ON s.file_id = f.id AND s.kind = 'damaged' WHERE {LISTED}"),
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let mut st = conn.prepare(&format!(
+        "SELECT f.id, f.name, v.mount, f.rel_path, f.size, f.kind, s.detail, f.taken_at, v.online,
+                (SELECT COUNT(*) FROM files g WHERE COALESCE(g.prehash, g.hash) = COALESCE(f.prehash, f.hash) AND g.id != f.id AND g.missing = 0 AND g.quarantined = 0
+                   AND NOT EXISTS (SELECT 1 FROM suggestions x WHERE x.file_id = g.id AND x.kind = 'damaged'))
+         FROM files f JOIN suggestions s ON s.file_id = f.id AND s.kind = 'damaged' JOIN volumes v ON v.id = f.volume_id
+         WHERE {LISTED} ORDER BY f.volume_id, f.rel_path LIMIT ?1 OFFSET ?2"
+    ))?;
+    let mut files: Vec<DamagedFile> = st
+        .query_map(params![limit, offset], |r| {
+            let (mount, rel): (String, String) = (r.get(2)?, r.get(3)?);
+            let abs = volumes::join_rel(Path::new(&mount), &rel);
+            Ok(DamagedFile {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                folder: abs.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
+                size: r.get(4)?,
+                kind: r.get(5)?,
+                why: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                taken_at: r.get(7)?,
+                online: r.get(8)?,
+                other_copies: r.get(9)?,
+                protected: false,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let ids: Vec<i64> = files.iter().map(|f| f.id).collect();
+    let kept = protected_of(conn, &ids)?;
+    for f in &mut files {
+        f.protected = kept.contains(&f.id);
+    }
+    Ok(DamagedList { files, total, bytes })
+}
+
+/// ♥ / original / keep-folder files among `ids` (being the last copy does not protect a damaged file).
+fn protected_of(conn: &Connection, ids: &[i64]) -> Result<std::collections::HashSet<i64>> {
+    Ok(crate::protect::check(conn, ids)?.into_iter().filter(|b| b.reason != "last_copy").map(|b| b.id).collect())
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct DamagedDeleteReport {
+    pub batch_id: String,
+    pub deleted: u64,
+    pub bytes: i64,
+    /// ♥ / original / keep-folder files: left alone.
+    pub kept_protected: u64,
+    /// Not on the list (any more), or on a drive that is not connected.
+    pub skipped: u64,
+    pub failed: u64,
+    pub errors: Vec<String>,
+    pub cancelled: bool,
+}
+
+/// Delete for good the damaged files the user chose after looking at them. Only files on the
+/// list are taken; protected ones stay. They are not compared with their good copy first (they
+/// differ from it by nature), and nothing about them is remembered: a good copy of the same
+/// photo is still welcome in the library.
+pub fn delete(db: &Db, ids: &[i64], stop: &StopFlag, progress: ProgressFn) -> Result<DamagedDeleteReport> {
+    let conn = db.conn()?;
+    let mut rep = DamagedDeleteReport::default();
+    let mut st = conn.prepare(&format!("SELECT 1 FROM files f JOIN suggestions s ON s.file_id = f.id AND s.kind = 'damaged' WHERE f.id = ? AND {LISTED}"))?;
+    let mut take: Vec<i64> = Vec::new();
+    for id in ids {
+        if st.exists([id])? {
+            take.push(*id);
+        } else {
+            rep.skipped += 1;
+        }
+    }
+    drop(st);
+    let kept = protected_of(&conn, &take)?;
+    rep.kept_protected = kept.len() as u64;
+    take.retain(|id| !kept.contains(id));
+    if take.is_empty() {
+        return Ok(rep);
+    }
+    let d = crate::journal::delete_files_as(db, &take, true, false, Some("깨진 파일"), stop, progress)?;
+    rep.batch_id = d.batch_id.clone();
+    rep.skipped += d.skipped_offline;
+    rep.failed = d.failed;
+    rep.errors = d.errors;
+    rep.cancelled = d.cancelled;
+    if !d.batch_id.is_empty() && !d.cancelled {
+        let p = crate::journal::purge_batch_with(&conn, &d.batch_id, stop, progress)?;
+        rep.deleted = p.deleted;
+        rep.bytes = p.bytes;
+        rep.failed += p.failed + p.kept;
+        rep.errors.extend(p.errors);
+        rep.cancelled = p.cancelled;
+    }
+    Ok(rep)
+}

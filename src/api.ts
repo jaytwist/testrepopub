@@ -333,6 +333,10 @@ export const api = {
   cleanupSummary: () => invoke<CleanupSummary>("cleanup_summary"),
   /** Look at analysed files for damage (cut short, holes, no index). */
   startDamageCheck: () => invoke<void>("start_damage_check"),
+  /** Files that look damaged or could not be opened, in folder order. */
+  damagedList: (offset: number, limit: number) => invoke<DamagedList>("damaged_list", { offset, limit }),
+  /** Delete the chosen damaged files for good (protected ones stay). */
+  startDeleteDamaged: (ids: number[]) => invoke<void>("start_delete_damaged", { ids }),
   tripsSummary: () => invoke<TripsSummary>("trips_summary"),
   compareFiles: (ids: number[]) => invoke<CompareInfo>("compare_files", { ids }),
   getDupRules: () => invoke<DupRules>("get_dup_rules"),
@@ -606,3 +610,11 @@ export const DATE_SOURCE_NAMES: Record<string, string> = {
 };
 
 export const KIND_NAMES: Record<string, string> = { photo: "사진", video: "동영상", raw: "RAW", screenshot: "스크린샷" };
+
+export interface DamagedFile {
+  id: number; name: string; folder: string; size: number; kind: string; why: string; taken_at: number | null;
+  /** Other files with the same fingerprint that are not on the list: most likely good copies. */
+  other_copies: number; online: boolean; protected: boolean;
+}
+export interface DamagedList { files: DamagedFile[]; total: number; bytes: number }
+export interface DamagedDeleteReport { batch_id: string; deleted: number; bytes: number; kept_protected: number; skipped: number; failed: number; errors: string[]; cancelled: boolean }

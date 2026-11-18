@@ -185,6 +185,8 @@ fn bucket(conn: &Connection, sql: &str) -> Result<Bucket> {
 }
 
 pub fn summary(conn: &Connection) -> Result<CleanupSummary> {
+    // Photos that could not be opened count as damaged.
+    let _ = crate::damage::adopt_unreadable(conn);
     let live = "f.missing = 0 AND f.quarantined = 0";
     let sugg = |kind: &str| {
         format!(

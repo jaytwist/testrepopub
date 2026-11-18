@@ -566,6 +566,22 @@ fn cleanup_summary(state: State<AppState>) -> CmdResult<media_core::cleanup::Cle
     media_core::cleanup::summary(&conn).map_err(err)
 }
 
+/// The files that look damaged or could not be opened, to look at before deleting.
+#[tauri::command(async)]
+fn damaged_list(state: State<AppState>, offset: i64, limit: i64) -> CmdResult<media_core::damage::DamagedList> {
+    let conn = state.db.conn().map_err(err)?;
+    media_core::damage::list(&conn, offset, limit).map_err(err)
+}
+
+/// Delete for good the damaged files the user chose.
+#[tauri::command(async)]
+fn start_delete_damaged(app: AppHandle, state: State<AppState>, ids: Vec<i64>) -> CmdResult<()> {
+    if ids.is_empty() {
+        return Err("선택한 파일이 없습니다".into());
+    }
+    spawn_job(&app, &state, "delete:damaged", move |st, progress| media_core::damage::delete(&st.db, &ids, &st.stop, progress))
+}
+
 /// Look at analysed files for damage (libraries analysed before the check existed).
 #[tauri::command(async)]
 fn start_damage_check(app: AppHandle, state: State<AppState>) -> CmdResult<()> {
@@ -1840,6 +1856,8 @@ pub fn run() {
             triage_commit,
             diagnostics,
             start_damage_check,
+            damaged_list,
+            start_delete_damaged,
             move_faces,
             hide_people,
             set_person_cover,

@@ -191,3 +191,61 @@ fn what_a_real_folder_gives() {
     }
     println!("{seen} files looked at, {flagged} flagged");
 }
+
+/// The damaged files in one list, and the chosen ones deleted for good: without being compared
+/// with their good copy (they differ from it by nature), never a file that is not on the list,
+/// never a protected one.
+#[test]
+fn looked_at_and_deleted_for_good() {
+    let tmp = tempfile::tempdir().unwrap();
+    let e = drive(tmp.path(), "diskE");
+    write_jpeg(&e.join("사진/a.jpg"), &picture(1, 3000, 2000), Some(("2020:01:01 10:00:00", "Canon", "EOS R6")));
+    let good = fs::read(e.join("사진/a.jpg")).unwrap();
+    // The same photo from a recovery: same size, same beginning, a hole further in.
+    let mut hole = good.clone();
+    for b in &mut hole[100_000..100_000 + 2 * 4096] {
+        *b = 0;
+    }
+    fs::create_dir_all(e.join("복구")).unwrap();
+    fs::write(e.join("복구/a.jpg"), &hole).unwrap();
+    fs::write(e.join("복구/cut.jpg"), &good[..good.len() / 2]).unwrap();
+    fs::write(e.join("복구/fav.jpg"), &good[..good.len() / 3]).unwrap();
+    write_jpeg(&e.join("사진/b.jpg"), &picture(2, 3000, 2000), Some(("2020:01:02 10:00:00", "Canon", "EOS R6")));
+
+    let db = Db::open(tmp.path().join("app/library.db")).unwrap();
+    let conn = db.conn().unwrap();
+    volumes::add_source(&conn, &e).unwrap();
+    let stop = StopFlag::new();
+    scanner::scan_all(&db, &ScanOptions::default(), &stop, &quiet).unwrap();
+    media_core::identity::backfill_prehashes(&conn).unwrap();
+    let tc = ThumbCache::new(tmp.path().join("cache"));
+    analysis::run(&db, &tc, None, 2, &stop, &analysis::PauseFlag::default(), &quiet).unwrap();
+    let id = |rel: &str| -> i64 { conn.query_row("SELECT id FROM files WHERE rel_path = ?", [rel], |r| r.get(0)).unwrap() };
+    conn.execute("INSERT INTO labels(file_id, label, source) VALUES (?, 'favorite', 'user')", [id("복구/fav.jpg")]).unwrap();
+    // A photo the analysis could not open is on the list too.
+    conn.execute("UPDATE analysis SET tries = 1 WHERE file_id = ?", [id("사진/b.jpg")]).unwrap();
+
+    let l = damage::list(&conn, 0, 100).unwrap();
+    let names: Vec<(String, i64, bool)> = l.files.iter().map(|f| (format!("{}/{}", Path::new(&f.folder).file_name().unwrap().to_string_lossy(), f.name), f.other_copies, f.protected)).collect();
+    assert_eq!(l.total, 4, "{names:?}");
+    assert!(names.contains(&("복구/a.jpg".into(), 1, false)), "its good copy is counted: {names:?}");
+    assert!(names.contains(&("복구/cut.jpg".into(), 0, false)) && names.contains(&("복구/fav.jpg".into(), 0, true)), "{names:?}");
+    assert!(l.files.iter().any(|f| f.name == "b.jpg" && f.why.starts_with("열 수 없음")), "{names:?}");
+    assert_eq!(cleanup::summary(&conn).unwrap().damaged.count, 4);
+
+    // The user looked at b.jpg: it is fine — off the list. The rest is chosen, and so (by a
+    // mistake of the caller) is the good photo.
+    let mut c = db.conn().unwrap();
+    cleanup::dismiss(&mut c, &[id("사진/b.jpg")], "damaged").unwrap();
+    let ids = [id("복구/a.jpg"), id("복구/cut.jpg"), id("복구/fav.jpg"), id("사진/a.jpg"), id("사진/b.jpg")];
+    let rep = damage::delete(&db, &ids, &stop, &quiet).unwrap();
+    assert_eq!((rep.deleted, rep.kept_protected, rep.skipped, rep.failed), (2, 1, 2, 0), "{rep:?}");
+    assert!(!e.join("복구/a.jpg").exists() && !e.join("복구/cut.jpg").exists());
+    assert!(e.join("복구/fav.jpg").is_file() && e.join("사진/a.jpg").is_file() && e.join("사진/b.jpg").is_file());
+    assert_eq!(fs::read(e.join("사진/a.jpg")).unwrap(), good);
+    // Gone for good: nothing waits in the quarantine, nothing to undo.
+    let state: String = conn.query_row("SELECT state FROM batches WHERE id = ?", [&rep.batch_id], |r| r.get(0)).unwrap();
+    assert_eq!(state, "purged");
+    assert!(!volumes::quarantine_root(&e).join(&rep.batch_id).exists());
+    assert_eq!(damage::list(&conn, 0, 100).unwrap().total, 1, "the protected one is still listed");
+}

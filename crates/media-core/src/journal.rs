@@ -1496,6 +1496,14 @@ pub struct DeleteReport {
 /// unless `force`.
 /// `label` names the batch in the history (e.g. "연사 정리").
 pub fn delete_files(db: &Db, ids: &[i64], force: bool, label: Option<&str>, stop: &StopFlag, progress: ProgressFn) -> Result<DeleteReport> {
+    delete_files_as(db, ids, force, true, label, stop, progress)
+}
+
+/// `delete_files`; without `check_twin` the copy that stays is not remembered, so emptying the
+/// quarantine deletes the files without comparing them with it. For files the user looked at
+/// and wants gone as they are — damaged ones: they differ from their good copy by nature, and
+/// the comparison would only keep them.
+pub fn delete_files_as(db: &Db, ids: &[i64], force: bool, check_twin: bool, label: Option<&str>, stop: &StopFlag, progress: ProgressFn) -> Result<DeleteReport> {
     let conn = db.conn()?;
     volumes::refresh(&conn)?;
     let protected: std::collections::HashSet<i64> =
@@ -1533,7 +1541,8 @@ pub fn delete_files(db: &Db, ids: &[i64], force: bool, label: Option<&str>, stop
         // copy cut short or damaged further in has the same one. So the copy that stays is
         // remembered, and emptying the quarantine compares the two byte for byte first — a
         // file that turns out to be the only good one is kept.
-        let res = match surviving_twin(&conn, f.id, &doomed)? {
+        let twin = if check_twin { surviving_twin(&conn, f.id, &doomed)? } else { None };
+        let res = match twin {
             Some(t) => quarantine_copy(&conn, &batch, &f, t),
             None => quarantine(&conn, &batch, &f),
         };
