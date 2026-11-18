@@ -367,9 +367,16 @@ impl DupRules {
     }
 
     pub fn save(&self, conn: &Connection) -> Result<()> {
+        // Folders are stored the way files are (the full, real path): the same folder written
+        // another way — a short `PROGRA~1` name, another letter case — would match no file,
+        // and a "keep" folder that matches nothing protects nothing.
+        let real = |dirs: &[String]| -> Vec<String> {
+            dirs.iter().map(|d| crate::volumes::canonical(std::path::Path::new(d)).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| d.clone())).collect()
+        };
+        let stored = DupRules { keep: real(&self.keep), drop: real(&self.drop) };
         conn.execute(
             "INSERT INTO settings(key, value) VALUES ('dup_rules', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            [serde_json::to_string(self)?],
+            [serde_json::to_string(&stored)?],
         )?;
         Ok(())
     }

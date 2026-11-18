@@ -35,7 +35,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: swatinem/rust-cache@v2
       - name: Core tests on Windows
-        run: cargo test -p media-core
+        run: cargo test -p media-core --no-fail-fast
       - run: npm ci
       - run: npm run build
       - name: The app compiles for Windows
