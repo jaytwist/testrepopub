@@ -299,8 +299,10 @@ pub fn scan_with(db: &Db, source_id: i64, sub: Option<&str>, opts: &ScanOptions,
             }
             if entry.file_type().is_dir() {
                 // The time is read before the folder is listed, so a change during the scan is
-                // seen next time.
-                if let (Ok(md), Ok(rel)) = (entry.metadata(), volumes::rel_of(&vol_root, entry.path())) {
+                // seen next time. Asked of the folder itself: what its parent's listing says
+                // (which is what the walker has) can lag behind on NTFS, and the next quick
+                // check would list the folder again for nothing.
+                if let (Ok(md), Ok(rel)) = (std::fs::metadata(entry.path()), volumes::rel_of(&vol_root, entry.path())) {
                     seen_dirs.push((rel, mtime_ns(&md)));
                 }
                 stats.dirs_listed += 1;
