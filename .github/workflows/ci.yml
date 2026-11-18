@@ -39,7 +39,11 @@ jobs:
       - run: npm ci
       - run: npm run build
       - name: The app compiles for Windows
-        run: cargo check -p media-organizer
+        # The build only asks that the bundled tools exist; a compile check needs no real ones.
+        run: |
+          New-Item -ItemType Directory -Force src-tauri/binaries | Out-Null
+          foreach ($t in "ffmpeg", "ffprobe") { New-Item -ItemType File -Force "src-tauri/binaries/$t-x86_64-pc-windows-msvc.exe" | Out-Null }
+          cargo check -p media-organizer
 
   frontend:
     runs-on: ubuntu-latest
