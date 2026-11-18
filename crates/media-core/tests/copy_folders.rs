@@ -98,11 +98,15 @@ fn finds_whole_copies_only() {
     let s = &found.sets[0];
     assert_eq!(s.keep.rel_dir, "옛날/2015-08 제주도", "the oldest stays");
     assert_eq!(s.keep_why, "oldest");
-    let copies: Vec<&str> = s.copies.iter().map(|c| c.rel_dir.as_str()).collect();
+    // (Which of the two copies comes first depends on which was made first — within the same
+    // instant on a fast disk.)
+    let mut copies: Vec<&str> = s.copies.iter().map(|c| c.rel_dir.as_str()).collect();
+    copies.sort_unstable();
     assert_eq!(copies, ["백업/제주도 - 복사본", "백업2/x"], "the folders themselves, not the folders around them");
     assert_eq!((s.files, s.sample.len()), (3, 3));
-    assert_eq!(s.copies[0].names, s.keep.names, "copied as it is");
-    assert_ne!(s.copies[1].names, s.keep.names, "one file was renamed");
+    let as_is = s.copies.iter().find(|c| c.rel_dir == "백업/제주도 - 복사본").unwrap();
+    assert_eq!(as_is.names, s.keep.names, "copied as it is");
+    assert_ne!(s.copies.iter().find(|c| c.rel_dir == "백업2/x").unwrap().names, s.keep.names, "one file was renamed");
 
     // The user keeps the copy in 백업 instead: the original and the third go.
     let r = |d: &str| FolderRef { volume_id: s.keep.volume_id, rel_dir: d.into() };
