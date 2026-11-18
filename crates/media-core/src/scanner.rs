@@ -594,6 +594,9 @@ pub fn locate(conn: &Connection, folder: &Path) -> Result<Option<(i64, String)>>
     let mut st = conn.prepare("SELECT s.id, v.mount, s.rel_root FROM sources s JOIN volumes v ON v.id = s.volume_id WHERE v.online = 1")?;
     let rows: Vec<(i64, String, String)> = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
     let norm = |p: &Path| p.to_string_lossy().replace('\\', "/").trim_end_matches('/').to_lowercase();
+    // The folder as the drive spells it (a short `PROGRA~1` name is the same folder).
+    let real = volumes::canonical(folder).unwrap_or_else(|_| folder.to_path_buf());
+    let folder = real.as_path();
     let target = norm(folder);
     let mut best: Option<(i64, String, usize)> = None;
     for (id, mount, rel_root) in rows {

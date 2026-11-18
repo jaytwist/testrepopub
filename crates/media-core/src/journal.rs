@@ -307,7 +307,15 @@ pub fn rename_noclobber(src: &Path, dst: &Path) -> std::io::Result<()> {
         let wide = |p: &Path| -> Vec<u16> { verbatim(p).as_os_str().encode_wide().chain(std::iter::once(0)).collect() };
         let (s, d) = (wide(src), wide(dst));
         // No flags: fails if `dst` exists, and across drives (the caller copies then).
-        unsafe { MoveFileExW(PCWSTR(s.as_ptr()), PCWSTR(d.as_ptr()), MOVE_FILE_FLAGS(0)) }.map_err(std::io::Error::from)
+        // The system's own error code, so that "already exists" reads as that (the `windows`
+        // crate's error carries an HRESULT, which `io::Error` does not understand).
+        match unsafe { MoveFileExW(PCWSTR(s.as_ptr()), PCWSTR(d.as_ptr()), MOVE_FILE_FLAGS(0)) } {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let hr = e.code().0 as u32;
+                Err(if hr >> 16 == 0x8007 { std::io::Error::from_raw_os_error((hr & 0xFFFF) as i32) } else { std::io::Error::other(e) })
+            }
+        }
     }
     #[cfg(not(windows))]
     {

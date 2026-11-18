@@ -140,6 +140,8 @@ pub fn drive(root: &Path, name: &str) -> PathBuf {
     let d = root.join(name);
     fs::create_dir_all(&d).unwrap();
     fs::write(d.join(".mo-volume"), b"").unwrap();
-    d
+    // As the system spells it: a temporary folder may come with a short `RUNNER~1` name, and
+    // the app always works with the real one.
+    media_core::volumes::canonical(&d).unwrap()
 }
 

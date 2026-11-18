@@ -135,7 +135,8 @@ mod platform {
     /// NTFS / ReFS update a folder's time when an entry is added, removed or renamed; FAT and
     /// exFAT (cards, many USB drives) do not reliably.
     pub fn dir_times_reliable(root: &Path) -> bool {
-        let mut s = root.to_string_lossy().into_owned();
+        // The drive's root: the question cannot be asked of a folder.
+        let mut s = root.ancestors().last().unwrap_or(root).to_string_lossy().into_owned();
         if !s.ends_with('\\') {
             s.push('\\');
         }
