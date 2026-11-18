@@ -260,7 +260,40 @@ pub fn dir_times_reliable(root: &Path) -> bool {
 }
 
 pub fn mounted() -> HashMap<String, VolumeInfo> {
-    platform::mounted().into_iter().map(|v| (v.uid.clone(), v)).collect()
+    let (live, _) = mounted_checked();
+    live
+}
+
+/// The connected volumes by uid, and the uids that more than one connected drive answers to
+/// (a cloned disk keeps its serial number). Such a pair cannot be told apart: a path of one
+/// could be opened on the other, so neither counts as connected until one is unplugged.
+pub fn mounted_checked() -> (HashMap<String, VolumeInfo>, Vec<(String, Vec<PathBuf>)>) {
+    let mut by_uid: HashMap<String, Vec<VolumeInfo>> = HashMap::new();
+    for v in platform::mounted() {
+        by_uid.entry(v.uid.clone()).or_default().push(v);
+    }
+    let (mut live, mut twice) = (HashMap::new(), Vec::new());
+    for (uid, mut vs) in by_uid {
+        if vs.len() == 1 {
+            live.insert(uid, vs.remove(0));
+        } else {
+            twice.push((uid, vs.into_iter().map(|v| v.root).collect()));
+        }
+    }
+    (live, twice)
+}
+
+/// Drives that are connected twice under one identity, for a warning: `(label, where)`.
+pub fn ambiguous(conn: &Connection) -> Result<Vec<(String, Vec<String>)>> {
+    let mut out = Vec::new();
+    for (uid, roots) in mounted_checked().1 {
+        let label: Option<String> = conn.query_row("SELECT label FROM volumes WHERE uid = ?", [&uid], |r| r.get(0)).optional()?;
+        // Only drives the app knows matter.
+        if let Some(label) = label {
+            out.push((label, roots.iter().map(|r| r.to_string_lossy().into_owned()).collect()));
+        }
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -282,13 +315,16 @@ pub fn upsert(conn: &Connection, v: &VolumeInfo) -> Result<i64> {
 
 /// Re-detect which known volumes are online and where they are mounted now.
 pub fn refresh(conn: &Connection) -> Result<()> {
-    let live = mounted();
+    let (live, twice) = mounted_checked();
     let mut st = conn.prepare("SELECT id, uid, mount FROM volumes")?;
     let known: Vec<(i64, String, String)> =
         st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
     let now = crate::now_ts();
     for (id, uid, mount) in known {
-        let found = if let Some(v) = live.get(&uid) {
+        let found = if twice.iter().any(|(u, _)| *u == uid) {
+            // Two connected drives answer to this identity: neither is used.
+            None
+        } else if let Some(v) = live.get(&uid) {
             Some(v.clone())
         } else if live.is_empty() && Path::new(&mount).exists() {
             identify(Path::new(&mount)).ok().filter(|v| v.uid == uid)
@@ -327,6 +363,8 @@ pub fn add_source(conn: &Connection, folder: &Path) -> Result<i64> {
     };
     for (id, r) in &existing {
         if is_within(&rel, r) {
+            // (A folder first seen through an import is the user's from now on.)
+            conn.execute("UPDATE sources SET temp = 0 WHERE id = ?", [id])?;
             return Ok(*id);
         }
     }
@@ -337,6 +375,59 @@ pub fn add_source(conn: &Connection, folder: &Path) -> Result<i64> {
     }
     conn.execute("INSERT OR IGNORE INTO sources(volume_id, rel_root) VALUES (?, ?)", params![vid, rel])?;
     Ok(conn.query_row("SELECT id FROM sources WHERE volume_id = ? AND rel_root = ?", params![vid, rel], |r| r.get(0))?)
+}
+
+/// Register a folder for the time of an import (an SD card): `(source id, ours)`. A folder the
+/// user registered — or one inside such a folder — is used as it is (`ours` false): the import
+/// reads it, and forgetting the card afterwards leaves it alone. Otherwise a source marked
+/// temporary is added; sources the user has inside it stay as they are.
+pub fn add_temp_source(conn: &Connection, folder: &Path) -> Result<(i64, bool)> {
+    let folder = canonical(folder)?;
+    if !folder.is_dir() {
+        return Err(anyhow!("{} is not a folder", folder.display()));
+    }
+    let v = identify(&folder)?;
+    let vid = upsert(conn, &v)?;
+    let rel = rel_of(&v.root, &folder)?;
+    let existing: Vec<(i64, String, bool)> = {
+        let mut st = conn.prepare("SELECT id, rel_root, temp FROM sources WHERE volume_id = ?")?;
+        let rows = st.query_map([vid], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0)))?.collect::<rusqlite::Result<_>>()?;
+        rows
+    };
+    if let Some((id, _, temp)) = existing.iter().find(|(_, r, _)| is_within(&rel, r)) {
+        return Ok((*id, *temp && existing.iter().any(|(i, r, _)| i == id && *r == rel)));
+    }
+    conn.execute("INSERT INTO sources(volume_id, rel_root, temp) VALUES (?, ?, 1)", params![vid, rel])?;
+    Ok((conn.last_insert_rowid(), true))
+}
+
+/// Forget a temporary source (`add_temp_source`): its index rows go, except those inside a
+/// folder the user registered; its drive too, once nothing of it is left. A source that is not
+/// temporary is not touched.
+pub fn forget_temp_source(conn: &Connection, source_id: i64) -> Result<()> {
+    let Some((vid, root, temp)): Option<(i64, String, bool)> = conn
+        .query_row("SELECT volume_id, rel_root, temp FROM sources WHERE id = ?", [source_id], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0)))
+        .optional()?
+    else {
+        return Ok(());
+    };
+    if !temp {
+        return Ok(());
+    }
+    // Rows under the card's folder that no other source covers.
+    const MINE: &str = "volume_id = ?1 AND quarantined = 0
+           AND (?2 = '' OR substr(rel_path, 1, length(?2) + 1) = ?2 || '/')
+           AND NOT EXISTS (SELECT 1 FROM sources s WHERE s.volume_id = ?1 AND s.id != ?3
+                           AND (s.rel_root = '' OR substr(files.rel_path, 1, length(s.rel_root) + 1) = s.rel_root || '/'))";
+    conn.execute(&format!("UPDATE files SET clone_of = NULL WHERE clone_of IN (SELECT id FROM files WHERE {MINE})"), params![vid, root, source_id])?;
+    conn.execute(&format!("DELETE FROM files WHERE {MINE}"), params![vid, root, source_id])?;
+    conn.execute("DELETE FROM sources WHERE id = ?", [source_id])?;
+    conn.execute(
+        "DELETE FROM volumes WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM files WHERE volume_id = ?1)
+           AND NOT EXISTS (SELECT 1 FROM sources WHERE volume_id = ?1)",
+        [vid],
+    )?;
+    Ok(())
 }
 
 /// Stop tracking a source folder: drop its index rows (files on disk are untouched).

@@ -94,9 +94,10 @@ fn new_on_card(volume_id: i64) -> FileFilter {
 
 /// Scan the card (registered as a temporary source) and count what is new.
 pub fn preview(db: &Db, card: &Path, opts: &ScanOptions, stop: &StopFlag, progress: ProgressFn) -> Result<Preview> {
+    // (A drive or folder the user registered is read as it is; see `forget`.)
     let source_id = {
         let conn = db.conn()?;
-        volumes::add_source(&conn, card)?
+        volumes::add_temp_source(&conn, card)?.0
     };
     scanner::scan_source(db, source_id, opts, stop, progress)?;
     let conn = db.conn()?;
@@ -160,24 +161,8 @@ pub fn run(db: &Db, card: &Path, settings: &ImportSettings, opts: &ScanOptions, 
 }
 
 /// Stop tracking the card: its rows go (its files stay on the card). Copies made from it keep
-/// their own rows; they no longer borrow the card's thumbnails.
+/// their own rows; they no longer borrow the card's thumbnails. A "card" that is a drive or
+/// folder the user registered is left exactly as it is — its marks, dates and people with it.
 pub fn forget(conn: &Connection, source_id: i64) -> Result<()> {
-    let Some((vid, root)): Option<(i64, String)> =
-        conn.query_row("SELECT volume_id, rel_root FROM sources WHERE id = ?", [source_id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?
-    else {
-        return Ok(());
-    };
-    conn.execute(
-        "UPDATE files SET clone_of = NULL WHERE clone_of IN (
-             SELECT id FROM files WHERE volume_id = ?1 AND (?2 = '' OR substr(rel_path, 1, length(?2) + 1) = ?2 || '/'))",
-        params![vid, root],
-    )?;
-    volumes::remove_source(conn, source_id)?;
-    // The card leaves no trace in the drive list either (once nothing of it is indexed).
-    conn.execute(
-        "DELETE FROM volumes WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM files WHERE volume_id = ?1)
-           AND NOT EXISTS (SELECT 1 FROM sources WHERE volume_id = ?1)",
-        [vid],
-    )?;
-    Ok(())
+    volumes::forget_temp_source(conn, source_id)
 }

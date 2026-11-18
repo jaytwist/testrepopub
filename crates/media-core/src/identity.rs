@@ -164,6 +164,35 @@ pub fn apply_copy(conn: &Connection, from: i64, volume_id: i64, rel: &str, name:
     Ok(id)
 }
 
+/// Files whose fingerprint is shared by files that were found to differ further in (their
+/// fingerprints carry `~` and part of their full hash, see `journal::purge_batch_opts`): a new
+/// file with that plain fingerprint is read in full and gets the extended form too — a true
+/// copy of one of them is then seen as its copy, and it is no copy of the others. Connected
+/// drives only; returns how many were read.
+pub fn refine_look_alikes(conn: &Connection) -> Result<usize> {
+    let any: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM files WHERE instr(prehash, '~') > 0)", [], |r| r.get(0))?;
+    if !any {
+        return Ok(0);
+    }
+    let rows: Vec<(i64, String, String)> = {
+        let mut st = conn.prepare(
+            "SELECT f.id, v.mount, f.rel_path FROM files f JOIN volumes v ON v.id = f.volume_id
+             WHERE f.prehash IS NOT NULL AND instr(f.prehash, '~') = 0 AND f.missing = 0 AND f.quarantined = 0 AND v.online = 1
+               AND EXISTS (SELECT 1 FROM files g WHERE COALESCE(g.prehash, g.hash) >= f.prehash || '~'
+                                                  AND COALESCE(g.prehash, g.hash) < f.prehash || char(127))",
+        )?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+        rows
+    };
+    let mut done = 0;
+    for (id, mount, rel) in rows {
+        let Ok(h) = crate::journal::hash_file(&crate::volumes::join_rel(Path::new(&mount), &rel)) else { continue };
+        conn.execute("UPDATE files SET hash = ?1, prehash = prehash || '~' || substr(?1, 1, 16) WHERE id = ?2 AND instr(prehash, '~') = 0", params![h, id])?;
+        done += 1;
+    }
+    Ok(done)
+}
+
 /// Files indexed before fingerprints were stored that share their size with another file (only
 /// those can have a copy): fingerprint them once — one 64 KiB read each — so the backup check
 /// and copy recognition see them. Connected drives only; returns how many were done.
@@ -174,6 +203,7 @@ pub fn backfill_prehashes(conn: &Connection) -> Result<usize> {
         let n = backfill_prehashes_with(conn, 5000, &stop, &|| false)?;
         done += n;
         if n == 0 {
+            refine_look_alikes(conn)?;
             return Ok(done);
         }
     }

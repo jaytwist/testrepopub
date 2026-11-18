@@ -308,7 +308,7 @@ export interface LaneStatus {
   timed_files: number; read_ms: number; faces_ms: number; reused: number;
 }
 export interface AnalysisOptions { auto: boolean; people: boolean; gpu: boolean; pause_on_battery: boolean }
-export interface AppInfo { version: string; data_dir: string; cache_dir: string; ffmpeg: boolean; job: string | null; interrupted: string[] }
+export interface AppInfo { version: string; data_dir: string; cache_dir: string; ffmpeg: boolean; job: string | null; interrupted: string[]; warnings: string[] }
 
 export const api = {
   appInfo: () => invoke<AppInfo>("app_info"),
@@ -478,6 +478,8 @@ export function onDriveConnected(cb: (d: { volume_id: number; label: string }) =
 export function onAnalysisDone(cb: () => void): Promise<UnlistenFn> {
   return listen("analysis-done", () => cb());
 }
+/** The window was closed while a job runs: the job stops first, then the app closes. */
+export const onClosing = (cb: () => void) => listen("closing", () => cb());
 export function onJobDone(cb: (d: JobDone) => void): Promise<UnlistenFn> {
   return listen<JobDone>("job-done", (e) => cb(e.payload));
 }

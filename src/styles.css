@@ -681,7 +681,7 @@ button.keep-tile { border: 0; padding: 0; cursor: pointer; }
 .similar-tab, .similar-rows { display: flex; flex-direction: column; gap: 8px; }
 .similar-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; }
 .similar-row .spacer { flex: 1; }
-.notice-bar { position: sticky; top: 0; z-index: 20; display: flex; gap: 12px; align-items: center; justify-content: space-between; margin: 0 0 8px; }
+.notice-bar { position: fixed; top: 10px; left: 252px; right: 24px; z-index: 60; background: var(--panel); border: 1px solid var(--line); display: flex; gap: 12px; align-items: center; justify-content: space-between; margin: 0; box-shadow: 0 6px 24px rgba(0, 0, 0, 0.18); }
 .crash { max-width: 760px; margin: 60px auto; padding: 24px; display: flex; flex-direction: column; gap: 12px; }
 .crash pre { white-space: pre-wrap; font-size: 12px; max-height: 320px; overflow: auto; background: var(--panel-2); padding: 10px; border-radius: 8px; }
 

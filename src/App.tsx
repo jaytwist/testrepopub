@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useState } from "react";
 import {
-  api, onAnalysisStatus, onCardConnected, onDriveConnected, type Card, onJobDone, onProgress, onUpdateProgress, type AppInfo, type FileFilter, type GroupBy, type JobDone,
+  api, onAnalysisStatus, onCardConnected, onDriveConnected, type Card, onClosing, onJobDone, onProgress, onUpdateProgress, type AppInfo, type FileFilter, type GroupBy, type JobDone,
   type LaneStatus, type LibraryStats, type Progress, type UpdateInfo, type UpdateProgress, fmtBytes, fmtCount, fmtEta,
 } from "./api";
 import Library from "./pages/Library";
@@ -253,11 +253,14 @@ export default function App() {
       if (i.job) setRunning(i.job);
       // Work cut short last time (crash, power loss): say so and look at the files again, so
       // anything moved just before is found where it is now.
+      const notes = [...(i.warnings ?? [])];
       if (i.interrupted?.length) {
-        setNotice(`지난번 작업이 중간에 끝났습니다: ${i.interrupted.join(", ")} — 파일 위치를 다시 확인합니다. 「작업 기록」에서 되돌릴 수 있습니다.`);
+        notes.push(`지난번 작업이 중간에 끝났습니다: ${i.interrupted.join(", ")} — 그때까지 옮긴 파일은 기록해 두었고, 파일 위치를 다시 확인합니다. 「작업 기록」에서 되돌릴 수 있습니다.`);
         if (!i.job) api.startScan().then(() => setRunning("scan")).catch(() => {});
       }
+      if (notes.length) setNotice(notes.join("\n"));
     });
+    const c = onClosing(() => setNotice("작업을 안전한 지점에서 멈추는 중입니다. 멈추면 창이 닫힙니다 — 큰 파일을 복사하는 중이면 그 파일이 끝날 때까지 기다려 주세요."));
     // An error nobody handled (a failed command, say) is shown instead of vanishing.
     const onRejected = (e: PromiseRejectionEvent) => {
       const text = String(e.reason?.message ?? e.reason ?? "");
@@ -280,6 +283,7 @@ export default function App() {
       window.removeEventListener("unhandledrejection", onRejected);
       p.then((u) => u());
       d.then((u) => u());
+      c.then((u) => u());
     };
   }, []);
 
@@ -447,7 +451,7 @@ export default function App() {
           </div>
         )}
         {notice && (
-          <div className="alert notice-bar">
+          <div className="alert notice-bar" style={{ whiteSpace: "pre-line" }}>
             {notice} <button className="btn small ghost" onClick={() => setNotice(null)}>닫기</button>
           </div>
         )}

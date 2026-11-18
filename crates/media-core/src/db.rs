@@ -241,6 +241,16 @@ const MIGRATIONS: &[&str] = &[
     );
     ALTER TABLE sources ADD COLUMN last_full INTEGER NOT NULL DEFAULT 0;
     "#,
+    // 9: journal rows are found by file (a planned move is completed by its file); deleting a
+    //    file or a person no longer reads all of the tables that point at it; a source added
+    //    only for an import (an SD card) is marked, so forgetting the card never touches a
+    //    drive the user registered.
+    r#"
+    CREATE INDEX IF NOT EXISTS journal_file ON journal(file_id);
+    CREATE INDEX IF NOT EXISTS dup_members_file ON dup_members(file_id);
+    CREATE INDEX IF NOT EXISTS face_rejects_person ON face_rejects(person_id);
+    ALTER TABLE sources ADD COLUMN temp INTEGER NOT NULL DEFAULT 0;
+    "#,
 ];
 
 pub fn schema_version(conn: &Connection) -> Result<i64> {

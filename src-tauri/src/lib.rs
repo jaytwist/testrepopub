@@ -59,6 +59,9 @@ struct AppState {
     walk_ticket: std::sync::atomic::AtomicU64,
     /// Held while a setting is read, changed and written back.
     settings_lock: Mutex<()>,
+    /// The window was closed while a job ran: the job is stopping, and the app exits once it
+    /// has (never in the middle of moving or deleting a file).
+    closing: std::sync::atomic::AtomicBool,
 }
 
 impl AppState {
@@ -149,6 +152,12 @@ where
                 let _ = emit_app.emit("job-progress", p);
             }
         };
+        // Debug builds only: a job that takes a while on demand (`MO_SLOW_JOB_MS`), to try what
+        // happens when the window is closed meanwhile.
+        #[cfg(debug_assertions)]
+        if let Some(ms) = std::env::var("MO_SLOW_JOB_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
         // A panic inside a job must not leave the app saying "작업 중" for ever.
         let res = media_core::guarded("작업", || f(&st, &progress));
         // After work that wrote a lot: refresh planner statistics and fold the write-ahead log
@@ -176,6 +185,10 @@ where
             Err(e) => JobDone { job: name, ok: false, error: Some(format!("{e:#}")), result: serde_json::Value::Null },
         };
         let _ = app.emit("job-done", done);
+        // The window was closed meanwhile: the job has stopped at a safe point, now the app goes.
+        if st.closing.load(std::sync::atomic::Ordering::SeqCst) {
+            app.exit(0);
+        }
     });
     Ok(())
 }
@@ -193,11 +206,23 @@ struct AppInfo {
     job: Option<String>,
     /// Work cut short last time (given once).
     interrupted: Vec<String>,
+    /// Things the user should know before working (two drives under one identity, …).
+    warnings: Vec<String>,
 }
 
 #[tauri::command(async)]
 fn app_info(state: State<AppState>) -> AppInfo {
+    let warnings = state
+        .db
+        .conn()
+        .ok()
+        .and_then(|c| volumes::ambiguous(&c).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(label, at)| format!("‘{label}’ 드라이브가 같은 일련번호로 두 곳({})에 연결되어 있습니다. 복제한 디스크는 구분할 수 없어 둘 다 연결되지 않은 것으로 다룹니다 — 하나를 뽑아 주세요.", at.join(", ")))
+        .collect();
     AppInfo {
+        warnings,
         version: env!("CARGO_PKG_VERSION").into(),
         data_dir: state.data_dir.to_string_lossy().into(),
         cache_dir: state.cache_dir.to_string_lossy().into(),
@@ -1538,6 +1563,28 @@ fn prepend_exe_dir_to_path() {
 pub fn run() {
     prepend_exe_dir_to_path();
     tauri::Builder::default()
+        // One app per PC: a second start shows the first window instead of opening the same
+        // database and the same drives twice.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.unminimize();
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+        }))
+        // Closing the window while files are being moved or deleted: the job is asked to stop
+        // (it does between two files), and the app closes when it has.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let st = window.state::<AppState>();
+                if st.job.locked().is_some() {
+                    api.prevent_close();
+                    st.closing.store(true, std::sync::atomic::Ordering::SeqCst);
+                    st.stop.stop();
+                    let _ = window.emit("closing", ());
+                }
+            }
+        })
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -1578,6 +1625,7 @@ pub fn run() {
                 data_gen: std::sync::atomic::AtomicU64::new(0),
                 folders_cache: Default::default(),
                 walk_ticket: std::sync::atomic::AtomicU64::new(0),
+                closing: std::sync::atomic::AtomicBool::new(false),
                 settings_lock: Mutex::new(()),
                 db,
                 thumbs: ThumbCache::new(&cache_dir),

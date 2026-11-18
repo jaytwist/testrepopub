@@ -185,7 +185,24 @@ pub fn sanitize(s: &str) -> String {
     if out.is_empty() {
         out.push('_');
     }
-    out.chars().take(120).collect()
+    if out.chars().count() <= 120 {
+        return out;
+    }
+    // Too long: the name is cut, never its extension — a photo without `.jpg` is no photo to
+    // the next scan — and not so that it ends in a dot or a space.
+    let ext: String = match out.rfind('.') {
+        Some(i) if i > 0 && out[i..].chars().count() <= 12 => out[i..].to_string(),
+        _ => String::new(),
+    };
+    let keep = 120 - ext.chars().count();
+    let mut stem: String = out[..out.len() - ext.len()].chars().take(keep).collect();
+    while stem.ends_with('.') || stem.ends_with(' ') {
+        stem.pop();
+    }
+    if stem.is_empty() {
+        stem.push('_');
+    }
+    stem + &ext
 }
 
 pub struct TemplateCtx<'a> {
@@ -1451,6 +1468,16 @@ pub fn execute_with(db: &Db, plan: &Plan, xo: &ExecOptions, stop: &StopFlag, pro
 
     let batch = journal::new_batch(&conn, "organize", &what)?;
     rep.batch_id = batch.clone();
+    // The moves are written down before the first one is made: if the app is closed or dies
+    // half-way, the next start sees which were made and the batch can still be undone.
+    {
+        let planned: Vec<journal::PlannedMove> = work
+            .iter()
+            .filter(|i| i.action == Action::Move)
+            .filter_map(|i| Some(journal::PlannedMove { file_id: i.file_id, src: &i.src, dst: &i.dst, dst_volume: tvol_id, dst_rel: volumes::rel_of(&tvol.root, Path::new(&i.dst)).ok()? }))
+            .collect();
+        journal::plan_moves(&conn, &batch, &planned)?;
+    }
     // Folder listings for finding sidecars (one read per source folder).
     let mut listings: HashMap<PathBuf, Vec<String>> = HashMap::new();
     let total = work.len() as u64;
@@ -1476,13 +1503,15 @@ pub fn execute_with(db: &Db, plan: &Plan, xo: &ExecOptions, stop: &StopFlag, pro
         }
         // Saved every 200 files or 2 seconds, and right before and after a big copy: the
         // database is never held (locked for other writers) while a large file is copied.
-        let big = it.action == Action::Copy && it.size >= 64 << 20;
+        // (A move from another drive is a copy too.)
+        let copies = it.action == Action::Copy || it.cross_volume;
+        let big = copies && it.size >= 64 << 20;
         if (i > 0 && i % 200 == 0) || big || after_big || last_commit.elapsed().as_secs() >= 2 {
             conn.execute_batch("COMMIT; BEGIN")?;
             last_commit = std::time::Instant::now();
         }
         after_big = big;
-        if it.action == Action::Copy {
+        if copies {
             let left = room.get_or_insert_with(|| match volumes::disk_space(&target) {
                 Some((free, total)) => free as i64 - volumes::space_reserve(total) as i64,
                 None => i64::MAX,

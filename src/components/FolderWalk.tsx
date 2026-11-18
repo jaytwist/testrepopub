@@ -74,6 +74,8 @@ export default function FolderWalk({ sets, index, onIndex, onClose, onToggle, on
   const [err, setErr] = useState<string | null>(null);
   const [view, setView] = useState<GridItem[] | null>(null);
   const asked = useRef(new Set<number>());
+  /** The rows as last loaded (to carry choices over to a reloaded list). */
+  const rowsNow = useRef<AlignRow[] | null>(null);
   /** Tickets of the comparisons asked for by the photo in view: the newest one wins. */
   const ticket = useRef(Date.now());
 
@@ -81,6 +83,17 @@ export default function FolderWalk({ sets, index, onIndex, onClose, onToggle, on
     const set = setNow.current;
     if (!set) return;
     api.folderAlign(ref(set.keep), set.copies.map(ref)).then((r) => {
+      // Choices are kept by row number: when the list comes back changed (a pair found to
+      // differ becomes a row of its own), each choice follows its photo — by path — instead
+      // of landing on whichever photo now has that number.
+      const before = rowsNow.current;
+      if (keepPlace && before) {
+        const where = new Map(r.map((x, i) => [x.path, i]));
+        const moved = (i: number) => (before[i] ? where.get(before[i].path) : undefined);
+        setChoices((m) => new Map([...m].flatMap(([i, j]) => { const n = moved(i); return n == null ? [] : [[n, j] as [number, number]]; })));
+        setHistory((h) => h.flatMap((i) => { const n = moved(i); return n == null ? [] : [n]; }));
+      }
+      rowsNow.current = r;
       setRows(r);
       if (keepPlace) return;
       // Open on what is worth a look; a set with nothing to look at opens on everything.
@@ -105,6 +118,7 @@ export default function FolderWalk({ sets, index, onIndex, onClose, onToggle, on
     else if (lastDone.error !== "cancelled") setErr(lastDone.error ?? "사진을 넣지 못했습니다");
     setChoices(new Map());
     setHistory([]);
+    rowsNow.current = null;
     load(true);
   }, [lastDone]); // eslint-disable-line react-hooks/exhaustive-deps
 

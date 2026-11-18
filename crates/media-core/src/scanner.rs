@@ -163,6 +163,10 @@ pub fn scan_with(db: &Db, source_id: i64, sub: Option<&str>, opts: &ScanOptions,
     let mut walked: u64 = 0;
     // Every folder seen, with its modification time (for the next quick check).
     let mut seen_dirs: Vec<(String, i64)> = Vec::new();
+    // Folders (and files) that could not be read this time: a drive unplugged half-way, no
+    // permission, a damaged folder. What the index holds under them was not seen — which is
+    // not the same as gone.
+    let mut unread: Vec<String> = Vec::new();
     // A media file found while listing a folder.
     let consider = |path: &Path, name: String, md: &std::fs::Metadata, cands: &mut Vec<Candidate>, apps: &mut AppDirDetector| {
         if opts.skip_app_folders {
@@ -200,7 +204,13 @@ pub fn scan_with(db: &Db, source_id: i64, sub: Option<&str>, opts: &ScanOptions,
                 return Err(anyhow!("cancelled"));
             }
             let abs = volumes::join_rel(&vol_root, &rel_dir);
-            let Ok(md) = std::fs::metadata(&abs) else { continue };
+            let Ok(md) = std::fs::metadata(&abs) else {
+                // Deleted since the last scan — or not reachable right now.
+                if abs.parent().is_some_and(|p| std::fs::read_dir(p).is_err()) || !abs_root.is_dir() {
+                    unread.push(rel_dir.clone());
+                }
+                continue;
+            };
             let mt = mtime_ns(&md);
             seen_dirs.push((rel_dir.clone(), mt));
             walked += 1;
@@ -228,6 +238,7 @@ pub fn scan_with(db: &Db, source_id: i64, sub: Option<&str>, opts: &ScanOptions,
             stats.dirs_listed += 1;
             let Ok(rd) = std::fs::read_dir(&abs) else {
                 stats.errors += 1;
+                unread.push(rel_dir.clone());
                 continue;
             };
             for e in rd.flatten() {
@@ -271,9 +282,15 @@ pub fn scan_with(db: &Db, source_id: i64, sub: Option<&str>, opts: &ScanOptions,
             if stop.is_stopped() {
                 return Err(anyhow!("cancelled"));
             }
-            let Ok(entry) = entry else {
-                stats.errors += 1;
-                continue;
+            let entry = match entry {
+                Ok(e) => e,
+                Err(err) => {
+                    stats.errors += 1;
+                    if let Some(rel) = err.path().and_then(|p| volumes::rel_of(&vol_root, p).ok()) {
+                        unread.push(rel);
+                    }
+                    continue;
+                }
             };
             walked += 1;
             if walked.is_multiple_of(2000) {
@@ -339,7 +356,13 @@ pub fn scan_with(db: &Db, source_id: i64, sub: Option<&str>, opts: &ScanOptions,
     //     the same size and time exists — never a decode.
     let now = crate::now_ts();
     let seen: HashSet<&str> = cands.iter().map(|c| c.rel.as_str()).collect();
-    let gone_here: HashSet<i64> = existing.iter().filter(|(rel, _)| !seen.contains(rel.as_str())).map(|(_, (id, _, _))| *id).collect();
+    // The drive went away during the scan: nothing of what was not reached is "gone".
+    if !abs_root.is_dir() {
+        return Err(anyhow!("스캔 중에 드라이브 연결이 끊겼습니다: {}", abs_root.display()));
+    }
+    let unread_under: Vec<String> = unread.iter().map(|d| if d.is_empty() { String::new() } else { format!("{d}/") }).collect();
+    let not_read = |rel: &str| unread_under.iter().zip(&unread).any(|(under, d)| rel.starts_with(under.as_str()) || rel == d);
+    let gone_here: HashSet<i64> = existing.iter().filter(|(rel, _)| !seen.contains(rel.as_str()) && !not_read(rel.as_str())).map(|(_, (id, _, _))| *id).collect();
     let mut moved_ids: HashSet<i64> = HashSet::new();
     let mut known_rels: HashSet<&str> = HashSet::new();
     // Paths still held by a quarantined file's row (it keeps its path so undo can put it back).
@@ -504,6 +527,10 @@ pub fn scan_with(db: &Db, source_id: i64, sub: Option<&str>, opts: &ScanOptions,
         if !stats.quick {
             conn.execute("UPDATE sources SET last_full = ? WHERE id = ?", params![now, source_id])?;
         }
+    }
+    // New files that look like files known to differ from each other are told apart too.
+    if let Err(e) = crate::identity::refine_look_alikes(&conn) {
+        log::warn!("refining fingerprints: {e}");
     }
     progress(Progress::new(&job, "done", total, total, format!("{} files", stats.seen)));
     Ok(stats)

@@ -26,6 +26,7 @@ pub fn new_batch(conn: &Connection, kind: &str, description: &str) -> Result<Str
 }
 
 pub fn finish_batch(conn: &Connection, batch_id: &str) -> Result<()> {
+    conn.execute("DELETE FROM journal WHERE batch_id = ? AND undone = 2", [batch_id])?;
     conn.execute(
         "UPDATE batches SET state = 'done', op_count = (SELECT COUNT(*) FROM journal WHERE batch_id = ?1) WHERE id = ?1",
         [batch_id],
@@ -33,11 +34,50 @@ pub fn finish_batch(conn: &Connection, batch_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Work left `running` by a crash or power loss (call at start, when nothing can be running):
-/// entries that did nothing are dropped, the others are closed and marked 「중단됨」 so they can
-/// be undone. Returns their descriptions. File moves made after the last saved step are found
-/// again by the next scan (by content).
+/// A move the organizer is about to make (see `plan_moves`).
+pub struct PlannedMove<'a> {
+    pub file_id: i64,
+    pub src: &'a str,
+    pub dst: &'a str,
+    pub dst_volume: i64,
+    pub dst_rel: String,
+}
+
+/// Write down the moves of a batch before any of them is made. A move is a rename on disk and
+/// then an index update saved with a few hundred others: if the app dies in between, the file is
+/// at its new place and nothing says where it came from. With the move written down first,
+/// `recover_interrupted` sees which of them happened and completes the record — the batch can
+/// still be undone. (Rows with `undone = 2`: planned, not made yet.)
+pub fn plan_moves(conn: &Connection, batch: &str, moves: &[PlannedMove]) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut st = tx.prepare(
+            "INSERT INTO journal(batch_id, op, file_id, src_abs, dst_abs, src_volume, src_rel, dst_volume, dst_rel, ts, undone)
+             SELECT ?1, 'move', id, ?3, ?4, volume_id, rel_path, ?5, ?6, ?7, 2 FROM files WHERE id = ?2",
+        )?;
+        let now = crate::now_ts();
+        for m in moves {
+            st.execute(params![batch, m.file_id, m.src, m.dst, m.dst_volume, m.dst_rel, now])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Work left `running` by a crash, a closed window or power loss (call at start, when nothing
+/// can be running). Returns the descriptions of the interrupted entries, which are closed and
+/// marked 「중단됨」 so they can be undone. What was done on disk but not saved is put right first:
+/// * a planned move that happened (the file is at its new place, not at the old one) is
+///   recorded, so undoing the entry brings it back;
+/// * a file found in an interrupted entry's quarantine folder with no record of it goes back to
+///   where it was — never deleted, never left where nothing knows about it.
 pub fn recover_interrupted(conn: &Connection) -> Result<Vec<String>> {
+    volumes::refresh(conn)?;
+    let adopted = adopt_planned_moves(conn)?;
+    let restored = restore_unrecorded(conn)?;
+    if adopted + restored > 0 {
+        log::warn!("recovered after an interruption: {adopted} moves recorded, {restored} files put back from the quarantine");
+    }
     conn.execute("DELETE FROM batches WHERE state = 'running' AND NOT EXISTS (SELECT 1 FROM journal j WHERE j.batch_id = batches.id)", [])?;
     let names: Vec<String> = {
         let mut st = conn.prepare("SELECT description FROM batches WHERE state = 'running' ORDER BY created_at")?;
@@ -46,11 +86,160 @@ pub fn recover_interrupted(conn: &Connection) -> Result<Vec<String>> {
     };
     conn.execute(
         "UPDATE batches SET state = 'done', description = description || ' (중단됨)',
-                op_count = (SELECT COUNT(*) FROM journal j WHERE j.batch_id = batches.id)
+                op_count = (SELECT COUNT(*) FROM journal j WHERE j.batch_id = batches.id AND j.undone != 2)
          WHERE state = 'running'",
         [],
     )?;
     Ok(names)
+}
+
+/// Planned moves (`plan_moves`) left behind: those that were made are recorded, the others
+/// dropped. One whose drive is not connected waits for a later start.
+fn adopt_planned_moves(conn: &Connection) -> Result<u64> {
+    type Row = (i64, i64, String, String, i64, String, i64, String);
+    let rows: Vec<Row> = {
+        let mut st = conn.prepare("SELECT id, file_id, src_abs, dst_abs, src_volume, src_rel, dst_volume, dst_rel FROM journal WHERE undone = 2")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)))?.collect::<rusqlite::Result<_>>()?;
+        rows
+    };
+    let mut adopted = 0;
+    for (jid, file_id, src_abs, dst_abs, src_vol, src_rel, dst_vol, dst_rel) in rows {
+        let online = |v: i64| matches!(volumes::volume_mount(conn, v), Ok(Some((m, true))) if m.is_dir());
+        if !online(src_vol) || !online(dst_vol) {
+            continue;
+        }
+        let (src, dst) = (at_now(conn, &src_abs, src_vol, &src_rel), at_now(conn, &dst_abs, dst_vol, &dst_rel));
+        // Still where the index says (the move was not made, or was saved under another name).
+        let row: Option<(i64, String, i64)> =
+            conn.query_row("SELECT volume_id, rel_path, size FROM files WHERE id = ?", [file_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
+        let made = match row {
+            Some((v, rel, size)) if v == src_vol && rel == src_rel => {
+                let taken: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM files WHERE volume_id = ? AND rel_path = ? AND id != ?)", params![dst_vol, dst_rel, file_id], |r| r.get(0))?;
+                !taken && !src.exists() && fs::metadata(&dst).map(|m| m.is_file() && m.len() as i64 == size).unwrap_or(false)
+            }
+            _ => false,
+        };
+        if made {
+            let name = dst.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            conn.execute("UPDATE files SET volume_id = ?, rel_path = ?, name = ? WHERE id = ?", params![dst_vol, dst_rel, name, file_id])?;
+            conn.execute("UPDATE journal SET undone = 0 WHERE id = ?", [jid])?;
+            adopted += 1;
+        } else {
+            conn.execute("DELETE FROM journal WHERE id = ?", [jid])?;
+        }
+    }
+    Ok(adopted)
+}
+
+/// Files sitting in the quarantine folder of an interrupted batch that the journal does not
+/// know: moved there, and the app died before saving it. Each goes back to its place.
+fn restore_unrecorded(conn: &Connection) -> Result<u64> {
+    let batches: Vec<String> = {
+        let mut st = conn.prepare("SELECT id FROM batches WHERE state = 'running'")?;
+        let rows = st.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        rows
+    };
+    if batches.is_empty() {
+        return Ok(0);
+    }
+    let vols: Vec<(i64, String)> = {
+        let mut st = conn.prepare("SELECT id, mount FROM volumes WHERE online = 1")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        rows
+    };
+    let mut restored = 0;
+    for batch in &batches {
+        for (vol, mount) in &vols {
+            let mount = Path::new(mount);
+            let held = volumes::quarantine_root(mount).join(batch).join(format!("v{vol}"));
+            if !held.is_dir() {
+                continue;
+            }
+            let mut stack = vec![held.clone()];
+            while let Some(dir) = stack.pop() {
+                for e in fs::read_dir(&dir).into_iter().flatten().flatten() {
+                    let p = e.path();
+                    if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                        stack.push(p);
+                        continue;
+                    }
+                    let Ok(rel) = volumes::rel_of(&held, &p) else { continue };
+                    let known: bool =
+                        conn.query_row("SELECT EXISTS(SELECT 1 FROM journal WHERE batch_id = ? AND src_volume = ? AND src_rel = ? AND op IN ('quarantine', 'purged'))", params![batch, vol, rel], |r| r.get(0))?;
+                    if known {
+                        continue;
+                    }
+                    let back = volumes::join_rel(mount, &rel);
+                    if let Some(d) = back.parent() {
+                        let _ = fs::create_dir_all(d);
+                    }
+                    match rename_noclobber(&p, &back) {
+                        Ok(()) => {
+                            conn.execute("UPDATE files SET quarantined = 0, missing = 0 WHERE volume_id = ? AND rel_path = ?", params![vol, rel])?;
+                            restored += 1;
+                        }
+                        Err(e) => log::warn!("could not put back {}: {e}", p.display()),
+                    }
+                }
+            }
+            // Folders left empty by this go; what the journal knows stays.
+            let mut dirs = vec![held.clone()];
+            let mut i = 0;
+            while i < dirs.len() {
+                for e in fs::read_dir(&dirs[i]).into_iter().flatten().flatten() {
+                    if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                        dirs.push(e.path());
+                    }
+                }
+                i += 1;
+            }
+            for d in dirs.iter().rev() {
+                let _ = fs::remove_dir(d);
+            }
+            let _ = fs::remove_dir(held.parent().unwrap_or(&held));
+        }
+    }
+    Ok(restored)
+}
+
+/// Where a file recorded as (volume, relative path) is right now. The journal also keeps the
+/// full path it had then; a drive that came back under another letter is found by its volume.
+fn at_now(conn: &Connection, stored: &str, vol: i64, rel: &str) -> PathBuf {
+    let stored = PathBuf::from(stored);
+    if vol == 0 || rel.is_empty() {
+        return stored;
+    }
+    match volumes::volume_mount(conn, vol) {
+        Ok(Some((mount, true))) if !stored.starts_with(&mount) => volumes::join_rel(&mount, rel),
+        _ => stored,
+    }
+}
+
+/// A quarantined file of a batch: where it is, or why it cannot be reached.
+enum Held {
+    At(PathBuf),
+    /// Its drive is not connected: it is still there, to be dealt with later.
+    Offline,
+    /// The drive is here and the file is not in the quarantine (removed by hand).
+    Gone,
+}
+
+fn held(conn: &Connection, batch: &str, stored: &str, vol: i64, rel: &str) -> Held {
+    let stored = PathBuf::from(stored);
+    if stored.exists() {
+        return Held::At(stored);
+    }
+    match volumes::volume_mount(conn, vol) {
+        Ok(Some((mount, true))) if mount.is_dir() => {
+            let p = volumes::join_rel(&volumes::quarantine_root(&mount).join(batch), &format!("v{vol}/{rel}"));
+            if p.exists() {
+                Held::At(p)
+            } else {
+                Held::Gone
+            }
+        }
+        _ => Held::Offline,
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -106,7 +295,67 @@ fn existing_ancestor(p: &Path) -> PathBuf {
     cur
 }
 
-/// Copy with verification. Writes to a temp name first so a crash never leaves a half file at `dst`.
+/// Rename `src` to `dst`, never replacing a file that is already there. (`std::fs::rename`
+/// replaces it, on Windows too: "is it free?" followed by a rename leaves a moment in which
+/// another program's file would be overwritten.)
+pub fn rename_noclobber(src: &Path, dst: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVE_FILE_FLAGS};
+        let wide = |p: &Path| -> Vec<u16> { verbatim(p).as_os_str().encode_wide().chain(std::iter::once(0)).collect() };
+        let (s, d) = (wide(src), wide(dst));
+        // No flags: fails if `dst` exists, and across drives (the caller copies then).
+        unsafe { MoveFileExW(PCWSTR(s.as_ptr()), PCWSTR(d.as_ptr()), MOVE_FILE_FLAGS(0)) }.map_err(std::io::Error::from)
+    }
+    #[cfg(not(windows))]
+    {
+        if dst.symlink_metadata().is_ok() {
+            return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, format!("{} exists", dst.display())));
+        }
+        fs::rename(src, dst)
+    }
+}
+
+/// The `\\?\` form of an absolute path, which Windows takes at any length.
+#[cfg(windows)]
+fn verbatim(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy().replace('/', "\\");
+    if s.starts_with(r"\\?\") || !p.is_absolute() {
+        return p.to_path_buf();
+    }
+    match s.strip_prefix(r"\\") {
+        Some(rest) => PathBuf::from(format!(r"\\?\UNC\{rest}")),
+        None => PathBuf::from(format!(r"\\?\{s}")),
+    }
+}
+
+/// Delete a file, also one marked read-only (Windows refuses those until the mark is cleared).
+pub fn remove_file_force(p: &Path) -> std::io::Result<()> {
+    match fs::remove_file(p) {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            clear_readonly(p);
+            fs::remove_file(p)
+        }
+        r => r,
+    }
+}
+
+fn clear_readonly(p: &Path) {
+    if let Ok(md) = fs::metadata(p) {
+        let mut perm = md.permissions();
+        if perm.readonly() {
+            #[allow(clippy::permissions_set_readonly_false)]
+            perm.set_readonly(false);
+            let _ = fs::set_permissions(p, perm);
+        }
+    }
+}
+
+/// Copy with verification. Writes to a temp name first so a crash never leaves a half file at
+/// `dst`; the copy is written out to the disk before it counts (a copy still in memory when the
+/// power goes, with its source already deleted, would be a lost photo), read back and compared.
 pub fn copy_verified(src: &Path, dst: &Path) -> Result<String> {
     if dst.exists() {
         bail!("대상 파일이 이미 존재합니다: {}", dst.display());
@@ -118,19 +367,36 @@ pub fn copy_verified(src: &Path, dst: &Path) -> Result<String> {
         ".{}.mo-partial",
         dst.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
     ));
-    fs::copy(src, &tmp).with_context(|| format!("copy {} -> {}", src.display(), tmp.display()))?;
-    let (hs, hd) = (hash_file(src)?, hash_file(&tmp)?);
-    if hs != hd {
-        let _ = fs::remove_file(&tmp);
-        bail!("복사 검증 실패 (hash mismatch): {}", src.display());
-    }
-    if let Ok(md) = fs::metadata(src) {
-        if let Ok(m) = md.modified() {
-            let _ = filetime::set_file_mtime(&tmp, filetime::FileTime::from_system_time(m));
+    // (A partial copy an earlier, interrupted run left under this name is replaced.)
+    let _ = remove_file_force(&tmp);
+    let made: Result<String> = (|| {
+        fs::copy(src, &tmp).with_context(|| format!("copy {} -> {}", src.display(), tmp.display()))?;
+        // A read-only original makes a read-only copy, which could be neither written out nor
+        // moved or deleted later.
+        clear_readonly(&tmp);
+        fs::OpenOptions::new().write(true).open(&tmp).and_then(|f| f.sync_all()).with_context(|| format!("write {}", tmp.display()))?;
+        let (hs, hd) = (hash_file(src)?, hash_file(&tmp)?);
+        if hs != hd {
+            bail!("복사 검증 실패 (hash mismatch): {}", src.display());
         }
+        if let Ok(md) = fs::metadata(src) {
+            if let Ok(m) = md.modified() {
+                let _ = filetime::set_file_mtime(&tmp, filetime::FileTime::from_system_time(m));
+            }
+        }
+        rename_noclobber(&tmp, dst).with_context(|| format!("대상 파일이 이미 존재합니다: {}", dst.display()))?;
+        Ok(hs)
+    })();
+    if made.is_err() {
+        let _ = remove_file_force(&tmp);
+        return made;
     }
-    fs::rename(&tmp, dst)?;
-    Ok(hs)
+    // The new name is on disk too (where the system lets a folder be written out).
+    #[cfg(unix)]
+    if let Some(d) = dst.parent() {
+        let _ = fs::File::open(d).and_then(|f| f.sync_all());
+    }
+    made
 }
 
 /// Move a file; same-volume moves are a rename, cross-volume moves are copy+verify+delete.
@@ -142,13 +408,20 @@ pub fn move_file(src: &Path, dst: &Path) -> Result<()> {
         fs::create_dir_all(p)?;
     }
     if same_volume(src, &existing_ancestor(dst)) {
-        match fs::rename(src, dst) {
+        match rename_noclobber(src, dst) {
             Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => bail!("대상 파일이 이미 존재합니다: {}", dst.display()),
             Err(e) => log::warn!("rename failed ({e}); falling back to copy"),
         }
     }
     copy_verified(src, dst)?;
-    fs::remove_file(src).with_context(|| format!("remove {}", src.display()))?;
+    if let Err(e) = remove_file_force(src) {
+        // The original cannot be removed (in use, no permission): it stays, and the copy just
+        // made goes again — one file, where the index says it is, instead of two with one of
+        // them unknown to the app.
+        let _ = remove_file_force(dst);
+        return Err(anyhow::Error::from(e).context(format!("원본을 옮길 수 없어 그대로 두었습니다: {}", src.display())));
+    }
     Ok(())
 }
 
@@ -183,6 +456,16 @@ fn record(
     dst_rel: &str,
     new_file_id: Option<i64>,
 ) -> Result<()> {
+    if op == "move" {
+        let planned = conn.execute(
+            "UPDATE journal SET undone = 0, src_abs = ?3, dst_abs = ?4, dst_volume = ?5, dst_rel = ?6, ts = ?7
+             WHERE batch_id = ?1 AND file_id = ?2 AND op = 'move' AND undone = 2",
+            params![batch, file_id, src.to_string_lossy(), dst.to_string_lossy(), dst_vol, dst_rel, crate::now_ts()],
+        )?;
+        if planned > 0 {
+            return Ok(());
+        }
+    }
     conn.execute(
         "INSERT INTO journal(batch_id, op, file_id, src_abs, dst_abs, src_volume, src_rel, dst_volume, dst_rel, new_file_id, ts)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -252,7 +535,7 @@ fn unquarantine(conn: &Connection, batch_id: &str, file_id: i64, src: &Path, dst
     if let Some(p) = src.parent() {
         fs::create_dir_all(p)?;
     }
-    fs::rename(dst, src)?;
+    rename_noclobber(dst, src)?;
     let name = src.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     conn.execute("UPDATE files SET quarantined = 0, missing = 0, volume_id = ?, rel_path = ?, name = ? WHERE id = ?", params![vol, rel, name, file_id])?;
     if let Some(qroot) = dst.ancestors().find(|a| a.file_name().map(|n| n == batch_id).unwrap_or(false)) {
@@ -274,7 +557,7 @@ fn quarantine_rec(conn: &Connection, batch: &str, file: &db::FileRow, twin: Opti
     if let Some(p) = dst.parent() {
         fs::create_dir_all(p)?;
     }
-    fs::rename(&src, &dst).with_context(|| format!("quarantine {}", src.display()))?;
+    rename_noclobber(&src, &dst).with_context(|| format!("quarantine {}", src.display()))?;
     conn.execute("UPDATE files SET quarantined = 1 WHERE id = ?", [file.id])?;
     record(conn, batch, "quarantine", file.id, &src, &dst, file.volume_id, &file.rel_path, file.volume_id, &file.rel_path, twin)?;
     Ok(())
@@ -519,6 +802,8 @@ struct JournalEntry {
     dst_abs: String,
     src_volume: i64,
     src_rel: String,
+    dst_volume: i64,
+    dst_rel: String,
     new_file_id: Option<i64>,
 }
 
@@ -531,9 +816,11 @@ pub fn undo_batch(conn: &Connection, batch_id: &str) -> Result<UndoReport> {
         Some("undone") => bail!("이미 되돌린 작업입니다"),
         _ => {}
     }
+    // Drives may have come back under another letter since.
+    volumes::refresh(conn)?;
     let entries: Vec<JournalEntry> = {
         let mut st = conn.prepare(
-            "SELECT id, op, file_id, src_abs, dst_abs, src_volume, src_rel, new_file_id FROM journal
+            "SELECT id, op, file_id, src_abs, dst_abs, src_volume, src_rel, dst_volume, dst_rel, new_file_id FROM journal
              WHERE batch_id = ? AND undone = 0 ORDER BY id DESC",
         )?;
         let rows = st
@@ -546,7 +833,9 @@ pub fn undo_batch(conn: &Connection, batch_id: &str) -> Result<UndoReport> {
                     dst_abs: r.get(4)?,
                     src_volume: r.get(5)?,
                     src_rel: r.get(6)?,
-                    new_file_id: r.get(7)?,
+                    dst_volume: r.get(7)?,
+                    dst_rel: r.get(8)?,
+                    new_file_id: r.get(9)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -554,12 +843,21 @@ pub fn undo_batch(conn: &Connection, batch_id: &str) -> Result<UndoReport> {
     };
     let mut rep = UndoReport::default();
     for e in entries {
-        let (src, dst) = (PathBuf::from(&e.src_abs), PathBuf::from(&e.dst_abs));
+        let src = at_now(conn, &e.src_abs, e.src_volume, &e.src_rel);
+        let dst = if e.op == "quarantine" { PathBuf::from(&e.dst_abs) } else { at_now(conn, &e.dst_abs, e.dst_volume, &e.dst_rel) };
         let res: Result<()> = (|| {
             match e.op.as_str() {
-                "quarantine" => unquarantine(conn, batch_id, e.file_id, &src, &dst, e.src_volume, &e.src_rel)?,
+                "quarantine" => match held(conn, batch_id, &e.dst_abs, e.src_volume, &e.src_rel) {
+                    Held::At(dst) => unquarantine(conn, batch_id, e.file_id, &src, &dst, e.src_volume, &e.src_rel)?,
+                    Held::Offline => bail!("드라이브가 연결되어 있지 않습니다: {}", e.src_abs),
+                    Held::Gone => bail!("격리함에 파일이 없습니다: {}", e.dst_abs),
+                },
                 "move" => {
-                    move_file(&dst, &src)?;
+                    // Already back (an undo that was interrupted after the move): only the
+                    // record is missing.
+                    if dst.exists() || !src.exists() {
+                        move_file(&dst, &src)?;
+                    }
                     let name = src.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                     conn.execute(
                         "UPDATE files SET volume_id = ?, rel_path = ?, name = ?, missing = 0 WHERE id = ?",
@@ -674,12 +972,14 @@ pub fn purge_batch_with(conn: &Connection, batch_id: &str, stop: &crate::StopFla
 /// `purge_batch_with`; with `quick` the copy and its twin are compared in parts only
 /// (`Comparer::same_sampled`): much less to read, and a difference between the parts is not seen.
 pub fn purge_batch_opts(conn: &Connection, batch_id: &str, quick: bool, stop: &crate::StopFlag, progress: crate::ProgressFn) -> Result<PurgeReport> {
-    let entries: Vec<(i64, i64, String, Option<i64>, i64)> = {
+    volumes::refresh(conn)?;
+    type Entry = (i64, i64, String, Option<i64>, i64, i64, String);
+    let entries: Vec<Entry> = {
         let mut st = conn.prepare(
-            "SELECT j.id, j.file_id, j.dst_abs, j.new_file_id, COALESCE(f.size, 0) FROM journal j LEFT JOIN files f ON f.id = j.file_id
+            "SELECT j.id, j.file_id, j.dst_abs, j.new_file_id, COALESCE(f.size, 0), j.src_volume, j.src_rel FROM journal j LEFT JOIN files f ON f.id = j.file_id
              WHERE j.batch_id = ? AND j.op = 'quarantine' AND j.undone = 0",
         )?;
-        let rows = st.query_map([batch_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.collect::<rusqlite::Result<_>>()?;
+        let rows = st.query_map([batch_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?.collect::<rusqlite::Result<_>>()?;
         rows
     };
     let mut rep = PurgeReport { quick, ..Default::default() };
@@ -688,7 +988,7 @@ pub fn purge_batch_opts(conn: &Connection, batch_id: &str, quick: bool, stop: &c
     let (mut bytes_done, started) = (0u64, std::time::Instant::now());
     let stage = if quick { "verify_quick" } else { "verify" };
     let mut cmp = Comparer::new();
-    for (i, (jid, file_id, dst, twin, indexed_size)) in entries.into_iter().enumerate() {
+    for (i, (jid, file_id, dst, twin, indexed_size, vol, rel)) in entries.into_iter().enumerate() {
         if stop.is_stopped() {
             rep.cancelled = true;
             break;
@@ -701,16 +1001,32 @@ pub fn purge_batch_opts(conn: &Connection, batch_id: &str, quick: bool, stop: &c
         if let Some(ms) = std::env::var("MO_SLOW_COMPARE_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
             std::thread::sleep(std::time::Duration::from_millis(ms));
         }
-        let p = PathBuf::from(&dst);
-        if let Some(twin) = twin {
+        // Where the file is now (its drive may have another letter). A drive that is not
+        // connected is not "nothing left to delete": the file waits for it.
+        let (p, there) = match held(conn, batch_id, &dst, vol, &rel) {
+            Held::At(p) => (p, true),
+            Held::Gone => (PathBuf::from(&dst), false),
+            Held::Offline => {
+                rep.failed += 1;
+                if rep.errors.len() < 200 {
+                    rep.errors.push(format!("{dst}: 드라이브가 연결되어 있지 않아 지우지 못했습니다. 연결한 뒤 「이어서 지우기」를 누르세요"));
+                }
+                continue;
+            }
+        };
+        if let (Some(twin), true) = (twin, there) {
             let twin_path = db::get_file(conn, twin)?.filter(|f| !f.quarantined && !f.missing && f.online).map(|f| f.abs_path());
             let same = match &twin_path {
-                Some(tp) if p.exists() => if quick { cmp.same_sampled(&p, tp) } else { cmp.same(&p, tp) }.unwrap_or(false),
+                Some(tp) => if quick { cmp.same_sampled(&p, tp) } else { cmp.same(&p, tp) }.unwrap_or(false),
                 _ => false,
             };
             if !same {
-                if twin_path.is_some() && p.exists() {
+                if let Some(tp) = &twin_path {
                     rep.differing.push((file_id, twin));
+                    // The two only looked the same (same size, same beginning): from now on
+                    // their fingerprints tell them apart, so neither counts as a copy of the
+                    // other again.
+                    let _ = mark_different(conn, file_id, &p, twin, tp);
                 }
                 rep.kept += 1;
                 if rep.errors.len() < 200 {
@@ -720,7 +1036,7 @@ pub fn purge_batch_opts(conn: &Connection, batch_id: &str, quick: bool, stop: &c
             }
         }
         let size = fs::metadata(&p).map(|m| m.len() as i64).unwrap_or(0);
-        let r = if p.exists() { fs::remove_file(&p).map_err(anyhow::Error::from) } else { Ok(()) };
+        let r = if there { remove_file_force(&p).map_err(anyhow::Error::from) } else { Ok(()) };
         match r {
             Ok(()) => {
                 conn.execute("DELETE FROM files WHERE id = ? AND quarantined = 1", [file_id])?;
@@ -745,6 +1061,37 @@ pub fn purge_batch_opts(conn: &Connection, batch_id: &str, quick: bool, stop: &c
         conn.execute("UPDATE batches SET state = 'purged' WHERE id = ?", [batch_id])?;
     }
     Ok(rep)
+}
+
+/// Two files that share a fingerprint (same size, same first 64 KiB) and were found to differ:
+/// each gets its full hash, and a fingerprint extended by it.
+fn mark_different(conn: &Connection, a: i64, pa: &Path, b: i64, pb: &Path) -> Result<()> {
+    let (ha, hb) = (hash_file(pa)?, hash_file(pb)?);
+    if ha == hb {
+        return Ok(());
+    }
+    for (id, h) in [(a, &ha), (b, &hb)] {
+        conn.execute(
+            "UPDATE files SET hash = ?1, prehash = CASE WHEN prehash IS NULL THEN NULL
+                 ELSE (CASE WHEN instr(prehash, '~') > 0 THEN substr(prehash, 1, instr(prehash, '~') - 1) ELSE prehash END) || '~' || substr(?1, 1, 16) END
+             WHERE id = ?2",
+            params![h, id],
+        )?;
+    }
+    Ok(())
+}
+
+/// A file with the same fingerprint as `id` that stays when `doomed` are deleted (one on a
+/// connected drive if there is one).
+fn surviving_twin(conn: &Connection, id: i64, doomed: &std::collections::HashSet<i64>) -> Result<Option<i64>> {
+    let mut st = conn.prepare_cached(
+        "SELECT f.id FROM files f JOIN volumes v ON v.id = f.volume_id
+         WHERE COALESCE(f.prehash, f.hash) = (SELECT COALESCE(prehash, hash) FROM files WHERE id = ?1)
+           AND f.id != ?1 AND f.missing = 0 AND f.quarantined = 0
+         ORDER BY v.online DESC, f.id LIMIT 200",
+    )?;
+    let ids = st.query_map([id], |r| r.get::<_, i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(ids.into_iter().find(|t| !doomed.contains(t)))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -781,6 +1128,8 @@ pub fn delete_files(db: &Db, ids: &[i64], force: bool, label: Option<&str>, stop
     let batch = new_batch(&conn, "delete", &what)?;
     let mut rep = DeleteReport { batch_id: batch.clone(), ..Default::default() };
     let total = ids.len() as u64;
+    // What goes, to tell which copies stay.
+    let doomed: std::collections::HashSet<i64> = ids.iter().copied().filter(|id| !protected.contains(id)).collect();
     for (i, id) in ids.iter().enumerate() {
         if stop.is_stopped() {
             rep.cancelled = true;
@@ -801,7 +1150,15 @@ pub fn delete_files(db: &Db, ids: &[i64], force: bool, label: Option<&str>, stop
             rep.skipped_offline += 1;
             continue;
         }
-        match quarantine(&conn, &batch, &f) {
+        // "Another copy stays" is known from the fingerprint only (size and first 64 KiB): a
+        // copy cut short or damaged further in has the same one. So the copy that stays is
+        // remembered, and emptying the quarantine compares the two byte for byte first — a
+        // file that turns out to be the only good one is kept.
+        let res = match surviving_twin(&conn, f.id, &doomed)? {
+            Some(t) => quarantine_copy(&conn, &batch, &f, t),
+            None => quarantine(&conn, &batch, &f),
+        };
+        match res {
             Ok(()) => {
                 rep.deleted += 1;
                 rep.bytes += f.size;
