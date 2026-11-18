@@ -76,6 +76,24 @@ pub fn identify_lenient(path: &Path) -> Result<VolumeInfo> {
 // Platform identification
 // ---------------------------------------------------------------------------------------------
 
+/// Tests only (`MO_TEST_VOLUMES=1`): a folder holding a `.mo-volume` file stands for a drive
+/// of its own, on Windows as elsewhere — so the tests that need several drives run on a
+/// Windows machine with one.
+#[cfg(windows)]
+fn test_volumes() -> bool {
+    std::env::var_os("MO_TEST_VOLUMES").is_some()
+}
+
+#[cfg(windows)]
+fn test_volume(path: &Path) -> Option<VolumeInfo> {
+    if !test_volumes() {
+        return None;
+    }
+    let root = path.ancestors().find(|a| a.join(".mo-volume").is_file())?.to_path_buf();
+    let label = root.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    Some(VolumeInfo { uid: format!("mount:{}", root.display()), label, root, removable: false })
+}
+
 #[cfg(windows)]
 mod platform {
     use super::*;
@@ -94,6 +112,10 @@ mod platform {
 
     pub fn identify(path: &Path) -> Result<VolumeInfo> {
         let path = canonical(path)?;
+        // Tests simulate several drives with marker files (see `test_volume`).
+        if let Some(v) = test_volume(&path) {
+            return Ok(v);
+        }
         let wpath = wide(path.as_os_str());
         let mut buf = [0u16; 512];
         unsafe { GetVolumePathNameW(PCWSTR(wpath.as_ptr()), &mut buf)? };
@@ -147,6 +169,9 @@ mod platform {
     }
 
     pub fn mounted() -> Vec<VolumeInfo> {
+        if test_volumes() {
+            return Vec::new();
+        }
         let mask = unsafe { GetLogicalDrives() };
         let mut out = Vec::new();
         for i in 0..26u32 {

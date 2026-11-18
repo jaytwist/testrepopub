@@ -1,4 +1,6 @@
-# Core logic tests (headless, no webview needed) and a frontend type-check/build on every push.
+# Every push: the core logic tested on Linux and on Windows (real NTFS: moves that never
+# replace a file, long paths, the app itself compiled), the linter's correctness checks, the
+# frontend type-check and build, and the licences of everything linked into the app.
 name: CI
 
 on:
@@ -6,14 +8,38 @@ on:
     branches: ["main"]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   core:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: swatinem/rust-cache@v2
       - run: cargo test -p media-core
+      # Style lints are shown; lints that point at wrong code fail the build.
+      - run: cargo clippy -p media-core --all-targets -- -D clippy::correctness -D clippy::suspicious
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+      - name: Core tests on Windows
+        run: cargo test -p media-core
+      - run: npm ci
+      - run: npm run build
+      - name: The app compiles for Windows
+        run: cargo check -p media-organizer
 
   frontend:
     runs-on: ubuntu-latest
@@ -25,3 +51,22 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
+      - name: Known vulnerabilities in npm packages (reported, not failing)
+        run: npm audit --omit=dev || true
+
+  licences:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses bans sources
+
+  advisories:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories

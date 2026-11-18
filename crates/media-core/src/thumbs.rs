@@ -502,12 +502,11 @@ pub fn warm(db: &Db, cache: &ThumbCache, stop: &StopFlag, progress: ProgressFn) 
     Ok(WarmStats { generated: done.load(Ordering::Relaxed) - failed, failed, total })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
     /// A helper program that never finishes is stopped, and one that does is read to its end.
-    #[cfg(unix)]
     #[test]
     fn a_helper_that_hangs_is_stopped() {
         let mut never = Command::new("sleep");

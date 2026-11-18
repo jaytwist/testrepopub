@@ -7,6 +7,7 @@ the app (installer: `ai\` folder for the AI runtime; the rest in each project's 
 |---|---|---|
 | [Tauri](https://tauri.app) | App shell, installer, auto-update | MIT / Apache-2.0 |
 | [czkawka_core](https://github.com/qarmin/czkawka) | Similar photos and videos | MIT |
+| [rawler](https://github.com/dnglab/dnglab) (comes with czkawka_core) | RAW decoding for similar photos | LGPL-2.1 — linked into the app; the app's source is public, so it can be rebuilt with another version of this library |
 | [nom-exif](https://github.com/mindeng/nom-exif) | Photo / video metadata | MIT |
 | [image](https://github.com/image-rs/image), jpeg-decoder, imagesize | Decoding, thumbnails | MIT / Apache-2.0 |
 | [rusqlite](https://github.com/rusqlite/rusqlite) / [SQLite](https://sqlite.org) | Index database | MIT / Public Domain |

@@ -135,6 +135,8 @@ pub fn write_png(path: &Path, img: &DynamicImage) {
 }
 
 pub fn drive(root: &Path, name: &str) -> PathBuf {
+    // On Windows the marker file counts only when asked for (it does everywhere else).
+    std::env::set_var("MO_TEST_VOLUMES", "1");
     let d = root.join(name);
     fs::create_dir_all(&d).unwrap();
     fs::write(d.join(".mo-volume"), b"").unwrap();

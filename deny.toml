@@ -1,0 +1,33 @@
+# Licence and advisory gate for dependencies (cargo-deny, run in CI).
+# The app is MIT and ships as one executable: everything linked into it must allow that.
+
+[graph]
+targets = ["x86_64-pc-windows-msvc", "x86_64-pc-windows-gnu"]
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "MIT", "MIT-0", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib", "0BSD",
+    "Unlicense", "CC0-1.0", "BSL-1.0", "Unicode-3.0", "bzip2-1.0.6",
+    # File-level copyleft: fine for unmodified crates built from source.
+    "MPL-2.0",
+]
+
+# LGPL code linked into the executable. Allowed for this crate only, on purpose: it comes with
+# czkawka_core (RAW decoding for similar photos) and cannot be switched off there. The app's
+# source is public, which is what lets anyone relink it — see THIRD_PARTY_NOTICES.md. A new
+# GPL / LGPL / AGPL dependency fails this check and needs a decision.
+[[licenses.exceptions]]
+crate = "rawler"
+allow = ["LGPL-2.1", "LGPL-2.1-only", "LGPL-2.1-or-later"]
+
+[bans]
+multiple-versions = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+
+[advisories]
+# Reported in CI without failing the build: an advisory against a transitive crate is to be
+# looked at, not a reason to block unrelated work.
