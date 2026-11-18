@@ -566,6 +566,12 @@ fn cleanup_summary(state: State<AppState>) -> CmdResult<media_core::cleanup::Cle
     media_core::cleanup::summary(&conn).map_err(err)
 }
 
+/// Look at analysed files for damage (libraries analysed before the check existed).
+#[tauri::command(async)]
+fn start_damage_check(app: AppHandle, state: State<AppState>) -> CmdResult<()> {
+    spawn_job(&app, &state, "check:damage", move |st, progress| media_core::damage::run(&st.db, &st.stop, progress))
+}
+
 #[tauri::command(async)]
 fn burst_extra_ids(state: State<AppState>) -> CmdResult<Vec<i64>> {
     let conn = state.db.conn().map_err(err)?;
@@ -1824,6 +1830,7 @@ pub fn run() {
             triage_groups,
             triage_commit,
             diagnostics,
+            start_damage_check,
             move_faces,
             hide_people,
             set_person_cover,

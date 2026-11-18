@@ -278,6 +278,8 @@ struct FaceOut {
 
 struct FileOut {
     id: i64,
+    /// Why the file looks damaged, if it does (`damage::check_file`).
+    damage: Option<String>,
     sharpness: Option<f32>,
     dhash: Option<i64>,
     faces: Option<Vec<FaceOut>>,
@@ -297,11 +299,24 @@ fn analyze_inner(f: &FileRow, cache: &ThumbCache, engine: Option<&Mutex<FaceEngi
     }
     // Videos: only make sure a thumbnail exists; nothing else to measure.
     if f.kind == "video" {
-        cache.ensure_thumb(f)?;
-        return Ok(FileOut { id: f.id, sharpness: None, dhash: None, faces: None });
+        // (Its structure is looked at first: a video cut short may still give a thumbnail.)
+        let damage = crate::damage::check_file(&f.abs_path()).ok().flatten();
+        if let Err(e) = cache.ensure_thumb(f) {
+            if damage.is_none() {
+                return Err(e);
+            }
+        }
+        return Ok(FileOut { id: f.id, damage, sharpness: None, dhash: None, faces: None });
     }
     let t0 = Instant::now();
-    let img = decode(f)?;
+    // Its structure first (cut short, holes): decoders open such files without complaint.
+    let damage = crate::damage::check_file(&f.abs_path()).ok().flatten();
+    let img = match decode(f) {
+        Ok(img) => img,
+        // Damaged and it does not even open: that is what there is to know about it.
+        Err(_) if damage.is_some() => return Ok(FileOut { id: f.id, damage, sharpness: None, dhash: None, faces: None }),
+        Err(e) => return Err(e),
+    };
     TIMING.decode_us.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
     TIMING.files.fetch_add(1, Ordering::Relaxed);
     // Screenshots: nobody to recognise (faces in them are pictures of pictures).
@@ -346,7 +361,7 @@ fn analyze_inner(f: &FileRow, cache: &ThumbCache, engine: Option<&Mutex<FaceEngi
         None => None,
     };
     TIMING.faces_us.fetch_add(t1.elapsed().as_micros() as u64, Ordering::Relaxed);
-    Ok(FileOut { id: f.id, sharpness: Some(sharp), dhash: Some(hash), faces })
+    Ok(FileOut { id: f.id, damage, sharpness: Some(sharp), dhash: Some(hash), faces })
 }
 
 fn save(conn: &mut Connection, cache: &ThumbCache, outs: Vec<Result<FileOut, (i64, String, bool)>>, stats: &mut AnalysisStats) -> Result<()> {
@@ -371,6 +386,7 @@ fn save(conn: &mut Connection, cache: &ThumbCache, outs: Vec<Result<FileOut, (i6
                         analyzed_at = excluded.analyzed_at, tries = 0",
                     params![o.id, ANALYSIS_VERSION, o.sharpness, o.dhash, o.faces.as_ref().map(|v| v.len() as i64), face_version.max(prev_face_version), now],
                 )?;
+                crate::damage::record(&tx, o.id, o.damage.as_deref())?;
                 if let Some(faces) = o.faces {
                     // Keep user decisions: only replace faces that were never confirmed by the user.
                     let locked: i64 = tx.query_row("SELECT COUNT(*) FROM faces WHERE file_id = ? AND locked = 1", [o.id], |r| r.get(0))?;

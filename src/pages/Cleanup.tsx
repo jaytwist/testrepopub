@@ -106,6 +106,11 @@ export default function Cleanup() {
 
   const find = async (kind: string) => {
     try {
+      if (kind === "damage") {
+        await api.startDamageCheck();
+        setRunning("check:damage");
+        return;
+      }
       await api.startDedupe(kind, kind === "similar_image" ? "high" : undefined);
       setRunning(`dedupe:${kind}`);
     } catch (e) {
@@ -155,6 +160,13 @@ export default function Cleanup() {
           find: searched("similar_image") ? undefined : { kind: "similar_image", label: "비슷한 사진 찾기" },
         },
         {
+          key: "damaged", tier: "check", icon: "⚠", title: "깨진 것 같은 파일", count: s.damaged.count, bytes: s.damaged.bytes, unit: "개",
+          why: `중간에서 잘렸거나 내용에 빈 구간이 있는 사진·영상입니다(복구 프로그램이 만든 폴더에 많습니다). 열어 보고, 같은 사진의 온전한 복사본이 있는지 확인한 뒤 정리하세요.${s.damage_unchecked > 0 ? ` 아직 검사하지 않은 파일이 ${fmtCount(s.damage_unchecked)}개 있습니다.` : ""}`,
+          primary: { label: "모아서 보기", library: { filter: { suggest: "damaged" }, groupBy: "month" } },
+          secondary: [{ label: "한 장씩 검토", library: { filter: { suggest: "damaged" }, groupBy: "month", review: "damaged" } }],
+          find: s.damage_unchecked > 0 ? { kind: "damage", label: `${fmtCount(s.damage_unchecked)}개 검사하기` } : undefined,
+        },
+        {
           key: "short_video", tier: "check", icon: "▷", title: "아주 짧은 동영상", count: s.short_videos.count, bytes: s.short_videos.bytes, unit: "개",
           why: "3초가 안 되는 동영상. 실수로 찍힌 경우가 많습니다.",
           primary: { label: "한 장씩 검토", library: { filter: { suggest: "short_video" }, groupBy: "month", review: "short_video" } },
@@ -169,7 +181,8 @@ export default function Cleanup() {
       ]
     : [];
 
-  const tierBytes = (t: Tier) => cards.filter((c) => c.tier === t).reduce((a, c) => a + c.bytes, 0);
+  // (Damaged files are something to look at, not space to win: not in the totals.)
+  const tierBytes = (t: Tier) => cards.filter((c) => c.tier === t && c.key !== "damaged").reduce((a, c) => a + c.bytes, 0);
   const analyzing = s != null && s.pending > 0;
 
   return (
@@ -242,7 +255,7 @@ export default function Cleanup() {
                     <div className="btn-row">
                       {c.find && (
                         <button className={`btn ${empty ? "primary" : "small"}`} disabled={!!running} onClick={() => find(c.find!.kind)}>
-                          {empty ? c.find.label : "다시 찾기"}
+                          {empty || c.find.kind === "damage" ? c.find.label : "다시 찾기"}
                         </button>
                       )}
                       {!empty && (

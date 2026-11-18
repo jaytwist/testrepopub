@@ -161,6 +161,11 @@ pub struct CleanupSummary {
     pub screenshots: Bucket,
     pub large_videos: Bucket,
     pub short_videos: Bucket,
+    /// Files whose structure looks damaged (cut short, holes, no index): to look at, not
+    /// counted into what can be freed.
+    pub damaged: Bucket,
+    /// Analysed files not yet looked at for damage.
+    pub damage_unchecked: i64,
     /// Extra copies on the same drive (copies on other drives are backups and stay).
     pub exact_duplicates: Bucket,
     /// Resized / recompressed versions of a photo that is kept.
@@ -188,6 +193,8 @@ pub fn summary(conn: &Connection) -> Result<CleanupSummary> {
         )
     };
     let blurry = bucket(conn, &sugg("blurry"))?;
+    let damaged = bucket(conn, &sugg("damaged"))?;
+    let damage_unchecked = crate::damage::unchecked(conn)?;
     let burst_extras = bucket(conn, &sugg("burst_extra"))?;
     let burst_groups: i64 = conn.query_row(
         &format!("SELECT COUNT(DISTINCT b.burst_id) FROM bursts b JOIN files f ON f.id = b.file_id WHERE {live}"),
@@ -253,6 +260,8 @@ pub fn summary(conn: &Connection) -> Result<CleanupSummary> {
         + variants_safe.bytes
         + variants_edited.bytes;
     Ok(CleanupSummary {
+        damaged,
+        damage_unchecked,
         blurry,
         burst_extras,
         burst_groups,

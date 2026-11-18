@@ -256,6 +256,11 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE analysis ADD COLUMN tries INTEGER NOT NULL DEFAULT 0;
     "#,
+    // 11: whether a file's structure was looked at for damage (`damage.rs`); what was found is
+    //     a suggestion of kind 'damaged'.
+    r#"
+    ALTER TABLE analysis ADD COLUMN damage_checked INTEGER NOT NULL DEFAULT 0;
+    "#,
 ];
 
 pub fn schema_version(conn: &Connection) -> Result<i64> {

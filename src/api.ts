@@ -112,6 +112,8 @@ export interface TripsSummary { trips: TripRow[]; home: string; located: number;
 export interface Bucket { count: number; bytes: number }
 export interface CleanupSummary {
   blurry: Bucket; burst_extras: Bucket; burst_groups: number; screenshots: Bucket; large_videos: Bucket;
+  /** Files that look damaged; analysed files not yet looked at for damage. */
+  damaged: Bucket; damage_unchecked: number;
   short_videos: Bucket; exact_duplicates: Bucket; variants_safe: Bucket; variants_edited: Bucket; backups: Bucket;
   total_bytes: number; analyzed: number; pending: number;
 }
@@ -329,6 +331,8 @@ export const api = {
   scanFolder: (folder: string) => invoke<void>("start_scan", { sourceId: null, volumeId: null, folder, full: false }),
   getScanOptions: () => invoke<ScanOptions>("get_scan_options"),
   cleanupSummary: () => invoke<CleanupSummary>("cleanup_summary"),
+  /** Look at analysed files for damage (cut short, holes, no index). */
+  startDamageCheck: () => invoke<void>("start_damage_check"),
   tripsSummary: () => invoke<TripsSummary>("trips_summary"),
   compareFiles: (ids: number[]) => invoke<CompareInfo>("compare_files", { ids }),
   getDupRules: () => invoke<DupRules>("get_dup_rules"),

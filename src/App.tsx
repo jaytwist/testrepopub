@@ -62,6 +62,8 @@ const STAGE_NAMES: Record<string, string> = {
   move: "복사 폴더에서 꺼내는 중",
   verify: "원본과 끝까지 비교하며 지우는 중",
   verify_quick: "원본과 일부만 비교하며 지우는 중 (빠른 확인)",
+  check: "깨진 파일이 있는지 검사하는 중",
+  undo: "되돌리는 중",
   done: "마무리 중",
 };
 
@@ -89,6 +91,12 @@ function doneText(d: JobDone): string {
     return parts.join(" · ") + " — 「작업 기록」에서 되돌릴 수 있습니다";
   }
   if (d.job === "import:preview") return "SD 카드를 확인했습니다";
+  if (d.job === "check:damage") {
+    const parts = [`${fmtCount(r.checked ?? 0)}개를 검사했습니다 · 깨진 것 같은 파일 ${fmtCount(r.damaged ?? 0)}개`];
+    if (r.unreadable) parts.push(`읽지 못한 ${fmtCount(r.unreadable)}개는 다음에 다시`);
+    if (r.cancelled) parts.push("중간에 멈춤 — 다시 누르면 이어서 검사");
+    return parts.join(" · ");
+  }
   if (d.job === "cleanup:folders") {
     const n = (r.folders ?? 0) + (r.partial ?? 0);
     return `복사 폴더 ${fmtCount(n)}개를 정리했습니다 (${fmtBytes(r.bytes ?? 0)})`;

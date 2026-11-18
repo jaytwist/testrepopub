@@ -31,7 +31,7 @@ export interface ReviewProps {
   onFinish: () => void;
 }
 
-const REASON_NAMES: Record<string, string> = { blurry: "흐린 사진", burst_extra: "연사" };
+const REASON_NAMES: Record<string, string> = { blurry: "흐린 사진", burst_extra: "연사", damaged: "깨진 것 같음" };
 
 export default function Viewer({ items, index, onIndex, onClose, onChanged, review }: Props) {
   const nav = useNav();

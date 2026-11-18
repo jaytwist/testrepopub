@@ -9,6 +9,7 @@ pub mod db;
 pub mod analysis;
 pub mod cleanup;
 pub mod compare;
+pub mod damage;
 pub mod dedupe;
 pub mod faces;
 pub mod folders;
