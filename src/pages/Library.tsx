@@ -9,6 +9,7 @@ import { useJob, useNav, type LibraryPreset } from "../App";
 import FilterBar from "../components/FilterBar";
 import Viewer from "../components/Viewer";
 import TimelineScrubber, { type ScrubSegment } from "../components/TimelineScrubber";
+import CopiesPanel from "../components/CopiesPanel";
 import Compare from "../components/Compare";
 
 /** Items fetched per request inside one group. */
@@ -118,6 +119,9 @@ export default function Library({ active = true, preset, onClearPreset, onConsum
   const viewerChanged = useRef(false);
   /** Mark identical files as 원본 / 사본 on the tiles. */
   const [showRoles, setShowRoles] = useState<boolean>(() => store.get("mo.showRoles") === "1");
+  // The same photo under other names / in other folders: shown once, with "+N".
+  const [stackCopies, setStackCopies] = useState<boolean>(() => store.get("mo.stackCopies") !== "0");
+  const [copiesOf, setCopiesOf] = useState<number | null>(null);
   const [bulk, setBulk] = useState<"label" | "date" | "shift" | null>(null);
   const [bulkValue, setBulkValue] = useState("");
   const [busyGroup, setBusyGroup] = useState<string | null>(null);
@@ -184,8 +188,8 @@ export default function Library({ active = true, preset, onClearPreset, onConsum
   /** "Show only the selection": the ids frozen when it was turned on. */
   const [onlySel, setOnlySel] = useState<number[] | null>(null);
   const qf: FileFilter = useMemo(
-    () => ({ ...filter, stack_bursts: stack && groupBy !== "burst", ...(onlySel ? { ids: onlySel } : {}) }),
-    [filter, stack, groupBy, onlySel],
+    () => ({ ...filter, stack_bursts: stack && groupBy !== "burst", stack_copies: stackCopies, ...(onlySel ? { ids: onlySel } : {}) }),
+    [filter, stack, groupBy, onlySel, stackCopies],
   );
 
   const reload = useCallback(() => {
@@ -591,7 +595,9 @@ export default function Library({ active = true, preset, onClearPreset, onConsum
       bytes = (await api.filteredStats({ ids })).bytes;
     } catch { /* size is informational only */ }
     try {
-      if (await confirmDelete(ids, "선택한 파일 삭제", bytes)) setRunning("delete");
+      // Stacked: what is ticked is the one file shown; the same photo elsewhere stays.
+      const note = qf.stack_copies && !filter.volume_id && !filter.dir ? "「같은 사진 묶기」가 켜져 있습니다: 보이는 파일만 지워지고, 다른 곳에 있는 같은 사진(+N)은 남아 그중 하나가 대신 보이게 됩니다." : "";
+      if (await confirmDelete(ids, "선택한 파일 삭제", bytes, undefined, note)) setRunning("delete");
     } catch (e) {
       setLoadError(String(e));
     }
@@ -813,6 +819,10 @@ export default function Library({ active = true, preset, onClearPreset, onConsum
           )}
           {groupBy === "burst" && item.burst_rank === 0 && <span className="badge-best">★ 베스트</span>}
           {kept.has(item.id) && <span className="badge-kept">남김</span>}
+          {item.same > 0 && (
+            <button className="badge-same" title={`같은 사진이 ${item.same}장 더 있습니다 — 눌러서 어디에 있는지 보기`}
+              onClick={(e) => { e.stopPropagation(); setCopiesOf(item.id); }}>+{item.same}</button>
+          )}
           {(filter.copies || filter.volume_id != null) && item.copies > 0 && (
             <span className="badge-copies" title="다른 드라이브에 똑같은 파일이 있습니다">사본 {item.copies}</span>
           )}
@@ -898,6 +908,10 @@ export default function Library({ active = true, preset, onClearPreset, onConsum
             <button className="btn small" onClick={unfoldAll} disabled={foldedCount === 0}>모두 펼치기</button>
           </>
         )}
+        <label className="check-row small roles-toggle" title="이름·폴더가 달라도 내용이 같은 파일은 한 장만 보여 주고 +N으로 표시합니다. +N을 누르면 모든 위치가 나옵니다. (드라이브나 폴더 하나만 볼 때는 묶지 않습니다.)">
+          <input type="checkbox" checked={stackCopies} onChange={(e) => { setStackCopies(e.target.checked); store.set("mo.stackCopies", e.target.checked ? "1" : "0"); }} />
+          같은 사진 묶기
+        </label>
         <label className="check-row small roles-toggle" title="똑같은 파일이 여러 개인 사진에 원본/사본 표시 (사진 보기에서 원본을 직접 지정할 수 있음)">
           <input type="checkbox" checked={showRoles} onChange={(e) => { setShowRoles(e.target.checked); store.set("mo.showRoles", e.target.checked ? "1" : "0"); }} />
           원본 표시
@@ -1023,6 +1037,14 @@ export default function Library({ active = true, preset, onClearPreset, onConsum
         </div>
       )}
 
+      {copiesOf != null && (
+        <CopiesPanel
+          id={copiesOf}
+          onClose={() => setCopiesOf(null)}
+          onShowFolder={(volume_id, dir) => { setCopiesOf(null); setFilter({ ...filter, volume_id, dir }); }}
+          onCompare={(ids) => { setCopiesOf(null); setComparing(ids); }}
+        />
+      )}
       {comparing && <Compare ids={comparing} onClose={() => setComparing(null)} />}
 
       {viewIndex != null && (

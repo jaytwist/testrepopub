@@ -285,6 +285,8 @@ pub struct FamilyMember {
     /// 축소본 / 재압축본 / 편집본.
     pub relation: String,
     pub is_self: bool,
+    /// Looks damaged, or could not be opened (see `damage`).
+    pub damaged: bool,
 }
 
 /// A file with everything that is the same photo: where the original is, what the others are,
@@ -305,6 +307,7 @@ pub fn family(conn: &Connection, id: i64) -> Result<Option<Family>> {
     let member = |f: db::FileRow, role: &str, relation: &str| FamilyMember {
         abs_path: f.abs_path().to_string_lossy().into_owned(),
         is_self: f.id == id,
+        damaged: conn.query_row("SELECT 1 FROM suggestions WHERE file_id = ? AND kind = 'damaged'", [f.id], |_| Ok(())).is_ok(),
         role: role.into(),
         relation: relation.into(),
         file: f,

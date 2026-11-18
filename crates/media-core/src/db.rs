@@ -496,6 +496,8 @@ pub struct GridItem {
     pub favorite: bool,
     /// "original" / "copy" when byte-identical copies of this file exist (see `identity::refresh_roles`).
     pub dup_role: Option<String>,
+    /// Other files with the same content, anywhere (the "+N" on a tile).
+    pub same: i64,
 }
 
 /// SQL: file `g` has the same content as file `f` — the full hashes when both are known,
@@ -572,6 +574,11 @@ pub struct FileFilter {
     pub person_ids: Option<Vec<i64>>,
     /// Show each burst as its best shot only.
     pub stack_bursts: bool,
+    /// Show files with the same content (whatever their names and folders) once: the original
+    /// stands for its copies. Not when the view is narrowed to a drive, a folder or chosen
+    /// files — the original may be elsewhere, and the photo would seem to be missing.
+    #[serde(default)]
+    pub stack_copies: bool,
     /// 'taken' (default) | 'mtime' | 'size' | 'name' | 'resolution' | 'duration'
     pub sort: Option<String>,
     /// Default: true (newest / largest first).
@@ -747,6 +754,9 @@ impl FileFilter {
         if self.stack_bursts {
             w.push("NOT EXISTS (SELECT 1 FROM bursts b WHERE b.file_id = f.id AND b.rank > 0)".into());
         }
+        if self.stack_copies && self.volume_id.is_none() && self.source_id.is_none() && self.dir.is_none() && self.ids.is_none() {
+            w.push("NOT EXISTS (SELECT 1 FROM dup_roles dr WHERE dr.file_id = f.id AND dr.role IN ('copy', 'backup'))".into());
+        }
         match self.has_gps {
             Some(true) => w.push("f.lat IS NOT NULL AND f.lon IS NOT NULL".into()),
             Some(false) => w.push("(f.lat IS NULL OR f.lon IS NULL)".into()),
@@ -857,7 +867,8 @@ pub fn query_grid(conn: &Connection, filter: &FileFilter, offset: i64, limit: i6
                 (SELECT COUNT(*) FROM bursts b2 WHERE b2.burst_id = bb.burst_id), bb.rank, bb.burst_id,
                 (SELECT COUNT(*) FROM files g WHERE g.id != f.id AND g.volume_id != f.volume_id AND g.missing = 0 AND g.quarantined = 0 AND {same}),
                 EXISTS (SELECT 1 FROM labels lf WHERE lf.file_id = f.id AND lf.label = 'favorite'),
-                (SELECT dr.role FROM dup_roles dr WHERE dr.file_id = f.id)
+                (SELECT dr.role FROM dup_roles dr WHERE dr.file_id = f.id),
+                (SELECT COUNT(*) FROM files g WHERE g.id != f.id AND g.missing = 0 AND g.quarantined = 0 AND {same})
          FROM files f JOIN volumes v ON v.id = f.volume_id LEFT JOIN bursts bb ON bb.file_id = f.id WHERE {w}
          ORDER BY {} LIMIT {limit} OFFSET {offset}",
         filter.order_sql(),
@@ -883,6 +894,7 @@ pub fn query_grid(conn: &Connection, filter: &FileFilter, offset: i64, limit: i6
                 copies: r.get(13)?,
                 favorite: r.get::<_, i64>(14)? != 0,
                 dup_role: r.get(15)?,
+                same: r.get(16)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;

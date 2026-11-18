@@ -83,6 +83,8 @@ export interface FileFilter {
   /** Backup check: "elsewhere" = also on another drive, "only_here" = on no other drive. */
   copies?: "elsewhere" | "only_here" | null;
   stack_bursts?: boolean;
+  /** Show files with the same content once (not when narrowed to a drive, a folder or chosen files). */
+  stack_copies?: boolean;
   sort?: SortKey | null;
   desc?: boolean | null;
 }
@@ -161,6 +163,8 @@ export interface GridItem {
   favorite: boolean;
   /** "original" / "copy" when byte-identical copies exist. */
   dup_role: DupRole | null;
+  /** Other files with the same content, anywhere (the "+N" on a tile). */
+  same: number;
 }
 export interface ValueCount { value: string; count: number }
 export interface FilterOptions { cameras: ValueCount[]; exts: ValueCount[]; years: number[]; max_size: number; with_gps: number }
@@ -225,7 +229,7 @@ export interface YearBucket {
 }
 export interface CopyFolder { dir: string; count: number; bytes: number; versions: number; same_name: number; dir_total: number; kept_in: [string, number][] }
 /** A file that is the same photo as another: role and what it is in words (원본 / 복사본 / 사본 / 백업 / 축소본 …). */
-export interface FamilyMember { file: FileRow; abs_path: string; role: DupRole; relation: string; is_self: boolean }
+export interface FamilyMember { file: FileRow; abs_path: string; role: DupRole; relation: string; is_self: boolean; damaged: boolean }
 export interface Family { kind: "exact" | "similar"; why: string; members: FamilyMember[] }
 export interface CopyPair { file_id: number; src: string; size: number; tag: string; kept_id: number; kept_src: string; kept_dst: string }
 export interface KeepItem { file_id: number; group: string; action: PlanItem["action"]; copies: number; size: number }

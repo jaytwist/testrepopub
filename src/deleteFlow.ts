@@ -13,11 +13,11 @@ const REASONS: Record<Blocked["reason"], string> = {
  * (original, ♥, a keep folder, or the last copy of a photo) offers to leave those out.
  * Starts the delete job and returns true, or returns false if the user cancelled.
  */
-export async function confirmDelete(ids: number[], title = "삭제", bytes?: number, label?: string): Promise<boolean> {
+export async function confirmDelete(ids: number[], title = "삭제", bytes?: number, label?: string, note = ""): Promise<boolean> {
   if (ids.length === 0) return false;
   const size = bytes != null ? ` (${fmtBytes(bytes)})` : "";
   const blocked = await api.protectCheck(ids).catch(() => [] as Blocked[]);
-  const after = "\n\n같은 드라이브의 격리 폴더로 옮겨지며, 「작업 기록」에서 되돌릴 수 있습니다.";
+  const after = `${note ? `\n\n${note}` : ""}\n\n같은 드라이브의 격리 폴더로 옮겨지며, 「작업 기록」에서 되돌릴 수 있습니다.`;
   if (blocked.length === 0) {
     const ok = await confirm(`${fmtCount(ids.length)}개${size}를 삭제할까요?${after}`, {
       title, kind: "warning", okLabel: "삭제", cancelLabel: "취소",

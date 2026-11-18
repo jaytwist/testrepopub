@@ -38,6 +38,7 @@ export default function OriginalCard({ id, version, onCompare, onMakeOriginal, o
       </button>
       {m.is_self && <span className="muted small">이 파일</span>}
       {!m.file.online && <span className="warn-text small">연결 안 됨</span>}
+      <button className="btn small ghost" disabled={!m.file.online} title="탐색기에서 이 파일이 있는 폴더 열기" onClick={() => api.revealFile(m.file.id)}>폴더 열기</button>
     </div>
   );
   return (
