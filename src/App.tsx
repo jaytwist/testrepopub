@@ -60,7 +60,7 @@ const STAGE_NAMES: Record<string, string> = {
   run: "파일 이동 중",
   quarantine: "격리함으로 옮기는 중",
   move: "복사 폴더에서 꺼내는 중",
-  verify: "원본과 끝까지 비교하며 지우는 중",
+  verify: "원본과 같은지 확인하며 지우는 중",
   verify_quick: "원본과 일부만 비교하며 지우는 중 (빠른 확인)",
   check: "깨진 파일이 있는지 검사하는 중",
   undo: "되돌리는 중",

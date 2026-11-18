@@ -3,12 +3,19 @@ import { confirm } from "@tauri-apps/plugin-dialog";
 import { api, fmtBytes, fmtCount, type BatchRow } from "../api";
 import { useJob } from "../App";
 
+const HOW = (quick: boolean) =>
+  quick
+    ? "빠른 확인: 원본이 있는 사본은 원본과 일부(앞·끝과 32MB마다 1MB)만 비교하고 지웁니다. 가운데만 깨진 파일은 알아채지 못합니다."
+    : "원본이 있는 사본은 원본과 같은지 확인한 뒤 지웁니다(이미 확인된 것은 다시 읽지 않습니다). 진행 중 남은 시간이 표시되고, 멈췄다가 다시 누르면 이어집니다.";
+
 const STATE_NAMES: Record<string, string> = { running: "진행 중", done: "완료", undone: "되돌림", purged: "격리함 비움" };
 
 export default function History() {
   const { version, running, setRunning, lastDone } = useJob();
   const [rows, setRows] = useState<BatchRow[]>([]);
   const [error, setError] = useState<string | null>(null);
+  // "Quick check": compare parts of each copy with its original instead of all of it.
+  const [quick, setQuick] = useState(false);
 
   useEffect(() => {
     api.batches().then(setRows);
@@ -28,12 +35,30 @@ export default function History() {
   const purge = async (b: BatchRow) => {
     const ok = await confirm(
       `격리함의 파일 ${fmtCount(b.waiting)}개(${fmtBytes(b.bytes)})를 영구 삭제합니다.\n\n` +
-        "원본이 있는 사본은 원본과 끝까지 비교한 뒤 지웁니다(진행 중 남은 시간이 표시되고, 멈췄다가 다시 누르면 이어집니다). 이 작업은 되돌릴 수 없습니다.",
+        `${HOW(quick)} 이 작업은 되돌릴 수 없습니다.`,
       { title: "격리함 비우기", kind: "error" },
     );
     if (!ok) return;
     try {
-      await api.startPurge(b.id);
+      await api.startPurge(b.id, quick);
+      setRunning("purge");
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  // Everything that waits in the quarantine, whatever batch put it there.
+  const waiting = rows.filter((b) => b.state === "done" && b.waiting > 0);
+  const waitingFiles = waiting.reduce((n, b) => n + b.waiting, 0);
+  const purgeAll = async () => {
+    const ok = await confirm(
+      `격리함에 있는 파일 전부(작업 ${fmtCount(waiting.length)}건, ${fmtCount(waitingFiles)}개)를 영구 삭제합니다.\n\n` +
+        `${HOW(quick)} 이 작업은 되돌릴 수 없습니다.`,
+      { title: "격리함 전부 비우기", kind: "error" },
+    );
+    if (!ok) return;
+    try {
+      await api.startPurgeAll(quick);
       setRunning("purge");
     } catch (e) {
       setError(String(e));
@@ -52,9 +77,21 @@ export default function History() {
         </div>
       </header>
       {error && <div className="alert bad">{error}</div>}
+      {waitingFiles > 0 && (
+        <div className="purge-all">
+          <div>
+            <b>격리함에 {fmtCount(waitingFiles)}개</b> <span className="muted">(작업 {fmtCount(waiting.length)}건)</span>
+            <label className="small" title="원본과 일부만 비교합니다. 큰 영상이 많을 때 훨씬 빠르지만, 가운데만 깨진 파일은 알아채지 못합니다. 복구 폴더에서 온 사본에는 권하지 않습니다.">
+              <input type="checkbox" checked={quick} onChange={(e) => setQuick(e.target.checked)} /> 빠른 확인 (일부만 비교)
+            </label>
+          </div>
+          <button className="btn danger" disabled={!!running} onClick={purgeAll}>격리함 전부 비우기</button>
+        </div>
+      )}
       {undoResult && undoResult.ok && (
         <div className={`alert ${undoResult.result.failed ? "bad" : "ok"}`}>
           {undoResult.job === "undo" ? "되돌림" : "삭제"} {fmtCount(undoResult.result.restored)}개
+          {undoResult.job === "purge" && undoResult.result.bytes > 0 && <> · {fmtBytes(undoResult.result.bytes)} 확보</>}
           {undoResult.result.failed > 0 && <> · 실패 {undoResult.result.failed}개<pre>{undoResult.result.errors.join("\n")}</pre></>}
         </div>
       )}

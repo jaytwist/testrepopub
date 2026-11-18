@@ -4,6 +4,7 @@
 //! scanning, labeling, de-duplication and organizing logic can be tested headlessly.
 
 /// Re-exported so the app can pass connections around without its own dependency.
+pub use blake3;
 pub use rusqlite;
 pub mod db;
 pub mod analysis;

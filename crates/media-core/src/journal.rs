@@ -615,6 +615,13 @@ impl Comparer {
 
     /// Whether the two files hold the same bytes, all of them.
     pub fn same(&mut self, a: &Path, b: &Path) -> Result<bool> {
+        self.same_with(a, b, false, None)
+    }
+
+    /// `same`, and more: with `parallel` both files are read at the same time (they are on
+    /// different drives — on one hard disk that would only make the head travel); `hash_b`
+    /// takes in all of `b` on the way, so its full hash is known when the answer is "the same".
+    pub fn same_with(&mut self, a: &Path, b: &Path, parallel: bool, mut hash_b: Option<&mut blake3::Hasher>) -> Result<bool> {
         let (la, lb) = (fs::metadata(a)?.len(), fs::metadata(b)?.len());
         if la != lb {
             return Ok(false);
@@ -624,10 +631,22 @@ impl Comparer {
         let mut left = la;
         while left > 0 {
             let want = left.min(self.run as u64) as usize;
-            let x = read_full(&mut fa, &mut self.a[..want])?;
-            let y = read_full(&mut fb, &mut self.b[..want])?;
+            let (ba, bb) = (&mut self.a[..want], &mut self.b[..want]);
+            let (x, y) = if parallel {
+                std::thread::scope(|sc| {
+                    let other = sc.spawn(|| read_full(&mut fb, bb));
+                    let x = read_full(&mut fa, ba);
+                    (x, other.join().unwrap_or_else(|_| Err(anyhow::anyhow!("read failed"))))
+                })
+            } else {
+                (read_full(&mut fa, ba), read_full(&mut fb, bb))
+            };
+            let (x, y) = (x?, y?);
             if x != want || y != want || self.a[..want] != self.b[..want] {
                 return Ok(false);
+            }
+            if let Some(h) = hash_b.as_deref_mut() {
+                h.update(&self.b[..want]);
             }
             left -= want as u64;
         }
@@ -802,6 +821,8 @@ pub struct UndoReport {
     pub errors: Vec<String>,
     /// Stopped before the end: the rest is still as the batch left it.
     pub cancelled: bool,
+    /// Bytes freed (emptying the quarantine).
+    pub bytes: i64,
 }
 
 struct JournalEntry {
@@ -955,21 +976,34 @@ pub fn undo_batch_with(conn: &Connection, batch_id: &str, stop: &StopFlag, progr
 
 /// Permanently delete quarantined files of a batch. This is the only irreversible action.
 pub fn purge_batch(conn: &Connection, batch_id: &str) -> Result<UndoReport> {
-    purge_batch_progress(conn, batch_id, &crate::StopFlag::new(), &|_| {})
+    purge_batch_progress(conn, batch_id, false, &crate::StopFlag::new(), &|_| {})
 }
 
 /// `purge_batch` as a job: reports how far it is and can be stopped. What it had not reached
 /// stays in the quarantine; running it again goes on from there.
-pub fn purge_batch_progress(conn: &Connection, batch_id: &str, stop: &crate::StopFlag, progress: crate::ProgressFn) -> Result<UndoReport> {
-    let r = purge_batch_with(conn, batch_id, stop, progress)?;
+pub fn purge_batch_progress(conn: &Connection, batch_id: &str, quick: bool, stop: &crate::StopFlag, progress: crate::ProgressFn) -> Result<UndoReport> {
+    Ok(purge_summary(purge_batch_opts(conn, batch_id, quick, stop, progress)?))
+}
+
+/// Empty the whole quarantine as one job: every finished batch that still has files waiting,
+/// oldest first, with one progress over all of them.
+pub fn purge_all_progress(conn: &Connection, quick: bool, stop: &crate::StopFlag, progress: crate::ProgressFn) -> Result<UndoReport> {
+    Ok(purge_summary(purge_all(conn, quick, stop, progress)?))
+}
+
+/// What a purge did, in the words the history page shows.
+fn purge_summary(r: PurgeReport) -> UndoReport {
     let mut errors = r.errors;
+    if r.offline > 0 {
+        errors.insert(0, format!("연결되어 있지 않은 드라이브의 {}개는 지우지 못했습니다. 드라이브를 연결한 뒤 다시 누르세요", r.offline));
+    }
     if r.kept > 0 {
         errors.insert(0, format!("원본과 내용이 달라(또는 원본이 없어) {}개는 격리함에 남겨 두었습니다", r.kept));
     }
     if r.cancelled {
         errors.insert(0, "중간에 멈췄습니다. 다시 누르면 남은 것부터 이어서 지웁니다".into());
     }
-    Ok(UndoReport { restored: r.deleted, failed: r.failed + r.kept, errors, cancelled: r.cancelled })
+    UndoReport { restored: r.deleted, failed: r.failed + r.kept, errors, cancelled: r.cancelled, bytes: r.bytes }
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -985,6 +1019,12 @@ pub struct PurgeReport {
     pub quick: bool,
     /// Of the kept: copies compared with their twin and found different (copy, twin).
     pub differing: Vec<(i64, i64)>,
+    /// Of the failed: files on a drive that is not connected (they wait for it).
+    pub offline: u64,
+    /// Copies deleted without reading them again: their full hash and their twin's were known.
+    pub known: u64,
+    /// Batches gone through (`purge_all`).
+    pub batches: u64,
 }
 
 /// Permanently delete a batch's quarantined files. A copy quarantined with its twin
@@ -994,98 +1034,412 @@ pub fn purge_batch_with(conn: &Connection, batch_id: &str, stop: &crate::StopFla
     purge_batch_opts(conn, batch_id, false, stop, progress)
 }
 
+/// How far a purge is, over all the batches it goes through.
+struct Tally {
+    done: u64,
+    total: u64,
+    bytes_done: u64,
+    bytes_total: u64,
+    started: std::time::Instant,
+}
+
+const WAITING: &str = "FROM journal j LEFT JOIN files f ON f.id = j.file_id WHERE j.op = 'quarantine' AND j.undone = 0";
+
 /// `purge_batch_with`; with `quick` the copy and its twin are compared in parts only
 /// (`Comparer::same_sampled`): much less to read, and a difference between the parts is not seen.
 pub fn purge_batch_opts(conn: &Connection, batch_id: &str, quick: bool, stop: &crate::StopFlag, progress: crate::ProgressFn) -> Result<PurgeReport> {
     volumes::refresh(conn)?;
-    type Entry = (i64, i64, String, Option<i64>, i64, i64, String);
-    let entries: Vec<Entry> = {
+    let (total, bytes_total): (i64, i64) =
+        conn.query_row(&format!("SELECT COUNT(*), COALESCE(SUM(COALESCE(f.size, 0)), 0) {WAITING} AND j.batch_id = ?"), [batch_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let mut tally = Tally { done: 0, total: total as u64, bytes_done: 0, bytes_total: bytes_total.max(0) as u64, started: std::time::Instant::now() };
+    let rep = purge_inner(conn, batch_id, quick, stop, progress, &mut tally)?;
+    if !rep.cancelled {
+        progress(crate::Progress::new("purge", stage_of(quick), tally.total, tally.total, "").with_bytes(tally.bytes_total, tally.bytes_total, tally.started.elapsed()));
+    }
+    Ok(rep)
+}
+
+/// Every finished batch with files still in the quarantine, emptied in one go (oldest first).
+/// Stopped, it leaves the rest where it is; run again, it goes on from there.
+pub fn purge_all(conn: &Connection, quick: bool, stop: &crate::StopFlag, progress: crate::ProgressFn) -> Result<PurgeReport> {
+    volumes::refresh(conn)?;
+    let of_done = "AND j.batch_id IN (SELECT id FROM batches WHERE state = 'done')";
+    let batches: Vec<String> = {
+        let mut st = conn.prepare(
+            "SELECT b.id FROM batches b WHERE b.state = 'done' AND EXISTS(SELECT 1 FROM journal j WHERE j.batch_id = b.id AND j.op = 'quarantine' AND j.undone = 0)
+             ORDER BY b.created_at, b.id",
+        )?;
+        let rows = st.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        rows
+    };
+    let (total, bytes_total): (i64, i64) = conn.query_row(&format!("SELECT COUNT(*), COALESCE(SUM(COALESCE(f.size, 0)), 0) {WAITING} {of_done}"), [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let mut tally = Tally { done: 0, total: total as u64, bytes_done: 0, bytes_total: bytes_total.max(0) as u64, started: std::time::Instant::now() };
+    let mut all = PurgeReport { quick, ..Default::default() };
+    for b in &batches {
+        if stop.is_stopped() {
+            all.cancelled = true;
+            break;
+        }
+        let r = purge_inner(conn, b, quick, stop, progress, &mut tally)?;
+        all.batches += 1;
+        all.deleted += r.deleted;
+        all.bytes += r.bytes;
+        all.kept += r.kept;
+        all.failed += r.failed;
+        all.offline += r.offline;
+        all.known += r.known;
+        all.differing.extend(r.differing);
+        let room = 200usize.saturating_sub(all.errors.len());
+        all.errors.extend(r.errors.into_iter().take(room));
+        if r.cancelled {
+            all.cancelled = true;
+            break;
+        }
+    }
+    if !all.cancelled {
+        progress(crate::Progress::new("purge", stage_of(quick), tally.total, tally.total, "").with_bytes(tally.bytes_total, tally.bytes_total, tally.started.elapsed()));
+    }
+    Ok(all)
+}
+
+fn stage_of(quick: bool) -> &'static str {
+    if quick {
+        "verify_quick"
+    } else {
+        "verify"
+    }
+}
+
+/// Database writes of a long run, saved together: every `EVERY` writes or `SPAN` of time, and
+/// before anything that takes long (so no other writer waits for a file being read). Saving
+/// each file on its own made the disk wait for every single one.
+struct Saved<'a> {
+    conn: &'a Connection,
+    /// Not inside a transaction of the caller's.
+    own: bool,
+    open: bool,
+    n: u32,
+    since: std::time::Instant,
+}
+
+impl<'a> Saved<'a> {
+    const EVERY: u32 = 200;
+    const SPAN: std::time::Duration = std::time::Duration::from_secs(2);
+
+    fn new(conn: &'a Connection) -> Self {
+        Self { conn, own: conn.is_autocommit(), open: false, n: 0, since: std::time::Instant::now() }
+    }
+
+    /// Before writing.
+    fn write(&mut self) -> Result<()> {
+        if self.own && !self.open {
+            self.conn.execute_batch("BEGIN IMMEDIATE")?;
+            (self.open, self.n, self.since) = (true, 0, std::time::Instant::now());
+        }
+        self.n += 1;
+        Ok(())
+    }
+
+    /// Save what is due — or, with `now`, whatever there is.
+    fn save(&mut self, now: bool) -> Result<()> {
+        if self.open && (now || self.n >= Self::EVERY || self.since.elapsed() >= Self::SPAN) {
+            self.conn.execute_batch("COMMIT")?;
+            self.open = false;
+        }
+        Ok(())
+    }
+}
+
+fn mtime_secs(md: &fs::Metadata) -> i64 {
+    md.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// The file's full hash from the index, if the file on disk is still the one it was taken
+/// from (same size, same time): then there is no need to read it again.
+fn known_hash<'a>(row: &'a db::FileRow, at: &Path) -> Option<&'a str> {
+    let md = fs::metadata(at).ok()?;
+    (md.len() as i64 == row.size && mtime_secs(&md) == row.mtime).then_some(row.hash.as_deref()).flatten()
+}
+
+/// Whether the quarantined copy at `p` holds what its twin holds, reading as little as that
+/// takes: nothing if both full hashes are known, one file if one is, both otherwise (at the
+/// same time when they are on different drives). `Ok((same, twin's path, read nothing))`.
+fn copy_matches(conn: &Connection, cmp: &mut Comparer, quick: bool, saved: &mut Saved, copy_id: i64, copy_vol: i64, p: &Path, twin: i64) -> Result<(bool, Option<PathBuf>, bool)> {
+    let Some(t) = db::get_file(conn, twin)?.filter(|f| !f.quarantined && !f.missing && f.online) else { return Ok((false, None, false)) };
+    let tp = t.abs_path();
+    let c = db::get_file(conn, copy_id)?;
+    let th = known_hash(&t, &tp);
+    let ch = c.as_ref().and_then(|c| known_hash(c, p));
+    let keep_hash = |saved: &mut Saved, h: &str| -> Result<()> {
+        // For the next copy of the same original: it alone is read then.
+        if fs::metadata(&tp).map(|m| m.len() as i64 == t.size && mtime_secs(&m) == t.mtime).unwrap_or(false) {
+            saved.write()?;
+            conn.execute("UPDATE files SET hash = ? WHERE id = ? AND hash IS NULL", params![h, twin])?;
+        }
+        Ok(())
+    };
+    let (same, unread) = match (ch, th) {
+        (Some(a), Some(b)) => (a == b, true),
+        _ if quick => (cmp.same_sampled(p, &tp).unwrap_or(false), false),
+        (None, Some(b)) => (hash_file(p).map(|h| h == b).unwrap_or(false), false),
+        (Some(a), None) => match hash_file(&tp) {
+            Ok(h) if h == a => {
+                keep_hash(saved, &h)?;
+                (true, false)
+            }
+            _ => (false, false),
+        },
+        (None, None) => {
+            let mut h = blake3::Hasher::new();
+            let same = cmp.same_with(p, &tp, t.volume_id != copy_vol, Some(&mut h)).unwrap_or(false);
+            if same {
+                keep_hash(saved, h.finalize().to_hex().as_str())?;
+            }
+            (same, false)
+        }
+    };
+    Ok((same, Some(tp), unread))
+}
+
+/// Files this large are not read while database writes are waiting to be saved.
+const LONG_READ: i64 = 32 << 20;
+/// Copies smaller than this are checked in groups: first the copies of a group are read, one
+/// after the other, then their originals. Read in turns — copy, original, copy, original — a
+/// hard disk moves its head between two far places for every single photo.
+const GROUPED_BELOW: i64 = 16 << 20;
+const GROUP_FILES: usize = 400;
+const GROUP_BYTES: i64 = 256 << 20;
+
+struct Waiting {
+    jid: i64,
+    file_id: i64,
+    dst: String,
+    twin: Option<i64>,
+    size: i64,
+    vol: i64,
+    rel: String,
+}
+
+/// How a waiting copy is checked against its original.
+enum Check {
+    /// Nothing to compare with (no original was named), or nothing there to compare.
+    None,
+    /// On its own, by `copy_matches` (large files, the quick check).
+    Alone(i64),
+    /// By full hashes, read in a group. `orig` is the original's path if it can be read.
+    Hashes { twin: i64, orig: Option<PathBuf>, copy: Option<String>, unread: bool },
+}
+
+fn purge_inner(conn: &Connection, batch_id: &str, quick: bool, stop: &crate::StopFlag, progress: crate::ProgressFn, tally: &mut Tally) -> Result<PurgeReport> {
+    let entries: Vec<Waiting> = {
         let mut st = conn.prepare(
             "SELECT j.id, j.file_id, j.dst_abs, j.new_file_id, COALESCE(f.size, 0), j.src_volume, j.src_rel FROM journal j LEFT JOIN files f ON f.id = j.file_id
-             WHERE j.batch_id = ? AND j.op = 'quarantine' AND j.undone = 0",
+             WHERE j.batch_id = ? AND j.op = 'quarantine' AND j.undone = 0 ORDER BY j.id",
         )?;
-        let rows = st.query_map([batch_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?.collect::<rusqlite::Result<_>>()?;
+        let rows = st
+            .query_map([batch_id], |r| Ok(Waiting { jid: r.get(0)?, file_id: r.get(1)?, dst: r.get(2)?, twin: r.get(3)?, size: r.get(4)?, vol: r.get(5)?, rel: r.get(6)? }))?
+            .collect::<rusqlite::Result<_>>()?;
         rows
     };
     let mut rep = PurgeReport { quick, ..Default::default() };
-    let total = entries.len() as u64;
-    let bytes_total: u64 = entries.iter().map(|e| e.4.max(0) as u64).sum();
-    let (mut bytes_done, started) = (0u64, std::time::Instant::now());
-    let stage = if quick { "verify_quick" } else { "verify" };
-    let mut cmp = Comparer::new();
-    for (i, (jid, file_id, dst, twin, indexed_size, vol, rel)) in entries.into_iter().enumerate() {
-        if stop.is_stopped() {
-            rep.cancelled = true;
-            break;
-        }
-        progress(crate::Progress::new("purge", stage, i as u64, total, dst.clone()).with_bytes(bytes_done, bytes_total, started.elapsed()));
-        bytes_done += indexed_size.max(0) as u64;
-        // Debug builds only: a slow disk on demand (`MO_SLOW_COMPARE_MS` per file), to see the
-        // progress a real run of hours shows.
-        #[cfg(debug_assertions)]
-        if let Some(ms) = std::env::var("MO_SLOW_COMPARE_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
-            std::thread::sleep(std::time::Duration::from_millis(ms));
-        }
-        // Where the file is now (its drive may have another letter). A drive that is not
-        // connected is not "nothing left to delete": the file waits for it.
-        let (p, there) = match held(conn, batch_id, &dst, vol, &rel) {
-            Held::At(p) => (p, true),
-            Held::Gone => (PathBuf::from(&dst), false),
-            Held::Offline => {
-                rep.failed += 1;
-                if rep.errors.len() < 200 {
-                    rep.errors.push(format!("{dst}: 드라이브가 연결되어 있지 않아 지우지 못했습니다. 연결한 뒤 「이어서 지우기」를 누르세요"));
-                }
-                continue;
+    let mut run = PurgeRun { conn, batch_id, quick, stop, progress, cmp: Comparer::new(), saved: Saved::new(conn), emptied: None };
+    let done = (|| -> Result<()> {
+        let mut at = 0;
+        while at < entries.len() && !rep.cancelled {
+            // The next group: up to so many files and bytes.
+            let (mut end, mut bytes) = (at, 0i64);
+            while end < entries.len() && end - at < GROUP_FILES && bytes < GROUP_BYTES {
+                bytes += if entries[end].size < GROUPED_BELOW { entries[end].size.max(0) } else { 0 };
+                end += 1;
             }
-        };
-        if let (Some(twin), true) = (twin, there) {
-            let twin_path = db::get_file(conn, twin)?.filter(|f| !f.quarantined && !f.missing && f.online).map(|f| f.abs_path());
-            let same = match &twin_path {
-                Some(tp) => if quick { cmp.same_sampled(&p, tp) } else { cmp.same(&p, tp) }.unwrap_or(false),
-                _ => false,
-            };
-            if !same {
-                if let Some(tp) = &twin_path {
-                    rep.differing.push((file_id, twin));
-                    // The two only looked the same (same size, same beginning): from now on
-                    // their fingerprints tell them apart, so neither counts as a copy of the
-                    // other again.
-                    let _ = mark_different(conn, file_id, &p, twin, tp);
-                }
-                rep.kept += 1;
-                if rep.errors.len() < 200 {
-                    rep.errors.push(format!("{}: 원본과 내용이 같은지 확인하지 못해 남겨 둠", dst));
-                }
-                continue;
-            }
+            run.group(&entries[at..end], &mut rep, tally)?;
+            at = end;
         }
-        let size = fs::metadata(&p).map(|m| m.len() as i64).unwrap_or(0);
-        let r = if there { remove_file_force(&p).map_err(anyhow::Error::from) } else { Ok(()) };
-        match r {
-            Ok(()) => {
-                conn.execute("DELETE FROM files WHERE id = ? AND quarantined = 1", [file_id])?;
-                conn.execute("UPDATE journal SET op = 'purged', undone = 1 WHERE id = ?", [jid])?;
-                rep.deleted += 1;
-                rep.bytes += size;
-                if let Some(qroot) = p.ancestors().find(|a| a.file_name().map(|n| n == batch_id).unwrap_or(false)) {
-                    prune_empty_dirs(p.parent().unwrap_or(qroot), qroot.parent().unwrap_or(qroot));
-                }
-            }
-            Err(e) => {
-                rep.failed += 1;
-                rep.errors.push(e.to_string());
-            }
-        }
-    }
-    if !rep.cancelled {
-        progress(crate::Progress::new("purge", stage, total, total, "").with_bytes(bytes_total, bytes_total, started.elapsed()));
-    }
+        Ok(())
+    })();
+    // Whatever was deleted is recorded, also when the run ends in an error.
+    run.saved.save(true)?;
+    run.tidy();
+    done?;
     let left: i64 = conn.query_row("SELECT COUNT(*) FROM journal WHERE batch_id = ? AND undone = 0", [batch_id], |r| r.get(0))?;
     if left == 0 {
         conn.execute("UPDATE batches SET state = 'purged' WHERE id = ?", [batch_id])?;
     }
     Ok(rep)
+}
+
+struct PurgeRun<'a> {
+    conn: &'a Connection,
+    batch_id: &'a str,
+    quick: bool,
+    stop: &'a crate::StopFlag,
+    progress: crate::ProgressFn<'a>,
+    cmp: Comparer,
+    saved: Saved<'a>,
+    /// The folder the last deleted file was in, and where tidying up stops: emptied folders are
+    /// removed when the run moves on to another folder, not after every file.
+    emptied: Option<(PathBuf, PathBuf)>,
+}
+
+impl PurgeRun<'_> {
+    fn tidy(&mut self) {
+        if let Some((dir, top)) = self.emptied.take() {
+            prune_empty_dirs(&dir, &top);
+        }
+    }
+
+    fn group(&mut self, items: &[Waiting], rep: &mut PurgeReport, tally: &mut Tally) -> Result<()> {
+        let conn = self.conn;
+        // Where each file is now (its drive may have another letter), and how it is checked.
+        // A drive that is not connected is not "nothing left to delete": the file waits for it.
+        let mut at: Vec<Held> = Vec::with_capacity(items.len());
+        let mut checks: Vec<Check> = Vec::with_capacity(items.len());
+        // Originals whose full hash has to be read: id → (path, row).
+        let mut to_read: std::collections::HashMap<i64, (PathBuf, db::FileRow)> = Default::default();
+        let mut orig_hash: std::collections::HashMap<i64, Option<String>> = Default::default();
+        for it in items {
+            let h = held(conn, self.batch_id, &it.dst, it.vol, &it.rel);
+            let check = match (&h, it.twin) {
+                (Held::At(_), Some(twin)) if self.quick || it.size >= GROUPED_BELOW => Check::Alone(twin),
+                (Held::At(p), Some(twin)) => match db::get_file(conn, twin)?.filter(|f| !f.quarantined && !f.missing && f.online) {
+                    None => Check::Hashes { twin, orig: None, copy: None, unread: false },
+                    Some(t) => {
+                        let tp = t.abs_path();
+                        let copy = db::get_file(conn, it.file_id)?.as_ref().and_then(|c| known_hash(c, p)).map(str::to_string);
+                        let known = known_hash(&t, &tp).map(str::to_string);
+                        let unread = copy.is_some() && known.is_some();
+                        match known {
+                            Some(k) => {
+                                orig_hash.insert(twin, Some(k));
+                            }
+                            None => {
+                                to_read.entry(twin).or_insert((tp.clone(), t));
+                            }
+                        }
+                        Check::Hashes { twin, orig: Some(tp), copy, unread }
+                    }
+                },
+                _ => Check::None,
+            };
+            at.push(h);
+            checks.push(check);
+        }
+        // The copies, one after the other …
+        for (h, check) in at.iter().zip(checks.iter_mut()) {
+            if let (Held::At(p), Check::Hashes { orig: Some(_), copy: copy @ None, .. }) = (h, check) {
+                if self.stop.is_stopped() {
+                    rep.cancelled = true;
+                    return Ok(());
+                }
+                *copy = hash_file(p).ok();
+            }
+        }
+        // … then their originals, in the order they lie in their folders. What is read is kept
+        // for the next copy of the same original.
+        let mut originals: Vec<(i64, (PathBuf, db::FileRow))> = to_read.into_iter().collect();
+        originals.sort_by(|a, b| a.1 .0.cmp(&b.1 .0));
+        for (twin, (tp, row)) in originals {
+            if self.stop.is_stopped() {
+                rep.cancelled = true;
+                return Ok(());
+            }
+            let h = hash_file(&tp).ok();
+            if let Some(h) = &h {
+                if fs::metadata(&tp).map(|m| m.len() as i64 == row.size && mtime_secs(&m) == row.mtime).unwrap_or(false) {
+                    self.saved.write()?;
+                    conn.execute("UPDATE files SET hash = ? WHERE id = ? AND hash IS NULL", params![h, twin])?;
+                }
+            }
+            orig_hash.insert(twin, h);
+        }
+        self.saved.save(false)?;
+        // The answers, file by file.
+        let stage = stage_of(self.quick);
+        for ((it, h), check) in items.iter().zip(at).zip(checks) {
+            if self.stop.is_stopped() {
+                rep.cancelled = true;
+                return Ok(());
+            }
+            (self.progress)(crate::Progress::new("purge", stage, tally.done, tally.total, it.dst.clone()).with_bytes(tally.bytes_done, tally.bytes_total, tally.started.elapsed()));
+            tally.done += 1;
+            tally.bytes_done += it.size.max(0) as u64;
+            // Debug builds only: a slow disk on demand (`MO_SLOW_COMPARE_MS` per file), to see the
+            // progress a real run of hours shows.
+            #[cfg(debug_assertions)]
+            if let Some(ms) = std::env::var("MO_SLOW_COMPARE_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
+            let (p, there) = match h {
+                Held::At(p) => (p, true),
+                Held::Gone => (PathBuf::from(&it.dst), false),
+                Held::Offline => {
+                    rep.failed += 1;
+                    rep.offline += 1;
+                    continue;
+                }
+            };
+            // (same, the original's path if it could be read, read nothing)
+            let verdict: Option<(bool, Option<PathBuf>, i64, bool)> = match check {
+                Check::None => None,
+                Check::Alone(twin) => {
+                    self.saved.save(it.size >= LONG_READ)?;
+                    let (same, tp, unread) = copy_matches(conn, &mut self.cmp, self.quick, &mut self.saved, it.file_id, it.vol, &p, twin)?;
+                    Some((same, tp, twin, unread))
+                }
+                Check::Hashes { twin, orig, copy, unread } => {
+                    let same = match (&copy, orig_hash.get(&twin).and_then(|h| h.as_ref())) {
+                        (Some(c), Some(o)) => orig.is_some() && c == o,
+                        _ => false,
+                    };
+                    Some((same, orig, twin, unread))
+                }
+            };
+            if let Some((same, twin_path, twin, unread)) = verdict {
+                if !same {
+                    if let Some(tp) = &twin_path {
+                        rep.differing.push((it.file_id, twin));
+                        // The two only looked the same (same size, same beginning): from now on
+                        // their fingerprints tell them apart, so neither counts as a copy of the
+                        // other again. (Both are read for it: nothing waits to be saved meanwhile.)
+                        self.saved.save(true)?;
+                        let _ = mark_different(conn, it.file_id, &p, twin, tp);
+                    }
+                    rep.kept += 1;
+                    if rep.errors.len() < 200 {
+                        rep.errors.push(format!("{}: 원본과 내용이 같은지 확인하지 못해 남겨 둠", it.dst));
+                    }
+                    continue;
+                }
+                rep.known += unread as u64;
+            }
+            let size = fs::metadata(&p).map(|m| m.len() as i64).unwrap_or(0);
+            let r = if there { remove_file_force(&p).map_err(anyhow::Error::from) } else { Ok(()) };
+            match r {
+                Ok(()) => {
+                    self.saved.write()?;
+                    conn.execute("DELETE FROM files WHERE id = ? AND quarantined = 1", [it.file_id])?;
+                    conn.execute("UPDATE journal SET op = 'purged', undone = 1 WHERE id = ?", [it.jid])?;
+                    rep.deleted += 1;
+                    rep.bytes += size;
+                    if let Some(qroot) = p.ancestors().find(|a| a.file_name().map(|n| n == self.batch_id).unwrap_or(false)) {
+                        let here = (p.parent().unwrap_or(qroot).to_path_buf(), qroot.parent().unwrap_or(qroot).to_path_buf());
+                        if self.emptied.as_ref() != Some(&here) {
+                            self.tidy();
+                            self.emptied = Some(here);
+                        }
+                    }
+                }
+                Err(e) => {
+                    rep.failed += 1;
+                    if rep.errors.len() < 200 {
+                        rep.errors.push(format!("{}: {e}", it.dst));
+                    }
+                }
+            }
+            self.saved.save(false)?;
+        }
+        Ok(())
+    }
 }
 
 /// Two files that share a fingerprint (same size, same first 64 KiB) and were found to differ:

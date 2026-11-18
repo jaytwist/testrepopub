@@ -1608,10 +1608,19 @@ fn protect_check(state: State<AppState>, ids: Vec<i64>) -> CmdResult<Vec<media_c
 }
 
 #[tauri::command(async)]
-fn start_purge(app: AppHandle, state: State<AppState>, batch_id: String) -> CmdResult<()> {
+fn start_purge(app: AppHandle, state: State<AppState>, batch_id: String, quick: Option<bool>) -> CmdResult<()> {
     spawn_job(&app, &state, "purge", move |st, progress| {
         let conn = st.db.conn()?;
-        journal::purge_batch_progress(&conn, &batch_id, &st.stop, progress)
+        journal::purge_batch_progress(&conn, &batch_id, quick.unwrap_or(false), &st.stop, progress)
+    })
+}
+
+/// Empty the whole quarantine: every batch that still has files in it, as one job.
+#[tauri::command(async)]
+fn start_purge_all(app: AppHandle, state: State<AppState>, quick: Option<bool>) -> CmdResult<()> {
+    spawn_job(&app, &state, "purge", move |st, progress| {
+        let conn = st.db.conn()?;
+        journal::purge_all_progress(&conn, quick.unwrap_or(false), &st.stop, progress)
     })
 }
 
@@ -1883,6 +1892,7 @@ pub fn run() {
             start_undo,
             start_delete,
             start_purge,
+            start_purge_all,
             library_years,
             year_copies,
             year_copy_pairs,

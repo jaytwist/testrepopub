@@ -453,7 +453,8 @@ export const api = {
   triageGroups: (kind: TriageKind, variant: "safe" | "edited" | null, offset: number, limit: number) =>
     invoke<TriageGroup[]>("triage_groups", { kind, variant, offset, limit }),
   triageCommit: (decisions: { key: string; keep: number[] }[]) => invoke<void>("triage_commit", { decisions }),
-  startPurge: (batchId: string) => invoke<void>("start_purge", { batchId }),
+  startPurge: (batchId: string, quick = false) => invoke<void>("start_purge", { batchId, quick }),
+  startPurgeAll: (quick = false) => invoke<void>("start_purge_all", { quick }),
 };
 
 /** Absolute path of an indexed file using the drive's native separator. */

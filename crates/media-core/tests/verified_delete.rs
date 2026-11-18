@@ -157,7 +157,7 @@ fn progress_counts_bytes_and_a_stopped_run_goes_on_later() {
     assert_eq!((row(&rep.batch_id).waiting as usize, row(&rep.batch_id).state.as_str()), (left, "done"));
     // Later, from the history: the rest goes, with the same checks.
     let last: Mutex<Option<Progress>> = Mutex::new(None);
-    let r = journal::purge_batch_progress(&conn, &rep.batch_id, &StopFlag::new(), &|p| *last.lock().unwrap() = Some(p)).unwrap();
+    let r = journal::purge_batch_progress(&conn, &rep.batch_id, false, &StopFlag::new(), &|p| *last.lock().unwrap() = Some(p)).unwrap();
     assert_eq!((r.restored as usize, r.failed), (left, 0), "{r:?}");
     assert_eq!(waiting(&e), 0);
     let last = last.into_inner().unwrap().unwrap();
