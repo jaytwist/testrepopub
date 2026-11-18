@@ -25,6 +25,7 @@ use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_updater::UpdaterExt;
 
 mod lane;
+mod logs;
 
 use lane::{Lane, LaneStatus};
 use media_core::analysis::{self, AnalysisOptions};
@@ -122,6 +123,32 @@ struct JobDone {
     result: serde_json::Value,
 }
 
+/// Jobs that move or delete files (by the start of their name).
+const DESTRUCTIVE: &[&str] = &["organize:run", "cleanup:", "dedupe:apply", "delete", "purge", "undo", "library:", "import"];
+
+/// Save a copy of the database unless one was saved within `every`. Failures are logged, never
+/// in the way of the work.
+fn snapshot_if_due(st: &AppState, why: &str, every: std::time::Duration) {
+    let fresh = st.db.snapshots().first().and_then(|p| std::fs::metadata(p).ok()).and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).is_some_and(|age| age < every);
+    if fresh {
+        return;
+    }
+    let t = std::time::Instant::now();
+    match st.db.snapshot(&why.replace(':', "-"), 3) {
+        Ok(p) => log::info!(target: "app", "database copy saved in {:.1?}: {}", t.elapsed(), p.display()),
+        Err(e) => log::warn!(target: "app", "database copy failed: {e:#}"),
+    }
+}
+
+/// For commands that change what a running job works from (keep rules, sources, people data):
+/// refused while a job runs, with a reason, instead of changing things under it.
+fn no_job(state: &AppState) -> CmdResult<()> {
+    match state.job.locked().as_ref() {
+        Some(j) => Err(format!("작업이 진행 중입니다({j}). 끝난 뒤에 다시 해 주세요.")),
+        None => Ok(()),
+    }
+}
+
 /// Run `f` on a worker thread as the single active job.
 fn spawn_job<F, R>(app: &AppHandle, state: &AppState, name: &str, f: F) -> CmdResult<()>
 where
@@ -158,15 +185,33 @@ where
         if let Some(ms) = std::env::var("MO_SLOW_JOB_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
             std::thread::sleep(std::time::Duration::from_millis(ms));
         }
+        log::info!(target: "app", "job {name}: start");
+        let started = std::time::Instant::now();
+        // Before work that moves or deletes files: a copy of the database, if the last one is
+        // not from today's session (it is the only record of where quarantined files belong).
+        if DESTRUCTIVE.iter().any(|d| name.starts_with(d)) {
+            snapshot_if_due(&st, &name, std::time::Duration::from_secs(6 * 3600));
+        }
         // A panic inside a job must not leave the app saying "작업 중" for ever.
         let res = media_core::guarded("작업", || f(&st, &progress));
+        match &res {
+            Ok(_) => log::info!(target: "app", "job {name}: done in {:.1?}", started.elapsed()),
+            Err(e) => log::warn!(target: "app", "job {name}: failed after {:.1?}: {e:#}", started.elapsed()),
+        }
         // After work that wrote a lot: refresh planner statistics and fold the write-ahead log
         // back (both cheap; failures do not matter).
         if let Ok(conn) = st.db.conn() {
             let _ = conn.execute_batch("PRAGMA optimize; PRAGMA wal_checkpoint(PASSIVE);");
         }
-        *st.job.locked() = None;
         st.changed();
+        // New GPS files, deletions, moves: keep places and trips current (cheap). (Guarded: the
+        // end of the job is announced whatever happens here.)
+        if let Err(e) = media_core::guarded("장소 정리", || refresh_places(&st)) {
+            log::warn!(target: "app", "places refresh failed: {e:#}");
+        }
+        // The job is over only now, right before saying so: a job started in between would
+        // otherwise be told "done" by this one's ending.
+        *st.job.locked() = None;
         st.lane.set_job_active(&app, false);
         if name == "scan" {
             st.lane.kick(&app, false);
@@ -175,10 +220,6 @@ where
         // behind, whether or not automatic analysis is on.
         if name == "scan" || name == "organize:plan" {
             st.lane.kick_backfill(&app);
-        }
-        // New GPS files, deletions, moves: keep places and trips current (cheap).
-        if let Err(e) = refresh_places(&st) {
-            eprintln!("places refresh failed: {e:#}");
         }
         let done = match res {
             Ok(r) => JobDone { job: name, ok: true, error: None, result: serde_json::to_value(r).unwrap_or_default() },
@@ -250,17 +291,22 @@ fn list_sources(state: State<AppState>) -> CmdResult<Vec<SourceRow>> {
 #[tauri::command(async)]
 fn add_source(state: State<AppState>, path: String) -> CmdResult<i64> {
     let conn = state.db.conn().map_err(err)?;
-    volumes::add_source(&conn, Path::new(&path)).map_err(err)
+    let id = volumes::add_source(&conn, Path::new(&path)).map_err(err)?;
+    state.changed();
+    Ok(id)
 }
 
 /// Stop tracking a folder. Index rows for files under it are removed; files on disk are untouched.
 #[tauri::command(async)]
 fn remove_source(state: State<AppState>, id: i64) -> CmdResult<()> {
+    no_job(&state)?;
     let conn = state.db.conn().map_err(err)?;
-    volumes::remove_source(&conn, id).map_err(err)
+    volumes::remove_source(&conn, id).map_err(err)?;
+    state.changed();
+    Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 /// Check for new files: one source, one drive (`volume_id`), one folder (`folder`, inside a
 /// registered source — nothing else is listed), or everything.
 fn start_scan(
@@ -497,6 +543,7 @@ fn answer_people_pair(state: State<AppState>, a: i64, b: i64, same: bool) -> Cmd
 /// "Delete face data": turn the feature off and forget every face, person and crop.
 #[tauri::command(async)]
 fn clear_face_data(state: State<AppState>) -> CmdResult<()> {
+    no_job(&state)?;
     let mut conn = state.db.conn().map_err(err)?;
     let mut opts = analysis::load_options(&conn).map_err(err)?;
     opts.people = false;
@@ -529,7 +576,9 @@ fn burst_extra_ids(state: State<AppState>) -> CmdResult<Vec<i64>> {
 #[tauri::command(async)]
 fn dismiss(state: State<AppState>, ids: Vec<i64>, kind: String) -> CmdResult<usize> {
     let mut conn = state.db.conn().map_err(err)?;
-    media_core::cleanup::dismiss(&mut conn, &ids, &kind).map_err(err)
+    let n = media_core::cleanup::dismiss(&mut conn, &ids, &kind).map_err(err)?;
+    state.changed();
+    Ok(n)
 }
 
 #[tauri::command(async)]
@@ -673,7 +722,9 @@ struct CompareInfo {
 #[tauri::command(async)]
 fn set_original(state: State<AppState>, id: i64) -> CmdResult<()> {
     let mut conn = state.db.conn().map_err(err)?;
-    media_core::identity::set_original(&mut conn, id).map_err(err)
+    media_core::identity::set_original(&mut conn, id).map_err(err)?;
+    state.changed();
+    Ok(())
 }
 
 #[tauri::command(async)]
@@ -685,6 +736,7 @@ fn get_dup_rules(state: State<AppState>) -> CmdResult<dedupe::DupRules> {
 /// Save the duplicate keep rules and re-pick keepers; returns how many groups changed.
 #[tauri::command(async)]
 fn set_dup_rules(state: State<AppState>, rules: dedupe::DupRules) -> CmdResult<usize> {
+    no_job(&state)?;
     let mut conn = state.db.conn().map_err(err)?;
     rules.save(&conn).map_err(err)?;
     state.changed();
@@ -1073,8 +1125,11 @@ fn dup_groups(state: State<AppState>, kind: String, offset: i64, limit: i64) -> 
 
 #[tauri::command(async)]
 fn set_keep(state: State<AppState>, group_id: i64, file_id: i64, keep: bool) -> CmdResult<()> {
+    no_job(&state)?;
     let conn = state.db.conn().map_err(err)?;
-    dedupe::set_keep(&conn, group_id, file_id, keep).map_err(err)
+    dedupe::set_keep(&conn, group_id, file_id, keep).map_err(err)?;
+    state.changed();
+    Ok(())
 }
 
 #[tauri::command(async)]
@@ -1455,10 +1510,10 @@ fn batches(state: State<AppState>) -> CmdResult<Vec<BatchRow>> {
 
 #[tauri::command(async)]
 fn start_undo(app: AppHandle, state: State<AppState>, batch_id: String) -> CmdResult<()> {
-    spawn_job(&app, &state, "undo", move |st, _| {
+    spawn_job(&app, &state, "undo", move |st, progress| {
         let conn = st.db.conn()?;
         volumes::refresh(&conn)?;
-        journal::undo_batch(&conn, &batch_id)
+        journal::undo_batch_with(&conn, &batch_id, &st.stop, progress)
     })
 }
 
@@ -1482,9 +1537,61 @@ fn triage_groups(state: State<AppState>, kind: String, variant: Option<String>, 
 /// Remember review decisions (kept files); removing the rest is a normal delete.
 #[tauri::command(async)]
 fn triage_commit(state: State<AppState>, decisions: Vec<media_core::triage::Decision>) -> CmdResult<()> {
+    no_job(&state)?;
     let mut conn = state.db.conn().map_err(err)?;
     media_core::triage::commit(&mut conn, &decisions).map_err(err)?;
+    state.changed();
     refresh_places(&state).map_err(err)
+}
+
+/// What to send when something went wrong: versions, the state of the database and of the
+/// drives, and the last lines of the log. No file contents, no photo names beyond paths that
+/// appear in error messages.
+#[tauri::command(async)]
+fn diagnostics(state: State<AppState>) -> CmdResult<String> {
+    let mut out = vec![
+        format!("Media Organizer v{} · {} {}", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH),
+        format!("시각: {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S")),
+        format!("데이터 폴더: {}", state.data_dir.display()),
+        format!("진행 중인 작업: {}", state.job.locked().clone().unwrap_or_else(|| "없음".into())),
+    ];
+    let size = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    let dbp = state.db.path();
+    out.push(format!(
+        "DB: {:.1} MB (+WAL {:.1} MB) · 저장된 복사본 {}개",
+        size(dbp) as f64 / 1e6,
+        size(&dbp.with_extension("db-wal")) as f64 / 1e6,
+        state.db.snapshots().len()
+    ));
+    if let Ok(conn) = state.db.conn() {
+        let n = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap_or(-1);
+        out.push(format!(
+            "스키마 v{} · 파일 {} (없어짐 {}, 격리 {}) · 얼굴 {} · 인물 {}",
+            db::schema_version(&conn).unwrap_or(-1),
+            n("SELECT COUNT(*) FROM files"),
+            n("SELECT COUNT(*) FROM files WHERE missing = 1"),
+            n("SELECT COUNT(*) FROM files WHERE quarantined = 1"),
+            n("SELECT COUNT(*) FROM faces"),
+            n("SELECT COUNT(*) FROM persons"),
+        ));
+        let mut st = conn.prepare("SELECT state, COUNT(*) FROM batches GROUP BY 1 ORDER BY 1").map_err(err)?;
+        let states: Vec<String> = st.query_map([], |r| Ok(format!("{} {}", r.get::<_, String>(0)?, r.get::<_, i64>(1)?))).map_err(err)?.flatten().collect();
+        out.push(format!("작업 기록: {} · 기록 {}줄 (대기 {})", states.join(", "), n("SELECT COUNT(*) FROM journal"), n("SELECT COUNT(*) FROM journal WHERE undone = 2")));
+        let mut st = conn.prepare("SELECT label, online, removable, (SELECT COUNT(*) FROM files f WHERE f.volume_id = v.id) FROM volumes v ORDER BY id").map_err(err)?;
+        for v in st.query_map([], |r| Ok(format!("드라이브 ‘{}’: {}{} · 파일 {}", r.get::<_, String>(0)?, if r.get::<_, i64>(1)? != 0 { "연결됨" } else { "연결 안 됨" }, if r.get::<_, i64>(2)? != 0 { " · 이동식" } else { "" }, r.get::<_, i64>(3)?))).map_err(err)?.flatten() {
+            out.push(v);
+        }
+    }
+    match state.db.quick_check() {
+        Ok(p) if p.is_empty() => out.push("DB 검사: 이상 없음".into()),
+        Ok(p) => out.push(format!("DB 검사: 문제 {}건 — {}", p.len(), p.join(" | "))),
+        Err(e) => out.push(format!("DB 검사 실패: {e:#}")),
+    }
+    out.push(format!("캐시: {:.1} MB", state.thumbs.size_on_disk() as f64 / 1e6));
+    out.push(String::new());
+    out.push("── 최근 로그 ──".into());
+    out.push(logs::tail(300));
+    Ok(out.join("\n"))
 }
 
 /// Which of these files are protected from deletion, and why.
@@ -1562,7 +1669,7 @@ fn prepend_exe_dir_to_path() {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     prepend_exe_dir_to_path();
-    tauri::Builder::default()
+    let ran = tauri::Builder::default()
         // One app per PC: a second start shows the first window instead of opening the same
         // database and the same drives twice.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -1609,6 +1716,7 @@ pub fn run() {
             let cache_dir = app.path().app_local_data_dir()?.join("cache");
             std::fs::create_dir_all(&data_dir)?;
             std::fs::create_dir_all(&cache_dir)?;
+            logs::init(&data_dir.join("logs"));
             dedupe::init_czkawka(&cache_dir);
             let db = Db::open(data_dir.join("library.db"))?;
             let interrupted = {
@@ -1646,15 +1754,38 @@ pub fn run() {
                 // Groups saved before copies on other drives counted as backups: decide them again
                 // once (nothing is read; later manual choices are not touched).
                 if let Err(e) = upgrade_dup_keepers(&handle.state::<AppState>()) {
-                    eprintln!("duplicate keepers upgrade failed: {e:#}");
+                    log::warn!(target: "app", "duplicate keepers upgrade failed: {e:#}");
                 }
                 // Libraries scanned before places existed already have GPS: name them now.
                 if let Err(e) = refresh_places(&handle.state::<AppState>()) {
-                    eprintln!("places refresh failed: {e:#}");
+                    log::warn!(target: "app", "places refresh failed: {e:#}");
                 }
                 std::thread::sleep(std::time::Duration::from_secs(5));
                 lane.kick(&handle, false);
                 lane.kick_backfill(&handle);
+                // Upkeep, behind everything else: is the database file sound, a copy of it once
+                // a day, and the cache without what is no longer needed.
+                std::thread::sleep(std::time::Duration::from_secs(20));
+                let st = handle.state::<AppState>();
+                match st.db.quick_check() {
+                    Ok(p) if p.is_empty() => {}
+                    Ok(p) => {
+                        log::error!(target: "app", "database check found problems: {}", p.join(" | "));
+                        let newest = st.db.snapshots().first().map(|p| p.display().to_string()).unwrap_or_else(|| "없음".into());
+                        let _ = handle.emit("notice", format!("데이터베이스 파일에 손상이 발견되었습니다({}건). 파일을 옮기거나 지우는 작업은 잠시 미루고, 「설정」의 「진단 정보 복사」 내용을 보내 주세요. 가장 최근에 저장된 복사본: {newest}", p.len()));
+                    }
+                    Err(e) => log::warn!(target: "app", "database check failed: {e:#}"),
+                }
+                if st.job.locked().is_none() {
+                    snapshot_if_due(&st, "daily", std::time::Duration::from_secs(24 * 3600));
+                }
+                if let Ok(conn) = st.db.conn() {
+                    match media_core::guarded("캐시 정리", || st.thumbs.prune(&conn, 20 << 30)) {
+                        Ok(r) if r.removed > 0 => log::info!(target: "app", "cache: removed {} files, {:.1} MB", r.removed, r.bytes as f64 / 1e6),
+                        Ok(_) => {}
+                        Err(e) => log::warn!(target: "app", "cache upkeep failed: {e:#}"),
+                    }
+                }
             });
             Ok(())
         })
@@ -1692,6 +1823,7 @@ pub fn run() {
             import_cancel,
             triage_groups,
             triage_commit,
+            diagnostics,
             move_faces,
             hide_people,
             set_person_cover,
@@ -1773,6 +1905,10 @@ pub fn run() {
             start_remove_copy_folders,
             open_folder,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Media Organizer");
+        .run(tauri::generate_context!());
+    // Not a panic into nothing: the reason is written down and, on Windows, shown.
+    if let Err(e) = ran {
+        logs::start_failed(&format!("{e:#}"));
+        std::process::exit(1);
+    }
 }

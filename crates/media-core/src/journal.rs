@@ -792,6 +792,8 @@ pub struct UndoReport {
     pub restored: u64,
     pub failed: u64,
     pub errors: Vec<String>,
+    /// Stopped before the end: the rest is still as the batch left it.
+    pub cancelled: bool,
 }
 
 struct JournalEntry {
@@ -809,6 +811,12 @@ struct JournalEntry {
 
 /// Reverse a batch, newest operation first.
 pub fn undo_batch(conn: &Connection, batch_id: &str) -> Result<UndoReport> {
+    undo_batch_with(conn, batch_id, &StopFlag::new(), &|_| {})
+}
+
+/// `undo_batch` as a job: says how far it is and can be stopped — what was not reached stays
+/// done, and undoing again goes on from there.
+pub fn undo_batch_with(conn: &Connection, batch_id: &str, stop: &StopFlag, progress: ProgressFn) -> Result<UndoReport> {
     let state: Option<String> = conn.query_row("SELECT state FROM batches WHERE id = ?", [batch_id], |r| r.get(0)).optional()?;
     match state.as_deref() {
         None => bail!("작업을 찾을 수 없습니다"),
@@ -842,7 +850,15 @@ pub fn undo_batch(conn: &Connection, batch_id: &str) -> Result<UndoReport> {
         rows
     };
     let mut rep = UndoReport::default();
-    for e in entries {
+    let total = entries.len() as u64;
+    for (i, e) in entries.into_iter().enumerate() {
+        if stop.is_stopped() {
+            rep.cancelled = true;
+            break;
+        }
+        if i % 20 == 0 {
+            progress(Progress::new("undo", "undo", i as u64, total, e.src_abs.clone()));
+        }
         let src = at_now(conn, &e.src_abs, e.src_volume, &e.src_rel);
         let dst = if e.op == "quarantine" { PathBuf::from(&e.dst_abs) } else { at_now(conn, &e.dst_abs, e.dst_volume, &e.dst_rel) };
         let res: Result<()> = (|| {
@@ -923,8 +939,9 @@ pub fn undo_batch(conn: &Connection, batch_id: &str) -> Result<UndoReport> {
             }
         }
     }
-    let state = if rep.failed == 0 { "undone" } else { "done" };
+    let state = if rep.failed == 0 && !rep.cancelled { "undone" } else { "done" };
     conn.execute("UPDATE batches SET state = ? WHERE id = ?", params![state, batch_id])?;
+    progress(Progress::new("undo", "done", total, total, ""));
     Ok(rep)
 }
 
@@ -944,7 +961,7 @@ pub fn purge_batch_progress(conn: &Connection, batch_id: &str, stop: &crate::Sto
     if r.cancelled {
         errors.insert(0, "중간에 멈췄습니다. 다시 누르면 남은 것부터 이어서 지웁니다".into());
     }
-    Ok(UndoReport { restored: r.deleted, failed: r.failed + r.kept, errors })
+    Ok(UndoReport { restored: r.deleted, failed: r.failed + r.kept, errors, cancelled: r.cancelled })
 }
 
 #[derive(Clone, Debug, Default, Serialize)]

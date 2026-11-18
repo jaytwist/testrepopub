@@ -159,11 +159,32 @@ pub fn attrs(_md: &std::fs::Metadata) -> Attrs {
 pub struct Rules {
     excluded: HashSet<String>,
     opts: ScanOptions,
+    volume_root: Option<PathBuf>,
+    library: Option<PathBuf>,
 }
+
+/// Excluded names that are system folders only at the top of a drive (`C:\Recovery`,
+/// `C:\Intel`, `C:\Temp`): deeper down the same name is a folder like any other — a user's
+/// "Recovery" full of recovered photos must not be skipped.
+const TOP_ONLY: &[&str] = &["recovery", "perflogs", "config.msi", "msocache", "esd", "inetpub", "intel", "amd", "nvidia", "drivers", "temp", "tmp"];
 
 impl Rules {
     pub fn new(opts: &ScanOptions) -> Self {
-        Self { excluded: opts.exclude_dirs.iter().map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect(), opts: opts.clone() }
+        Self {
+            excluded: opts.exclude_dirs.iter().map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect(),
+            opts: opts.clone(),
+            volume_root: None,
+            library: None,
+        }
+    }
+
+    /// The drive being read and the library folder: names that are system folders only at the
+    /// top of a drive are judged by where they are, and nothing inside the library is skipped
+    /// for its name (an event folder called "Cache" or "Temp" holds the user's photos).
+    pub fn at(mut self, volume_root: &Path, library: Option<PathBuf>) -> Self {
+        self.volume_root = Some(volume_root.to_path_buf());
+        self.library = library;
+        self
     }
 
     pub fn options(&self) -> &ScanOptions {
@@ -174,7 +195,12 @@ impl Rules {
     pub fn dir_skip(&self, path: &Path, md: Option<&std::fs::Metadata>) -> Option<Skip> {
         let name = path.file_name().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
         if self.excluded.contains(&name) {
-            return Some(Skip::SystemFolder);
+            let own = name == volumes::QUARANTINE_DIR || name == ".media-organizer";
+            let in_library = self.library.as_ref().is_some_and(|l| path.starts_with(l));
+            let deeper = TOP_ONLY.contains(&name.as_str()) && self.volume_root.as_ref().is_some_and(|r| path.parent() != Some(r.as_path()));
+            if own || !(in_library || deeper) {
+                return Some(Skip::SystemFolder);
+            }
         }
         let parent = path.parent().and_then(|p| p.file_name()).map(|s| s.to_string_lossy().to_lowercase());
         if parent.as_deref() == Some("users") && PROFILE_TEMPLATES.contains(&name.as_str()) {
@@ -275,6 +301,13 @@ mod tests {
         assert_eq!(r.dir_skip(Path::new("E:/DCIM/.thumbnails"), None), Some(Skip::SystemFolder));
         assert_eq!(r.dir_skip(Path::new("E:/backup/.hidden"), None), Some(Skip::HiddenFolder));
         assert_eq!(r.dir_skip(Path::new("C:/Users/me/Pictures"), None), None);
+        // With the drive known: system names count at its top only, and nothing in the library.
+        let r = Rules::new(&ScanOptions::default()).at(Path::new("E:/"), Some(PathBuf::from("E:/사진")));
+        assert_eq!(r.dir_skip(Path::new("E:/Recovery"), None), Some(Skip::SystemFolder));
+        assert_eq!(r.dir_skip(Path::new("E:/백업/Recovery"), None), None, "a user's folder of recovered photos");
+        assert_eq!(r.dir_skip(Path::new("E:/백업/cache"), None), Some(Skip::SystemFolder));
+        assert_eq!(r.dir_skip(Path::new("E:/사진/2015/2015-03/Cache"), None), None, "an event folder in the library");
+        assert_eq!(r.dir_skip(Path::new("E:/사진/.media-organizer"), None), Some(Skip::SystemFolder));
         assert_eq!(r.dir_skip(Path::new("D:/2019 제주도"), None), None);
         let mut o = ScanOptions::default();
         o.skip_hidden = false;

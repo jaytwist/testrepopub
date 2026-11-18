@@ -44,7 +44,7 @@ export default function ScanSettings() {
       <label className="check-row"><input type="checkbox" checked={o.skip_app_folders} onChange={(e) => set({ skip_app_folders: e.target.checked })} /> 프로그램·게임이 설치된 폴더 안의 이미지 건너뛰기 (DLL이 여러 개 있는 폴더)</label>
       <label className="check-row"><input type="checkbox" checked={o.skip_cloud_only} onChange={(e) => set({ skip_cloud_only: e.target.checked })} /> OneDrive "온라인 전용" 파일 건너뛰기 (읽으면 다운로드가 시작됨)</label>
       <div>
-        <label>건너뛸 폴더 이름 <span className="muted small">(어느 위치에 있든, 대소문자 무시)</span></label>
+        <label>건너뛸 폴더 이름 <span className="muted small">(대소문자 무시 · Recovery·Temp·Intel 같은 시스템 이름은 드라이브 맨 위에 있을 때만 · 라이브러리 폴더 안에서는 건너뛰지 않음)</span></label>
         <div className="chips excl">
           {o.exclude_dirs.map((d) => (
             <span key={d} className="chip">{d}<button onClick={() => set({ exclude_dirs: o.exclude_dirs.filter((x) => x !== d) })} title="목록에서 빼기">×</button></span>

@@ -34,6 +34,13 @@ pub fn hide_console(cmd: &mut Command) {
     let _ = cmd;
 }
 
+/// What `ThumbCache::prune` removed.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct PruneReport {
+    pub removed: u64,
+    pub bytes: u64,
+}
+
 #[derive(Clone)]
 pub struct ThumbCache {
     dir: PathBuf,
@@ -182,7 +189,7 @@ impl ThumbCache {
             if let Some(p) = out.parent() {
                 std::fs::create_dir_all(p)?;
             }
-            let tmp = out.with_extension(format!("part.{ext}"));
+            let tmp = out.with_extension(format!("part{}.{ext}", unique()));
             let mut cmd = Command::new("ffmpeg");
             cmd.args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
                 .arg(f.abs_path())
@@ -193,7 +200,15 @@ impl ThumbCache {
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped());
             hide_console(&mut cmd);
-            let o = cmd.output().context("ffmpeg를 찾을 수 없습니다")?;
+            // (A whole video is converted here: long ones take minutes; one that never ends
+            // is a damaged file.)
+            let o = match run_limited(cmd, std::time::Duration::from_secs(20 * 60)) {
+                Ok(o) => o,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e);
+                }
+            };
             if o.status.success() {
                 std::fs::rename(&tmp, &out)?;
                 return Ok(out);
@@ -202,6 +217,69 @@ impl ThumbCache {
             last_err = String::from_utf8_lossy(&o.stderr).lines().last().unwrap_or("").to_string();
         }
         bail!("ffmpeg 변환 실패: {last_err}")
+    }
+
+    /// Tidy the cache: entries of files that are gone from the index or have changed since
+    /// (a new entry was made for the new content), face crops of faces that no longer exist,
+    /// temporary files left by an interrupted run; then, if large previews and converted
+    /// videos — which can be made again — still take more than `max_bytes`, the ones not used
+    /// for the longest go. Thumbnails of files the index knows are never removed.
+    pub fn prune(&self, conn: &rusqlite::Connection, max_bytes: u64) -> Result<PruneReport> {
+        let mut rep = PruneReport::default();
+        let live: std::collections::HashSet<(i64, i64, i64)> = {
+            let mut st = conn.prepare("SELECT id, size, mtime FROM files")?;
+            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+            rows
+        };
+        let faces: std::collections::HashSet<i64> = {
+            let mut st = conn.prepare("SELECT id FROM faces")?;
+            let rows = st.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+            rows
+        };
+        let now = std::time::SystemTime::now();
+        let mut big: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
+        for sub in ["thumbs", "previews", "videos", "faces"] {
+            for e in walkdir::WalkDir::new(self.dir.join(sub)).into_iter().flatten().filter(|e| e.file_type().is_file()) {
+                let (path, md) = (e.path(), e.metadata().ok());
+                let len = md.as_ref().map(|m| m.len()).unwrap_or(0);
+                let name = e.file_name().to_string_lossy();
+                let stem = name.split('.').next().unwrap_or("");
+                let stale = if name.contains(".part") {
+                    // Being written right now, or left by a run that ended half-way.
+                    md.as_ref().and_then(|m| m.modified().ok()).and_then(|t| now.duration_since(t).ok()).is_some_and(|d| d.as_secs() > 3600)
+                } else if sub == "faces" {
+                    stem.parse::<i64>().map(|id| !faces.contains(&id)).unwrap_or(false)
+                } else {
+                    let mut it = stem.splitn(3, '-').map(|x| x.parse::<i64>());
+                    match (it.next(), it.next(), it.next()) {
+                        (Some(Ok(id)), Some(Ok(size)), Some(Ok(mtime))) => !live.contains(&(id, size, mtime)),
+                        _ => false,
+                    }
+                };
+                if stale {
+                    if std::fs::remove_file(path).is_ok() {
+                        rep.removed += 1;
+                        rep.bytes += len;
+                    }
+                } else if sub == "previews" || sub == "videos" {
+                    let used = md.as_ref().and_then(|m| m.accessed().or_else(|_| m.modified()).ok()).unwrap_or(std::time::UNIX_EPOCH);
+                    big.push((used, len, path.to_path_buf()));
+                }
+            }
+        }
+        let mut total: u64 = big.iter().map(|b| b.1).sum();
+        big.sort();
+        for (_, len, path) in big {
+            if total <= max_bytes {
+                break;
+            }
+            if std::fs::remove_file(&path).is_ok() {
+                total -= len;
+                rep.removed += 1;
+                rep.bytes += len;
+            }
+        }
+        Ok(rep)
     }
 
     pub fn size_on_disk(&self) -> u64 {
@@ -213,15 +291,59 @@ fn save_jpeg(img: &DynamicImage, out: &Path, quality: u8) -> Result<()> {
     if let Some(p) = out.parent() {
         std::fs::create_dir_all(p)?;
     }
-    let tmp = out.with_extension("part");
+    // (Its own temporary name: the same thumbnail may be made by two workers at once.)
+    let tmp = out.with_extension(format!("part{}", unique()));
     {
         let file = std::fs::File::create(&tmp)?;
         let mut w = std::io::BufWriter::new(file);
         let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut w, quality);
         img.to_rgb8().write_with_encoder(enc)?;
     }
-    std::fs::rename(&tmp, out)?;
+    if let Err(e) = std::fs::rename(&tmp, out) {
+        let _ = std::fs::remove_file(&tmp);
+        // Another worker finished the same thumbnail first: that is as good.
+        if !out.is_file() {
+            return Err(e.into());
+        }
+    }
     Ok(())
+}
+
+/// A number no other temporary file of this run has.
+fn unique() -> String {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!("{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Run a helper program (ffmpeg) to its end, but not for ever: a damaged video can make it
+/// read without end, and each one stuck would hold a worker. Past `limit` it is stopped and
+/// that counts as a failure of this file.
+fn run_limited(mut cmd: Command, limit: std::time::Duration) -> Result<std::process::Output> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().context("ffmpeg를 찾을 수 없습니다")?;
+    // Both pipes are read while it runs (a full pipe would stop it).
+    let drain = |r: Option<Box<dyn Read + Send>>| std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut r) = r {
+            let _ = r.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let out = drain(child.stdout.take().map(|s| Box::new(s) as Box<dyn Read + Send>));
+    let err = drain(child.stderr.take().map(|s| Box::new(s) as Box<dyn Read + Send>));
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait()? {
+            Some(s) => break s,
+            None if started.elapsed() >= limit => {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("시간 초과 ({}초): 파일이 손상되었을 수 있습니다", limit.as_secs());
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(40)),
+        }
+    };
+    Ok(std::process::Output { status, stdout: out.join().unwrap_or_default(), stderr: err.join().unwrap_or_default() })
 }
 
 fn decode_rust(path: &Path) -> Result<DynamicImage> {
@@ -264,14 +386,9 @@ pub fn ffmpeg_frame(path: &Path, is_video: bool, max: u32) -> Result<DynamicImag
         cmd.arg("-i")
             .arg(path)
             .args(["-frames:v", "1", "-vf", &format!("scale='min({max},iw)':-2"), "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stdin(Stdio::null());
         hide_console(&mut cmd);
-        let mut child = cmd.spawn().context("ffmpeg를 찾을 수 없습니다")?;
-        let mut buf = Vec::new();
-        child.stdout.take().unwrap().read_to_end(&mut buf)?;
-        child.wait()?;
+        let buf = run_limited(cmd, std::time::Duration::from_secs(60))?.stdout;
         if buf.is_empty() {
             bail!("no frame");
         }
@@ -383,4 +500,25 @@ pub fn warm(db: &Db, cache: &ThumbCache, stop: &StopFlag, progress: ProgressFn) 
     });
     let failed = failed.load(Ordering::Relaxed);
     Ok(WarmStats { generated: done.load(Ordering::Relaxed) - failed, failed, total })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A helper program that never finishes is stopped, and one that does is read to its end.
+    #[cfg(unix)]
+    #[test]
+    fn a_helper_that_hangs_is_stopped() {
+        let mut never = Command::new("sleep");
+        never.arg("30");
+        let t = std::time::Instant::now();
+        let e = run_limited(never, std::time::Duration::from_millis(300)).unwrap_err();
+        assert!(e.to_string().contains("시간 초과"), "{e}");
+        assert!(t.elapsed().as_secs() < 5);
+        let mut says = Command::new("sh");
+        says.args(["-c", "printf out; printf err >&2"]);
+        let o = run_limited(says, std::time::Duration::from_secs(10)).unwrap();
+        assert_eq!((o.stdout.as_slice(), o.stderr.as_slice(), o.status.success()), (&b"out"[..], &b"err"[..], true));
+    }
 }

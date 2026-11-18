@@ -156,7 +156,8 @@ pub fn scan_with(db: &Db, source_id: i64, sub: Option<&str>, opts: &ScanOptions,
     let quick = mode == Mode::Auto && crate::now_ts() - last_full < FULL_EVERY_SECS && volumes::dir_times_reliable(&vol_root);
 
     // 1. Walk, skipping anything that is not the user's own media.
-    let rules = Rules::new(opts);
+    let library = crate::importer::ImportSettings::load(&conn).ok().map(|s| s.target_dir).filter(|d| !d.trim().is_empty()).and_then(|d| volumes::canonical(Path::new(d.trim())).ok());
+    let rules = Rules::new(opts).at(&vol_root, library);
     let skipped = std::cell::RefCell::new(SkipCounts::default());
     let mut apps = AppDirDetector::default();
     let mut cands: Vec<Candidate> = Vec::new();

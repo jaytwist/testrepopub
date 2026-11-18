@@ -41,6 +41,16 @@ fn a_panicking_file_fails_alone() {
     assert_eq!(analysis::pending(&conn, false).unwrap().online, 0);
     let again = analysis::run(&db, &tc, None, 2, &stop, &analysis::PauseFlag::default(), &quiet).unwrap();
     assert_eq!(again.failed, 0);
+    // It may have been a passing problem (the file in use, the drive hiccuping): tried again
+    // another day, twice — then left alone.
+    for tries in 2..=3 {
+        conn.execute("UPDATE analysis SET analyzed_at = analyzed_at - 2 * 86400 WHERE dhash IS NULL", []).unwrap();
+        assert_eq!(analysis::pending(&conn, false).unwrap().online, 1, "due again before try {tries}");
+        let st = analysis::run(&db, &tc, None, 2, &stop, &analysis::PauseFlag::default(), &quiet).unwrap();
+        assert_eq!(st.failed, 1);
+    }
+    conn.execute("UPDATE analysis SET analyzed_at = analyzed_at - 2 * 86400 WHERE dhash IS NULL", []).unwrap();
+    assert_eq!(analysis::pending(&conn, false).unwrap().online, 0, "not for ever");
     std::env::remove_var("MO_TEST_PANIC");
 
     // The helpers behind this: a panic becomes an error, and a lock a thread died holding opens.

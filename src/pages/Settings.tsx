@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, clearSlowLog, fmtCount, fmtEta, onAnalysisStatus, slowLog, type AnalysisOptions, type AppInfo, type LaneStatus, type SlowEntry } from "../api";
+import { api, clearSlowLog, diagnostics, fmtCount, fmtEta, onAnalysisStatus, slowLog, type AnalysisOptions, type AppInfo, type LaneStatus, type SlowEntry } from "../api";
 import ScanSettings from "../components/ScanSettings";
 import { confirm } from "@tauri-apps/plugin-dialog";
 
@@ -110,6 +110,7 @@ export default function Settings() {
         <ScanSettings />
       </section>
 
+      <Diagnostics />
       <SlowLog />
 
       <section className="card">
@@ -141,6 +142,38 @@ export default function Settings() {
 
 /** What took long in this run: commands of half a second or more, and moments the screen did
  *  not react. Something to copy and send when the app felt stuck. */
+/** Everything worth sending when something went wrong, in one copy. */
+function Diagnostics() {
+  const [state, setState] = useState<"idle" | "busy" | "copied" | "failed">("idle");
+  const [text, setText] = useState("");
+  const copy = async () => {
+    setState("busy");
+    try {
+      const slow = slowLog().map((r) => `${new Date(r.at).toLocaleTimeString("ko-KR")}\t${r.kind === "stall" ? "화면 멈춤" : r.what}\t${(r.ms / 1000).toFixed(1)}초`).join("\n");
+      const all = `${await diagnostics()}\n\n── 느린 작업 ──\n${slow || "(없음)"}`;
+      setText(all);
+      await navigator.clipboard.writeText(all);
+      setState("copied");
+    } catch {
+      setState("failed");
+    }
+  };
+  return (
+    <section className="card">
+      <h2>진단 정보</h2>
+      <p className="muted small">
+        문제가 생겼을 때 보내 주실 내용입니다: 앱 버전, 데이터베이스와 드라이브 상태, 최근 로그, 느린 작업 기록. 사진 내용은 들어가지 않고, 오류 메시지에 나온 파일 경로만 포함됩니다.
+        로그 파일은 데이터 폴더의 logs 에 14일치가 남습니다.
+      </p>
+      <div className="btn-row">
+        <button className="btn small" disabled={state === "busy"} onClick={copy}>{state === "busy" ? "모으는 중…" : state === "copied" ? "복사됨" : "진단 정보 복사"}</button>
+        {state === "failed" && <span className="warn-text small">복사하지 못했습니다. 아래 내용을 직접 선택해 복사하세요.</span>}
+      </div>
+      {text && <pre className="slow-log small mono" style={{ whiteSpace: "pre-wrap", maxHeight: 220, overflow: "auto" }}>{text}</pre>}
+    </section>
+  );
+}
+
 function SlowLog() {
   const [rows, setRows] = useState<SlowEntry[]>(slowLog());
   const [copied, setCopied] = useState(false);

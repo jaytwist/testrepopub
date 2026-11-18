@@ -251,6 +251,11 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS face_rejects_person ON face_rejects(person_id);
     ALTER TABLE sources ADD COLUMN temp INTEGER NOT NULL DEFAULT 0;
     "#,
+    // 10: how often analysing a file failed. A file that could not be read once (in use,
+    //     drive hiccup) is tried again another day, a few times — not never, and not for ever.
+    r#"
+    ALTER TABLE analysis ADD COLUMN tries INTEGER NOT NULL DEFAULT 0;
+    "#,
 ];
 
 pub fn schema_version(conn: &Connection) -> Result<i64> {
@@ -260,6 +265,10 @@ pub fn schema_version(conn: &Connection) -> Result<i64> {
 /// Apply pending migrations, each in its own transaction.
 pub fn migrate(conn: &Connection) -> Result<()> {
     let mut v = schema_version(conn)? as usize;
+    // A database written by a newer version: an older app would misread it (and write to it).
+    if v > MIGRATIONS.len() {
+        anyhow::bail!("이 데이터베이스는 더 새 버전의 앱이 만든 것입니다 (v{v} > v{}). 앱을 최신 버전으로 업데이트하세요.", MIGRATIONS.len());
+    }
     while v < MIGRATIONS.len() {
         // Statement by statement, so that a column a migration adds that is already there (a
         // migration run again) does not stop the upgrade.
@@ -297,6 +306,49 @@ impl Db {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// A quick look at whether the database file is sound (`PRAGMA quick_check`): the problems
+    /// found, empty if none. Cheap enough for every start (it does not verify the indexes).
+    pub fn quick_check(&self) -> Result<Vec<String>> {
+        let conn = self.conn()?;
+        let mut st = conn.prepare("PRAGMA quick_check(20)")?;
+        let rows = st.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.into_iter().filter(|r| r != "ok").collect())
+    }
+
+    /// Save a copy of the database beside it (`backups/library-<when>-<why>.db`) and keep the
+    /// newest `keep`. The database is the only record of where quarantined files came from and
+    /// of every mark the user made; before work that moves or deletes files a copy is cheap
+    /// insurance. Returns the copy's path.
+    pub fn snapshot(&self, why: &str, keep: usize) -> Result<PathBuf> {
+        let dir = self.path.parent().unwrap_or(Path::new(".")).join("backups");
+        std::fs::create_dir_all(&dir)?;
+        let why: String = why.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
+        let to = dir.join(format!("library-{}-{why}.db", chrono::Local::now().format("%Y%m%d-%H%M%S")));
+        let conn = self.conn()?;
+        // A consistent copy while the app keeps using the database (no half-written pages).
+        let _ = std::fs::remove_file(&to);
+        conn.execute("VACUUM INTO ?", [to.to_string_lossy()])?;
+        let mut old: Vec<PathBuf> = std::fs::read_dir(&dir)?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("library-") && n.to_string_lossy().ends_with(".db")))
+            .collect();
+        old.sort();
+        for p in old.iter().rev().skip(keep.max(1)) {
+            let _ = std::fs::remove_file(p);
+        }
+        Ok(to)
+    }
+
+    /// The saved copies, newest first.
+    pub fn snapshots(&self) -> Vec<PathBuf> {
+        let dir = self.path.parent().unwrap_or(Path::new(".")).join("backups");
+        let mut v: Vec<PathBuf> = std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "db")).collect();
+        v.sort();
+        v.reverse();
+        v
     }
 
     pub fn conn(&self) -> Result<Connection> {

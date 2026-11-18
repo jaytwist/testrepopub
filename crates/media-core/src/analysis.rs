@@ -27,6 +27,8 @@ use crate::{Db, Progress, ProgressFn, StopFlag};
 pub const ANALYSIS_VERSION: i64 = 1;
 /// Bump when face detection/embedding changes.
 pub const FACE_VERSION: i64 = 1;
+/// A file whose analysis failed is tried again this many times, a day apart.
+const RETRIES: i64 = 2;
 /// Longest side of the image used for analysis.
 const ANALYSIS_SIZE: u32 = 1280;
 const CHUNK: usize = 48;
@@ -243,7 +245,8 @@ pub struct Pending {
 
 fn pending_where(faces: bool) -> String {
     format!(
-        "f.missing = 0 AND f.quarantined = 0 AND (a.file_id IS NULL OR a.version < {ANALYSIS_VERSION}{})",
+        "f.missing = 0 AND f.quarantined = 0 AND (a.file_id IS NULL OR a.version < {ANALYSIS_VERSION}{}
+            OR (a.tries BETWEEN 1 AND {RETRIES} AND a.analyzed_at < CAST(strftime('%s', 'now') AS INTEGER) - 86400))",
         if faces { format!(" OR (a.face_version < {FACE_VERSION} AND f.kind IN ('photo','raw'))") } else { String::new() }
     )
 }
@@ -365,7 +368,7 @@ fn save(conn: &mut Connection, cache: &ThumbCache, outs: Vec<Result<FileOut, (i6
                         dhash = excluded.dhash,
                         face_count = COALESCE(excluded.face_count, analysis.face_count),
                         face_version = MAX(excluded.face_version, analysis.face_version),
-                        analyzed_at = excluded.analyzed_at",
+                        analyzed_at = excluded.analyzed_at, tries = 0",
                     params![o.id, ANALYSIS_VERSION, o.sharpness, o.dhash, o.faces.as_ref().map(|v| v.len() as i64), face_version.max(prev_face_version), now],
                 )?;
                 if let Some(faces) = o.faces {
@@ -393,9 +396,9 @@ fn save(conn: &mut Connection, cache: &ThumbCache, outs: Vec<Result<FileOut, (i6
                 log::warn!("analysis failed for {id}: {e}");
                 // Record the attempt so a broken file is not retried on every pass.
                 tx.execute(
-                    "INSERT INTO analysis(file_id, version, analyzed_at, face_version) VALUES (?1, ?2, ?3, ?4)
+                    "INSERT INTO analysis(file_id, version, analyzed_at, face_version, tries) VALUES (?1, ?2, ?3, ?4, 1)
                      ON CONFLICT(file_id) DO UPDATE SET version = excluded.version, analyzed_at = excluded.analyzed_at,
-                        face_version = excluded.face_version",
+                        face_version = excluded.face_version, tries = analysis.tries + 1",
                     params![id, ANALYSIS_VERSION, now, FACE_VERSION],
                 )?;
                 stats.failed += 1;

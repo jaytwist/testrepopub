@@ -478,6 +478,10 @@ export function onDriveConnected(cb: (d: { volume_id: number; label: string }) =
 export function onAnalysisDone(cb: () => void): Promise<UnlistenFn> {
   return listen("analysis-done", () => cb());
 }
+/** Something the user should know, found in the background (a damaged database file, …). */
+export const onNotice = (cb: (text: string) => void) => listen<string>("notice", (e) => cb(e.payload));
+/** What to send when something went wrong: versions, database and drive state, recent log. */
+export const diagnostics = () => invoke<string>("diagnostics");
 /** The window was closed while a job runs: the job stops first, then the app closes. */
 export const onClosing = (cb: () => void) => listen("closing", () => cb());
 export function onJobDone(cb: (d: JobDone) => void): Promise<UnlistenFn> {

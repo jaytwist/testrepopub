@@ -304,7 +304,10 @@ impl Lane {
                         while ticking.load(Ordering::Relaxed) {
                             std::thread::sleep(Duration::from_secs(1));
                             waited += Duration::from_secs(1);
-                            if waited >= regroup_every() {
+                            // Not while the user's job runs: regrouping rewrites the tables
+                            // that job works from, and competes with it for the database. It
+                            // is done as soon as the job is over.
+                            if waited >= regroup_every() && !app.state::<AppState>().lane.job_active.load(Ordering::Relaxed) {
                                 waited = Duration::ZERO;
                                 let st = app.state::<AppState>();
                                 if let Err(e) = media_core::guarded("분석 후 정리", || crate::post_analysis(&st)) {

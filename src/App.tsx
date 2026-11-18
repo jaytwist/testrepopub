@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useState } from "react";
 import {
-  api, onAnalysisStatus, onCardConnected, onDriveConnected, type Card, onClosing, onJobDone, onProgress, onUpdateProgress, type AppInfo, type FileFilter, type GroupBy, type JobDone,
+  api, onAnalysisStatus, onCardConnected, onDriveConnected, type Card, onClosing, onJobDone, onNotice, onProgress, onUpdateProgress, type AppInfo, type FileFilter, type GroupBy, type JobDone,
   type LaneStatus, type LibraryStats, type Progress, type UpdateInfo, type UpdateProgress, fmtBytes, fmtCount, fmtEta,
 } from "./api";
 import Library from "./pages/Library";
@@ -260,6 +260,7 @@ export default function App() {
       }
       if (notes.length) setNotice(notes.join("\n"));
     });
+    const n = onNotice((text) => setNotice(text));
     const c = onClosing(() => setNotice("작업을 안전한 지점에서 멈추는 중입니다. 멈추면 창이 닫힙니다 — 큰 파일을 복사하는 중이면 그 파일이 끝날 때까지 기다려 주세요."));
     // An error nobody handled (a failed command, say) is shown instead of vanishing.
     const onRejected = (e: PromiseRejectionEvent) => {
@@ -284,6 +285,7 @@ export default function App() {
       p.then((u) => u());
       d.then((u) => u());
       c.then((u) => u());
+      n.then((u) => u());
     };
   }, []);
 

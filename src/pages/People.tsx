@@ -102,7 +102,11 @@ export default function People() {
     const chosen = (people ?? []).filter((p) => selected.has(p.id));
     if (chosen.length < 2) return;
     const names = new Set(chosen.map((p) => p.name).filter(Boolean));
-    if (names.size > 1 && !(await confirm(`서로 다른 이름(${[...names].join(", ")})이 있습니다. 그래도 한 사람으로 합칠까요?`, { title: "합치기", kind: "warning" }))) return;
+    // Merging cannot be undone: always asked, and louder when the names differ.
+    const ask = names.size > 1
+      ? `서로 다른 이름(${[...names].join(", ")})이 있습니다. 그래도 한 사람으로 합칠까요?\n\n합치면 되돌릴 수 없습니다.`
+      : `선택한 ${chosen.length}명을 한 사람으로 합칠까요?\n\n합치면 되돌릴 수 없습니다.`;
+    if (!(await confirm(ask, { title: "합치기", kind: "warning" }))) return;
     // Keep the named one, else the one with the most photos.
     const into = [...chosen].sort((a, b) => Number(!!b.name) - Number(!!a.name) || b.photos - a.photos)[0];
     await api.mergePeople(into.id, chosen.filter((p) => p.id !== into.id).map((p) => p.id));
