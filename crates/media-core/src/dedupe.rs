@@ -723,12 +723,22 @@ pub struct ApplyReport {
 
 /// Quarantine every non-kept member of the given groups (or all unresolved groups of `kind`).
 pub fn apply(db: &Db, kind: &str, group_ids: Option<Vec<i64>>, stop: &StopFlag, progress: ProgressFn) -> Result<ApplyReport> {
+    apply_in(db, kind, group_ids, None, stop, progress)
+}
+
+/// `apply` inside `scope` only: of each group, only the members not kept that are inside go;
+/// the kept one may be anywhere. A group with members to go left outside stays open.
+pub fn apply_in(db: &Db, kind: &str, group_ids: Option<Vec<i64>>, scope: Option<&crate::db::Scope>, stop: &StopFlag, progress: ProgressFn) -> Result<ApplyReport> {
     let conn = db.conn()?;
     volumes::refresh(&conn)?;
+    let inside = crate::db::and_scope(scope, "f");
     let ids: Vec<i64> = match group_ids {
         Some(v) => v,
         None => {
-            let mut st = conn.prepare("SELECT id FROM dup_groups WHERE kind = ? AND resolved = 0")?;
+            let mut st = conn.prepare(&format!(
+                "SELECT g.id FROM dup_groups g WHERE g.kind = ? AND g.resolved = 0
+                   AND EXISTS (SELECT 1 FROM dup_members m JOIN files f ON f.id = m.file_id WHERE m.group_id = g.id AND m.keep = 0{inside})"
+            ))?;
             let rows = st.query_map([kind], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
             rows
         }
@@ -747,10 +757,10 @@ pub fn apply(db: &Db, kind: &str, group_ids: Option<Vec<i64>>, stop: &StopFlag, 
     let total = ids.len() as u64;
     // Protection is checked once for everything that would go (not group by group).
     let protected: std::collections::HashSet<i64> = {
-        let mut st = conn.prepare(
+        let mut st = conn.prepare(&format!(
             "SELECT m.file_id FROM dup_members m JOIN files f ON f.id = m.file_id
-             WHERE m.group_id = ? AND m.keep = 0 AND f.missing = 0 AND f.quarantined = 0",
-        )?;
+             WHERE m.group_id = ? AND m.keep = 0 AND f.missing = 0 AND f.quarantined = 0{inside}"
+        ))?;
         let mut drop = Vec::new();
         for gid in &ids {
             for r in st.query_map([gid], |r| r.get::<_, i64>(0))? {
@@ -777,8 +787,14 @@ pub fn apply(db: &Db, kind: &str, group_ids: Option<Vec<i64>>, stop: &StopFlag, 
             rep.errors.push(format!("그룹 {gid}: 보존할 파일이 없거나 연결되지 않아 건너뜀"));
             continue;
         }
+        let mut left_outside = false;
         for (f, keep) in &members {
             if *keep {
+                continue;
+            }
+            // Outside the work scope: never touched here.
+            if scope.is_some_and(|s| !s.contains(f.volume_id, &f.rel_path)) {
+                left_outside = true;
                 continue;
             }
             if protected.contains(&f.id) {
@@ -802,7 +818,9 @@ pub fn apply(db: &Db, kind: &str, group_ids: Option<Vec<i64>>, stop: &StopFlag, 
                 Err(e) => rep.errors.push(e.to_string()),
             }
         }
-        conn.execute("UPDATE dup_groups SET resolved = 1 WHERE id = ?", [gid])?;
+        if !left_outside {
+            conn.execute("UPDATE dup_groups SET resolved = 1 WHERE id = ?", [gid])?;
+        }
     }
     journal::finish_batch(&conn, &batch)?;
     if rep.quarantined == 0 {

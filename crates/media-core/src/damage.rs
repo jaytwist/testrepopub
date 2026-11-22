@@ -390,9 +390,15 @@ const LISTED: &str = "f.missing = 0 AND f.quarantined = 0 AND NOT EXISTS (SELECT
 
 /// The files that look damaged or could not be opened, in folder order.
 pub fn list(conn: &Connection, offset: i64, limit: i64) -> Result<DamagedList> {
+    list_in(conn, None, offset, limit)
+}
+
+/// `list` for the files inside the work scope.
+pub fn list_in(conn: &Connection, scope: Option<&crate::db::Scope>, offset: i64, limit: i64) -> Result<DamagedList> {
     adopt_unreadable(conn)?;
+    let inside = crate::db::and_scope(scope, "f");
     let (total, bytes): (i64, i64) = conn.query_row(
-        &format!("SELECT COUNT(*), COALESCE(SUM(f.size), 0) FROM files f JOIN suggestions s ON s.file_id = f.id AND s.kind = 'damaged' WHERE {LISTED}"),
+        &format!("SELECT COUNT(*), COALESCE(SUM(f.size), 0) FROM files f JOIN suggestions s ON s.file_id = f.id AND s.kind = 'damaged' WHERE {LISTED}{inside}"),
         [],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
@@ -401,7 +407,7 @@ pub fn list(conn: &Connection, offset: i64, limit: i64) -> Result<DamagedList> {
                 (SELECT COUNT(*) FROM files g WHERE COALESCE(g.prehash, g.hash) = COALESCE(f.prehash, f.hash) AND g.id != f.id AND g.missing = 0 AND g.quarantined = 0
                    AND NOT EXISTS (SELECT 1 FROM suggestions x WHERE x.file_id = g.id AND x.kind = 'damaged'))
          FROM files f JOIN suggestions s ON s.file_id = f.id AND s.kind = 'damaged' JOIN volumes v ON v.id = f.volume_id
-         WHERE {LISTED} ORDER BY f.volume_id, f.rel_path LIMIT ?1 OFFSET ?2"
+         WHERE {LISTED}{inside} ORDER BY f.volume_id, f.rel_path LIMIT ?1 OFFSET ?2"
     ))?;
     let mut files: Vec<DamagedFile> = st
         .query_map(params![limit, offset], |r| {
@@ -453,9 +459,15 @@ pub struct DamagedDeleteReport {
 /// differ from it by nature), and nothing about them is remembered: a good copy of the same
 /// photo is still welcome in the library.
 pub fn delete(db: &Db, ids: &[i64], stop: &StopFlag, progress: ProgressFn) -> Result<DamagedDeleteReport> {
+    delete_in(db, ids, None, stop, progress)
+}
+
+/// `delete`, only for files inside the work scope.
+pub fn delete_in(db: &Db, ids: &[i64], scope: Option<&crate::db::Scope>, stop: &StopFlag, progress: ProgressFn) -> Result<DamagedDeleteReport> {
     let conn = db.conn()?;
     let mut rep = DamagedDeleteReport::default();
-    let mut st = conn.prepare(&format!("SELECT 1 FROM files f JOIN suggestions s ON s.file_id = f.id AND s.kind = 'damaged' WHERE f.id = ? AND {LISTED}"))?;
+    let inside = crate::db::and_scope(scope, "f");
+    let mut st = conn.prepare(&format!("SELECT 1 FROM files f JOIN suggestions s ON s.file_id = f.id AND s.kind = 'damaged' WHERE f.id = ? AND {LISTED}{inside}"))?;
     let mut take: Vec<i64> = Vec::new();
     for id in ids {
         if st.exists([id])? {

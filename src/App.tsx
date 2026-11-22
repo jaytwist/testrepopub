@@ -1,7 +1,7 @@
 import { createContext, useContext, useEffect, useState } from "react";
 import {
   api, onAnalysisStatus, onCardConnected, onDriveConnected, type Card, onClosing, onJobDone, onNotice, onProgress, onUpdateProgress, type AppInfo, type FileFilter, type GroupBy, type JobDone,
-  type LaneStatus, type LibraryStats, type Progress, type UpdateInfo, type UpdateProgress, fmtBytes, fmtCount, fmtEta,
+  type LaneStatus, type LibraryStats, type Progress, type Scope, type UpdateInfo, type UpdateProgress, fmtBytes, fmtCount, fmtEta,
 } from "./api";
 import Library from "./pages/Library";
 import Sources from "./pages/Sources";
@@ -49,6 +49,14 @@ interface JobCtx {
 
 export const JobContext = createContext<JobCtx>({ running: null, progress: null, lastDone: null, version: 0, setRunning: () => {} });
 export const useJob = () => useContext(JobContext);
+
+/** The work scope, shared by 「라이브러리」 and 「정리」 (stored by the app, so both always agree). */
+interface ScopeCtx {
+  scope: Scope | null;
+  setScope: (s: Scope | null) => Promise<void>;
+}
+export const ScopeContext = createContext<ScopeCtx>({ scope: null, setScope: async () => {} });
+export const useScope = () => useContext(ScopeContext);
 
 const STAGE_NAMES: Record<string, string> = {
   walk: "파일 찾는 중",
@@ -158,6 +166,13 @@ export default function App() {
   const [progress, setProgress] = useState<Progress | null>(null);
   const [lastDone, setLastDone] = useState<JobDone | null>(null);
   const [version, setVersion] = useState(0);
+  const [scope, setScopeState] = useState<Scope | null>(null);
+  useEffect(() => {
+    api.getWorkScope().then(setScopeState).catch(() => {});
+  }, []);
+  const setScope = async (s: Scope | null) => {
+    setScopeState(await api.setWorkScope(s));
+  };
   const [stats, setStats] = useState<LibraryStats | null>(null);
   const [info, setInfo] = useState<AppInfo | null>(null);
   const [toast, setToast] = useState<{ ok: boolean; text: string } | null>(null);
@@ -328,6 +343,7 @@ export default function App() {
   return (
     <NavContext.Provider value={nav}>
     <JobContext.Provider value={{ running, progress, lastDone, version, setRunning: markRunning }}>
+    <ScopeContext.Provider value={{ scope, setScope }}>
       <div className="app">
         <aside className="sidebar">
           <div className="brand">
@@ -482,6 +498,7 @@ export default function App() {
           </div>
         )}
       </div>
+    </ScopeContext.Provider>
     </JobContext.Provider>
     </NavContext.Provider>
   );

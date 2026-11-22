@@ -527,6 +527,90 @@ fn copy_elsewhere_sql() -> String {
 // Filters
 // ---------------------------------------------------------------------------------------------
 
+/// Where the user works now: one drive, or one folder on it with everything below. Screens
+/// show and change only what is inside; files outside may be what stays (the original of a
+/// copy inside), never what goes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Scope {
+    pub volume_id: i64,
+    /// Volume-relative, `/`-separated, no leading or trailing slash; "" = the whole drive.
+    #[serde(default)]
+    pub dir: String,
+}
+
+impl Scope {
+    pub fn new(volume_id: i64, dir: &str) -> Self {
+        Self { volume_id, dir: dir.replace('\\', "/").trim_matches('/').to_string() }
+    }
+
+    /// SQL: file `alias` is inside. Values are written into the text (an integer and a quoted
+    /// string), so the condition fits any query.
+    pub fn sql(&self, alias: &str) -> String {
+        let v = format!("{alias}.volume_id = {}", self.volume_id);
+        if self.dir.is_empty() {
+            return v;
+        }
+        let d = self.dir.replace('\'', "''");
+        // SQLite counts characters, not bytes (a Korean name is three bytes a character).
+        format!("({v} AND substr({alias}.rel_path, 1, {}) = '{d}/')", self.dir.chars().count() + 1)
+    }
+
+    /// Whether a file (its volume and volume-relative path) is inside.
+    pub fn contains(&self, volume_id: i64, rel_path: &str) -> bool {
+        volume_id == self.volume_id && (self.dir.is_empty() || rel_path.starts_with(&format!("{}/", self.dir)))
+    }
+
+    /// Whether a folder (volume-relative) is inside — the scope's own folder included.
+    pub fn contains_dir(&self, volume_id: i64, dir: &str) -> bool {
+        let dir = dir.trim_matches('/');
+        volume_id == self.volume_id && (self.dir.is_empty() || dir == self.dir || dir.starts_with(&format!("{}/", self.dir)))
+    }
+
+    /// The scope the user chose, if any (and its drive is still known).
+    pub fn load(conn: &Connection) -> Result<Option<Self>> {
+        let v: Option<String> = conn.query_row("SELECT value FROM settings WHERE key = 'work_scope'", [], |r| r.get(0)).optional()?;
+        let Some(s) = v.and_then(|s| serde_json::from_str::<Scope>(&s).ok()) else { return Ok(None) };
+        let known: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM volumes WHERE id = ?)", [s.volume_id], |r| r.get(0))?;
+        Ok(known.then_some(s))
+    }
+
+    /// Remember a scope; `None` = everything again.
+    pub fn save(conn: &Connection, scope: Option<&Scope>) -> Result<()> {
+        match scope {
+            Some(s) => conn.execute(
+                "INSERT INTO settings(key, value) VALUES ('work_scope', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [serde_json::to_string(&Scope::new(s.volume_id, &s.dir))?],
+            )?,
+            None => conn.execute("DELETE FROM settings WHERE key = 'work_scope'", [])?,
+        };
+        Ok(())
+    }
+}
+
+/// `AND <inside>` for a query, or nothing.
+pub fn and_scope(scope: Option<&Scope>, alias: &str) -> String {
+    scope.map(|s| format!(" AND {}", s.sql(alias))).unwrap_or_default()
+}
+
+/// A folder and how much is directly in it.
+#[derive(Clone, Debug, Serialize)]
+pub struct DirCount {
+    pub dir: String,
+    pub files: i64,
+    pub bytes: i64,
+}
+
+/// Every folder of a drive that holds photos or videos, with what is directly in it (the
+/// screen adds up the folders below).
+pub fn folder_tree(conn: &Connection, volume_id: i64) -> Result<Vec<DirCount>> {
+    let mut st = conn.prepare(&format!(
+        "SELECT {DIR_SQL} d, COUNT(*), COALESCE(SUM(f.size), 0) FROM files f
+         WHERE f.volume_id = ? AND f.missing = 0 AND f.quarantined = 0 GROUP BY d ORDER BY d"
+    ))?;
+    let rows = st.query_map([volume_id], |r| Ok(DirCount { dir: r.get(0)?, files: r.get(1)?, bytes: r.get(2)? }))?.collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FileFilter {
@@ -579,6 +663,8 @@ pub struct FileFilter {
     /// files — the original may be elsewhere, and the photo would seem to be missing.
     #[serde(default)]
     pub stack_copies: bool,
+    /// With `volume_id`: this folder and everything below it (the work scope).
+    pub under: Option<String>,
     /// 'taken' (default) | 'mtime' | 'size' | 'name' | 'resolution' | 'duration'
     pub sort: Option<String>,
     /// Default: true (newest / largest first).
@@ -707,6 +793,9 @@ impl FileFilter {
             } else {
                 w.push(format!("f.ext IN ({})", group.iter().map(|g| format!("'{g}'")).collect::<Vec<_>>().join(",")));
             }
+        }
+        if let (Some(v), Some(u)) = (self.volume_id, &self.under) {
+            w.push(Scope::new(v, u).sql("f"));
         }
         if let Some(d) = &self.dir {
             w.push(format!("{DIR_SQL} = ?"));

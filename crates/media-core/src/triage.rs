@@ -49,6 +49,46 @@ const LIVE: &str = "f.missing = 0 AND f.quarantined = 0";
 /// Groups still to review. `kind`: "burst" | "exact" | "similar_image" | "similar_video".
 /// `variant` narrows similar photos: "safe" (resized / recompressed copies) or "edited".
 pub fn groups(conn: &Connection, kind: &str, variant: Option<&str>, offset: i64, limit: i64) -> Result<Vec<TriageGroup>> {
+    groups_scoped(conn, kind, variant, None, offset, limit)
+}
+
+/// `groups` for the work scope: groups with a member inside; members outside stay (locked,
+/// role "outside") — they may be what is kept, never what goes.
+pub fn groups_scoped(conn: &Connection, kind: &str, variant: Option<&str>, scope: Option<&crate::db::Scope>, offset: i64, limit: i64) -> Result<Vec<TriageGroup>> {
+    let Some(scope) = scope else { return groups_all(conn, kind, variant, offset, limit) };
+    let all: Vec<i64> = match kind {
+        "burst" => burst_ids(conn, i64::MAX, 0)?,
+        "exact" | "similar_image" | "similar_video" => dup_ids(conn, kind, variant, i64::MAX, 0)?,
+        _ => bail!("unknown review kind {kind}"),
+    };
+    let sql = match kind {
+        "burst" => format!("SELECT DISTINCT b.burst_id FROM bursts b JOIN files f ON f.id = b.file_id WHERE {LIVE} AND {}", scope.sql("f")),
+        _ => format!("SELECT DISTINCT m.group_id FROM dup_members m JOIN files f ON f.id = m.file_id WHERE {LIVE} AND {}", scope.sql("f")),
+    };
+    let touching: HashSet<i64> = {
+        let mut st = conn.prepare(&sql)?;
+        let v = st.query_map([], |r| r.get::<_, i64>(0))?.collect::<rusqlite::Result<_>>()?;
+        v
+    };
+    let page: Vec<i64> = all.into_iter().filter(|g| touching.contains(g)).skip(offset.max(0) as usize).take(limit.max(0) as usize).collect();
+    let mut groups = match kind {
+        "burst" => load_bursts(conn, page)?,
+        _ => load_dups(conn, kind, page)?,
+    };
+    for g in groups.iter_mut() {
+        for m in &mut g.members {
+            if !scope.contains(m.file.volume_id, &m.file.rel_path) {
+                m.role = Some("outside".into());
+                m.locked = true;
+                m.keep = true;
+            }
+        }
+    }
+    groups.retain(|g| g.members.len() >= 2 && g.members.iter().any(|m| !m.locked));
+    Ok(groups)
+}
+
+fn groups_all(conn: &Connection, kind: &str, variant: Option<&str>, offset: i64, limit: i64) -> Result<Vec<TriageGroup>> {
     match kind {
         "burst" => bursts(conn, offset, limit),
         "exact" | "similar_image" | "similar_video" => dups(conn, kind, variant, offset, limit),

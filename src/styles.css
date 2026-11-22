@@ -746,3 +746,19 @@ figure.clickable { cursor: zoom-in; }
 .copies-where { flex: 1; min-width: 0; }
 .copies-folder { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left; }
 .copies-foot { display: flex; justify-content: flex-end; }
+
+/* Work scope */
+.scope-bar { position: relative; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 6px 10px; margin: 0 0 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+.scope-bar.set { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, var(--panel)); }
+.scope-label { font-weight: 700; font-size: 13px; }
+.scope-current { font-weight: 600; max-width: 60ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.scope-panel { position: absolute; left: 0; top: calc(100% + 4px); z-index: 50; width: min(760px, 92vw); max-height: 70vh; display: flex; flex-direction: column; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25); }
+.scope-drives { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; padding: 10px; border-bottom: 1px solid var(--line); }
+.scope-drives .grow { flex: 1; }
+.scope-tree { overflow: auto; padding: 6px 0; }
+.scope-row { display: flex; align-items: center; gap: 8px; padding: 3px 10px 3px 8px; }
+.scope-row:hover { background: var(--panel); }
+.scope-row.on { background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.scope-twisty { width: 18px; border: 0; background: none; cursor: pointer; color: inherit; }
+.scope-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.scope-drives .chip { cursor: pointer; } .scope-drives .chip.on { background: var(--accent); color: #fff; }

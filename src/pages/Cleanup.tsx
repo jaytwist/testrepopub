@@ -4,7 +4,8 @@ import {
   api, fmtBytes, fmtCount, onAnalysisDone, withLast,
   type CleanupSummary, type DupSummary, type FileFilter, type GroupBy, type TriageKind,
 } from "../api";
-import { useJob, useNav } from "../App";
+import { useJob, useNav, useScope } from "../App";
+import ScopePicker from "../components/ScopePicker";
 import CopyFolders from "../components/CopyFolders";
 import Damaged from "../components/Damaged";
 import Triage from "../components/Triage";
@@ -62,14 +63,16 @@ export default function Cleanup() {
   const [triage, setTriage] = useState<{ kind: TriageKind; variant?: "safe" | "edited"; title: string } | null>(null);
   const [damaged, setDamaged] = useState(false);
 
+  const { scope } = useScope();
+  const scopeKey = scope ? `${scope.volume_id}:${scope.dir}` : "all";
   const load = useCallback(() => {
     // What the page showed last time first, the fresh numbers when they arrive.
-    withLast("cleanup-summary", api.cleanupSummary, setS).catch((e) => setErr(String(e)));
+    withLast(`cleanup-summary:${scopeKey}`, api.cleanupSummary, setS).catch((e) => setErr(String(e)));
     withLast("dup-summary", api.dupSummary, setDups).catch(() => setDups([]));
     api.batches()
       .then((bs) => setFreed(bs.filter((b) => (b.kind === "delete" || b.kind === "dedupe") && b.state !== "undone").reduce((a, b) => a + b.bytes, 0)))
       .catch(() => {});
-  }, []);
+  }, [scopeKey]);
   useEffect(load, [load, version]);
   useEffect(() => {
     const un = onAnalysisDone(load);
@@ -89,6 +92,7 @@ export default function Cleanup() {
       else if ("applyExact" in a) {
         const ok = await confirm(
           `같은 드라이브에 또 있는 사본 ${fmtCount(c.count)}개(${fmtBytes(c.bytes)})를 정리할까요?\n\n` +
+            (scope ? "작업 범위 안의 사본만 정리합니다. 범위 밖의 파일은 남는 쪽으로만 쓰이고 지워지지 않습니다.\n\n" : "") +
             "각 드라이브에서 가장 좋은 한 장은 남고, 다른 드라이브의 백업과 보호된 파일(원본 지정·♥·항상 남길 폴더)도 남습니다. " +
             "정리한 파일은 「작업 기록」에서 되돌릴 수 있습니다.",
           { title: "똑같은 사본 정리", kind: "warning", okLabel: "정리", cancelLabel: "취소" },
@@ -200,6 +204,7 @@ export default function Cleanup() {
           </div>
         </div>
       </header>
+      <ScopePicker note="이 범위 안의 파일만 지우거나 옮깁니다. 범위 밖의 같은 사진은 남는 쪽입니다" />
       {err && <div className="alert bad">{err}</div>}
 
       {s && (
@@ -229,7 +234,7 @@ export default function Cleanup() {
         </div>
       )}
 
-      <CopyFolders onTotals={onFolderTotals} />
+      <CopyFolders key={scopeKey} onTotals={onFolderTotals} />
 
       {TIERS.map((t) => {
         const list = cards.filter((c) => c.tier === t.id);

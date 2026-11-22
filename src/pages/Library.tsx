@@ -5,7 +5,8 @@ import {
   absPath, api, FAVORITE, ROLE_HINTS, ROLE_NAMES, fmtBytes, fmtCount, fmtDate, fmtDuration, thumbUrl,
   type FileFilter, type FilteredStats, type GridItem, type GroupBy, type GroupRow, type SortKey, type VolumeRow,
 } from "../api";
-import { useJob, useNav, type LibraryPreset } from "../App";
+import { useJob, useNav, useScope, type LibraryPreset } from "../App";
+import ScopePicker from "../components/ScopePicker";
 import FilterBar from "../components/FilterBar";
 import Viewer from "../components/Viewer";
 import TimelineScrubber, { type ScrubSegment } from "../components/TimelineScrubber";
@@ -187,9 +188,17 @@ export default function Library({ active = true, preset, onClearPreset, onConsum
   /** The filter actually sent to the backend (stacking applies outside the burst view). */
   /** "Show only the selection": the ids frozen when it was turned on. */
   const [onlySel, setOnlySel] = useState<number[] | null>(null);
+  // The work scope narrows everything shown here (a folder: with everything below it).
+  const { scope } = useScope();
   const qf: FileFilter = useMemo(
-    () => ({ ...filter, stack_bursts: stack && groupBy !== "burst", stack_copies: stackCopies, ...(onlySel ? { ids: onlySel } : {}) }),
-    [filter, stack, groupBy, onlySel, stackCopies],
+    () => ({
+      ...filter,
+      stack_bursts: stack && groupBy !== "burst",
+      stack_copies: stackCopies,
+      ...(scope && filter.volume_id == null ? { volume_id: scope.volume_id, under: scope.dir || null } : {}),
+      ...(onlySel ? { ids: onlySel } : {}),
+    }),
+    [filter, stack, groupBy, onlySel, stackCopies, scope],
   );
 
   const reload = useCallback(() => {
@@ -863,7 +872,8 @@ export default function Library({ active = true, preset, onClearPreset, onConsum
           <button className="btn small ghost" onClick={() => { onClearPreset?.(); setFilter({}); prevView.current = null; setHasPrev(false); }}>닫고 전체 보기</button>
         </div>
       )}
-      {volumes.filter((v) => v.file_count > 0).length > 1 && (
+      <ScopePicker />
+      {!scope && volumes.filter((v) => v.file_count > 0).length > 1 && (
         <div className="drive-tabs" role="tablist" title="모든 드라이브를 합쳐 보거나 드라이브별로 따로 봅니다">
           <button className={filter.volume_id == null ? "on" : ""} onClick={() => setFilter({ ...filter, volume_id: null })}>
             모든 드라이브
@@ -999,7 +1009,12 @@ export default function Library({ active = true, preset, onClearPreset, onConsum
       {stats && total === 0 ? (
         <div className="empty">
           <div className="empty-icon">⛁</div>
-          {filtered ? (
+          {scope && !filtered ? (
+            <>
+              <h2>이 범위에는 사진이 없습니다</h2>
+              <p>위의 「범위」에서 다른 드라이브·폴더를 고르거나 「전체로」를 누르세요.</p>
+            </>
+          ) : filtered ? (
             <>
               <h2>조건에 맞는 항목이 없습니다</h2>
               <p>필터를 줄이거나 「모두 지우기」를 눌러 보세요.</p>

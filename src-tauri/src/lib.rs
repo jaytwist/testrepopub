@@ -563,14 +563,50 @@ fn trips_summary(state: State<AppState>) -> CmdResult<media_core::places::TripsS
 #[tauri::command(async)]
 fn cleanup_summary(state: State<AppState>) -> CmdResult<media_core::cleanup::CleanupSummary> {
     let conn = state.db.conn().map_err(err)?;
-    media_core::cleanup::summary(&conn).map_err(err)
+    let scope = media_core::db::Scope::load(&conn).map_err(err)?;
+    media_core::cleanup::summary_in(&conn, scope.as_ref()).map_err(err)
+}
+
+/// The work scope (a drive, or a folder with everything below it) — `None` = everything.
+#[tauri::command(async)]
+fn get_work_scope(state: State<AppState>) -> CmdResult<Option<media_core::db::Scope>> {
+    let conn = state.db.conn().map_err(err)?;
+    media_core::db::Scope::load(&conn).map_err(err)
+}
+
+#[tauri::command(async)]
+fn set_work_scope(state: State<AppState>, scope: Option<media_core::db::Scope>) -> CmdResult<Option<media_core::db::Scope>> {
+    let conn = state.db.conn().map_err(err)?;
+    media_core::db::Scope::save(&conn, scope.as_ref()).map_err(err)?;
+    media_core::db::Scope::load(&conn).map_err(err)
+}
+
+/// The folder for a path the user picked, if it is on a registered drive: `(volume, rel_dir)`.
+#[tauri::command(async)]
+fn scope_for_path(state: State<AppState>, path: String) -> CmdResult<Option<media_core::db::Scope>> {
+    let conn = state.db.conn().map_err(err)?;
+    media_core::volumes::refresh(&conn).map_err(err)?;
+    let p = media_core::volumes::canonical(Path::new(&path)).map_err(err)?;
+    let mut st = conn.prepare("SELECT id, mount FROM volumes WHERE online = 1").map_err(err)?;
+    let vols: Vec<(i64, String)> = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map_err(err)?.collect::<Result<_, _>>().map_err(err)?;
+    // The deepest mount the path is under.
+    let best = vols.into_iter().filter_map(|(id, m)| media_core::volumes::rel_of(Path::new(&m), &p).ok().map(|r| (id, m.len(), r))).max_by_key(|x| x.1);
+    Ok(best.map(|(id, _, rel)| media_core::db::Scope::new(id, &rel)))
+}
+
+/// The folders of a drive with photos or videos, for choosing a work scope.
+#[tauri::command(async)]
+fn folder_tree(state: State<AppState>, volume_id: i64) -> CmdResult<Vec<media_core::db::DirCount>> {
+    let conn = state.db.conn().map_err(err)?;
+    media_core::db::folder_tree(&conn, volume_id).map_err(err)
 }
 
 /// The files that look damaged or could not be opened, to look at before deleting.
 #[tauri::command(async)]
 fn damaged_list(state: State<AppState>, offset: i64, limit: i64) -> CmdResult<media_core::damage::DamagedList> {
     let conn = state.db.conn().map_err(err)?;
-    media_core::damage::list(&conn, offset, limit).map_err(err)
+    let scope = media_core::db::Scope::load(&conn).map_err(err)?;
+    media_core::damage::list_in(&conn, scope.as_ref(), offset, limit).map_err(err)
 }
 
 /// Delete for good the damaged files the user chose.
@@ -579,7 +615,8 @@ fn start_delete_damaged(app: AppHandle, state: State<AppState>, ids: Vec<i64>) -
     if ids.is_empty() {
         return Err("선택한 파일이 없습니다".into());
     }
-    spawn_job(&app, &state, "delete:damaged", move |st, progress| media_core::damage::delete(&st.db, &ids, &st.stop, progress))
+    let scope = media_core::db::Scope::load(&state.db.conn().map_err(err)?).map_err(err)?;
+    spawn_job(&app, &state, "delete:damaged", move |st, progress| media_core::damage::delete_in(&st.db, &ids, scope.as_ref(), &st.stop, progress))
 }
 
 /// Look at analysed files for damage (libraries analysed before the check existed).
@@ -1156,7 +1193,8 @@ fn set_keep(state: State<AppState>, group_id: i64, file_id: i64, keep: bool) -> 
 
 #[tauri::command(async)]
 fn start_dedupe_apply(app: AppHandle, state: State<AppState>, kind: String, group_ids: Option<Vec<i64>>) -> CmdResult<()> {
-    spawn_job(&app, &state, "dedupe:apply", move |st, progress| dedupe::apply(&st.db, &kind, group_ids, &st.stop, progress))
+    let scope = media_core::db::Scope::load(&state.db.conn().map_err(err)?).map_err(err)?;
+    spawn_job(&app, &state, "dedupe:apply", move |st, progress| dedupe::apply_in(&st.db, &kind, group_ids, scope.as_ref(), &st.stop, progress))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1380,6 +1418,10 @@ fn copy_folders(state: State<'_, AppState>, near: Option<f64>, refresh: Option<b
             let conn = state.db.conn()?;
             media_core::folders::find_with(&conn, near)
         })
+        .and_then(|found| {
+            let scope = media_core::db::Scope::load(&state.db.conn()?)?;
+            Ok(media_core::folders::in_scope(found, scope.as_ref()))
+        })
         .map_err(err)
 }
 
@@ -1463,8 +1505,9 @@ fn folder_props(state: State<'_, AppState>, folder: media_core::folders::FolderR
 #[tauri::command(async)]
 fn start_remove_copy_folders(app: AppHandle, state: State<AppState>, picks: Vec<media_core::folders::Pick>, purge: bool, quick: Option<bool>) -> CmdResult<()> {
     let opts = media_core::folders::RemoveOptions { purge, quick: quick.unwrap_or(false) };
+    let scope = media_core::db::Scope::load(&state.db.conn().map_err(err)?).map_err(err)?;
     spawn_job(&app, &state, "cleanup:folders", move |st, progress| {
-        let r = media_core::folders::remove_with(&st.db, &picks, &opts, &st.stop, progress)?;
+        let r = media_core::folders::remove_in(&st.db, &picks, &opts, scope.as_ref(), &st.stop, progress)?;
         // Plans made before no longer match what is on the drive.
         st.plans.locked().clear();
         Ok(r)
@@ -1553,7 +1596,8 @@ fn start_delete(app: AppHandle, state: State<AppState>, ids: Vec<i64>, force: Op
 #[tauri::command(async)]
 fn triage_groups(state: State<AppState>, kind: String, variant: Option<String>, offset: i64, limit: i64) -> CmdResult<Vec<media_core::triage::TriageGroup>> {
     let conn = state.db.conn().map_err(err)?;
-    media_core::triage::groups(&conn, &kind, variant.as_deref(), offset, limit).map_err(err)
+    let scope = media_core::db::Scope::load(&conn).map_err(err)?;
+    media_core::triage::groups_scoped(&conn, &kind, variant.as_deref(), scope.as_ref(), offset, limit).map_err(err)
 }
 
 /// Remember review decisions (kept files); removing the rest is a normal delete.
@@ -1856,6 +1900,10 @@ pub fn run() {
             triage_commit,
             diagnostics,
             start_damage_check,
+            get_work_scope,
+            set_work_scope,
+            scope_for_path,
+            folder_tree,
             damaged_list,
             start_delete_damaged,
             move_faces,

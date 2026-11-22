@@ -83,6 +83,8 @@ export interface FileFilter {
   /** Backup check: "elsewhere" = also on another drive, "only_here" = on no other drive. */
   copies?: "elsewhere" | "only_here" | null;
   stack_bursts?: boolean;
+  /** With volume_id: this folder and everything below it (the work scope). */
+  under?: string | null;
   /** Show files with the same content once (not when narrowed to a drive, a folder or chosen files). */
   stack_copies?: boolean;
   sort?: SortKey | null;
@@ -133,7 +135,7 @@ export type VariantKind = "smaller" | "recompressed" | "edited";
 
 /** Quick review: one group (burst, copies, versions) with the suggested keepers. */
 export interface TriageMember {
-  file: FileRow; keep: boolean; role: "backup" | "other_year" | null; variant: VariantKind | null; sharpness: number | null; locked: boolean;
+  file: FileRow; keep: boolean; role: "backup" | "other_year" | "outside" | null; variant: VariantKind | null; sharpness: number | null; locked: boolean;
 }
 export interface TriageGroup { key: string; members: TriageMember[] }
 export type TriageKind = "burst" | "exact" | "similar_image" | "similar_video";
@@ -319,6 +321,11 @@ export interface AppInfo { version: string; data_dir: string; cache_dir: string;
 export const api = {
   appInfo: () => invoke<AppInfo>("app_info"),
   listVolumes: (refresh = false) => invoke<VolumeRow[]>("list_volumes", { refresh }),
+  /** The work scope: a drive, or a folder with everything below it; null = everything. */
+  getWorkScope: () => invoke<Scope | null>("get_work_scope"),
+  setWorkScope: (scope: Scope | null) => invoke<Scope | null>("set_work_scope", { scope }),
+  scopeForPath: (path: string) => invoke<Scope | null>("scope_for_path", { path }),
+  folderTree: (volumeId: number) => invoke<DirCount[]>("folder_tree", { volumeId }),
   listSources: () => invoke<SourceRow[]>("list_sources"),
   addSource: (path: string) => invoke<number>("add_source", { path }),
   removeSource: (id: number) => invoke<void>("remove_source", { id }),
@@ -622,3 +629,7 @@ export interface DamagedFile {
 }
 export interface DamagedList { files: DamagedFile[]; total: number; bytes: number }
 export interface DamagedDeleteReport { batch_id: string; deleted: number; bytes: number; kept_protected: number; skipped: number; failed: number; errors: string[]; cancelled: boolean }
+
+/** Where the user works now: one drive (dir "") or one folder with everything below it. */
+export interface Scope { volume_id: number; dir: string }
+export interface DirCount { dir: string; files: number; bytes: number }

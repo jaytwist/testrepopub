@@ -1232,6 +1232,37 @@ pub struct RemoveOptions {
     pub quick: bool,
 }
 
+/// `remove_with`, only for copy folders inside the work scope: a pick of a folder outside is
+/// not done (the folder that stays may be anywhere).
+pub fn remove_in(db: &Db, picks: &[Pick], opts: &RemoveOptions, scope: Option<&crate::db::Scope>, stop: &StopFlag, progress: ProgressFn) -> Result<FolderRemoveReport> {
+    let Some(scope) = scope else { return remove_with(db, picks, opts, stop, progress) };
+    let (inside, outside): (Vec<Pick>, Vec<Pick>) = picks.iter().cloned().partition(|p| {
+        let c = clean(&p.copy);
+        scope.contains_dir(c.volume_id, &c.rel_dir)
+    });
+    let mut rep = if inside.is_empty() { FolderRemoveReport::default() } else { remove_with(db, &inside, opts, stop, progress)? };
+    rep.skipped += outside.len() as u64;
+    for p in outside.iter().take(50usize.saturating_sub(rep.skipped_why.len())) {
+        rep.skipped_why.push(format!("{}: 작업 범위 밖이라 지우지 않았습니다", p.copy.rel_dir));
+    }
+    Ok(rep)
+}
+
+/// What of `found` concerns the work scope: sets with a copy inside (only those copies are
+/// listed; the folder that stays may be anywhere), and almost-the-same folders inside.
+pub fn in_scope(mut found: Found, scope: Option<&crate::db::Scope>) -> Found {
+    let Some(scope) = scope else { return found };
+    for s in &mut found.sets {
+        s.copies.retain(|c| scope.contains_dir(c.volume_id, &c.rel_dir));
+    }
+    found.sets.retain(|s| !s.copies.is_empty());
+    for n in &mut found.near {
+        n.others.retain(|o| scope.contains_dir(o.info.volume_id, &o.info.rel_dir));
+    }
+    found.near.retain(|n| !n.others.is_empty());
+    found
+}
+
 fn clean(r: &FolderRef) -> FolderRef {
     FolderRef { volume_id: r.volume_id, rel_dir: r.rel_dir.replace('\\', "/").trim_matches('/').to_string() }
 }

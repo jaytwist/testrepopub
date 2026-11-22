@@ -185,9 +185,15 @@ fn bucket(conn: &Connection, sql: &str) -> Result<Bucket> {
 }
 
 pub fn summary(conn: &Connection) -> Result<CleanupSummary> {
+    summary_in(conn, None)
+}
+
+/// `summary` for the files inside `scope` only (everything when `None`).
+pub fn summary_in(conn: &Connection, scope: Option<&crate::db::Scope>) -> Result<CleanupSummary> {
     // Photos that could not be opened count as damaged.
     let _ = crate::damage::adopt_unreadable(conn);
-    let live = "f.missing = 0 AND f.quarantined = 0";
+    let live = format!("f.missing = 0 AND f.quarantined = 0{}", crate::db::and_scope(scope, "f"));
+    let live = live.as_str();
     let sugg = |kind: &str| {
         format!(
             "SELECT COUNT(*), COALESCE(SUM(f.size), 0) FROM files f JOIN suggestions s ON s.file_id = f.id AND s.kind = '{kind}'
@@ -227,11 +233,14 @@ pub fn summary(conn: &Connection) -> Result<CleanupSummary> {
             crate::db::live_photo_video_sql()
         ),
     )?;
-    let exact_duplicates = crate::dedupe::summary(conn)?
-        .into_iter()
-        .find(|s| s.kind == "exact")
-        .map(|s| Bucket { count: s.drop_files, bytes: s.reclaimable_bytes })
-        .unwrap_or_default();
+    // What a 「한 번에 정리」 would remove: members not kept, inside.
+    let exact_duplicates = bucket(
+        conn,
+        &format!(
+            "SELECT COUNT(*), COALESCE(SUM(f.size), 0) FROM dup_members m JOIN dup_groups g ON g.id = m.group_id JOIN files f ON f.id = m.file_id
+             WHERE {live} AND g.kind = 'exact' AND g.resolved = 0 AND m.keep = 0"
+        ),
+    )?;
     let variants = |which: &str| {
         format!(
             "SELECT COUNT(*), COALESCE(SUM(f.size), 0) FROM dup_members m JOIN dup_groups g ON g.id = m.group_id
