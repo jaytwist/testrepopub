@@ -167,4 +167,28 @@ fn library_plan_many_files() {
     let a = &after.summary;
     println!("with {moved} moved: plan {again:.2?} (was {planned:.2?}) — moves {} copies {} remove {} leave {} · timing {:?}", a.moves, a.copies, a.remove, a.leave, a.timing);
     assert!(a.moves < s.moves, "what was pushed is not moved again");
+
+    // The library grid with 「같은 사진 묶기」: the same photo once, with "+N".
+    let t = Instant::now();
+    let roles = media_core::identity::refresh_roles(&mut conn).unwrap();
+    println!("roles of {roles} files in {:.2?}", t.elapsed());
+    for stack in [false, true] {
+        let f = media_core::db::FileFilter { stack_copies: stack, ..Default::default() };
+        let t = Instant::now();
+        let first = media_core::db::query_grid(&conn, &f, 0, 300).unwrap();
+        let t1 = t.elapsed();
+        let t = Instant::now();
+        let mid = media_core::db::query_grid(&conn, &f, (n / 2) as i64, 300).unwrap();
+        let t2 = t.elapsed();
+        let t = Instant::now();
+        let months = media_core::db::group_summary(&conn, &f, "month").unwrap();
+        let t3 = t.elapsed();
+        let shown: i64 = months.iter().map(|g| g.count).sum();
+        println!(
+            "grid stack_copies={stack}: first page {t1:.2?} (+N on {}), middle page {t2:.2?} ({}), months {t3:.2?} ({} months, {shown} shown)",
+            first.iter().filter(|g| g.same > 0).count(),
+            mid.len(),
+            months.len()
+        );
+    }
 }
