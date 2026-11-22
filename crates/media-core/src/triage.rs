@@ -101,6 +101,29 @@ fn groups_all(conn: &Connection, kind: &str, variant: Option<&str>, offset: i64,
 /// `lib_vol` (only the library drive is cleaned up here), and files outside `allowed` (another
 /// year's photos are decided in that year). Groups with nothing left to decide are left out.
 pub fn groups_in(conn: &Connection, kind: &str, allowed: &HashSet<i64>, lib_vol: i64, offset: usize, limit: usize) -> Result<Vec<TriageGroup>> {
+    groups_in_with(conn, kind, allowed, &YearReview { lib_vol, ..Default::default() }, offset, limit)
+}
+
+/// How a year of the library plan is reviewed.
+#[derive(Clone, Debug)]
+pub struct YearReview {
+    pub lib_vol: i64,
+    /// The library folder on its drive (photos filed there that are not in the plan show as
+    /// "filed", not as another year's).
+    pub lib_root: Option<String>,
+    /// See `LibraryOptions::keep_edits`.
+    pub keep_edits: String,
+}
+
+impl Default for YearReview {
+    fn default() -> Self {
+        Self { lib_vol: -1, lib_root: None, keep_edits: "latest".into() }
+    }
+}
+
+/// `groups_in` with how edited versions are offered and where the library is.
+pub fn groups_in_with(conn: &Connection, kind: &str, allowed: &HashSet<i64>, review: &YearReview, offset: usize, limit: usize) -> Result<Vec<TriageGroup>> {
+    let lib_vol = review.lib_vol;
     let ids = group_ids_in(conn, kind, allowed)?;
     let page: Vec<i64> = ids.into_iter().skip(offset).take(limit).collect();
     let mut groups = match kind {
@@ -108,19 +131,40 @@ pub fn groups_in(conn: &Connection, kind: &str, allowed: &HashSet<i64>, lib_vol:
         "similar_image" => load_dups(conn, kind, page)?,
         _ => bail!("unknown review kind {kind}"),
     };
-    lock_outside(&mut groups, allowed, lib_vol);
+    lock_outside(&mut groups, allowed, review);
+    let _ = lib_vol;
     Ok(groups)
 }
 
-fn lock_outside(groups: &mut Vec<TriageGroup>, allowed: &HashSet<i64>, lib_vol: i64) {
+fn lock_outside(groups: &mut Vec<TriageGroup>, allowed: &HashSet<i64>, review: &YearReview) {
+    let lib_vol = review.lib_vol;
+    let filed = |f: &FileRow| review.lib_root.as_deref().is_some_and(|root| f.volume_id == lib_vol && (root.is_empty() || f.rel_path.replace('\\', "/").starts_with(&format!("{root}/"))));
     for g in groups.iter_mut() {
+        // Edited versions: which are offered for deletion. The newest edit (by file time) stays
+        // with "latest"; "none" offers them all, "all" none (they are locked as before).
+        let mut edits: Vec<(i64, i64)> = g.members.iter().filter(|m| m.variant.as_deref() == Some("edited") && allowed.contains(&m.file.id)).map(|m| (m.file.mtime, m.file.id)).collect();
+        edits.sort_unstable_by(|a, b| b.cmp(a));
+        let newest = edits.first().map(|e| e.1);
         for m in &mut g.members {
             let reason = if m.file.volume_id != lib_vol {
                 Some("backup")
             } else if !allowed.contains(&m.file.id) {
-                Some("other_year")
+                Some(if filed(&m.file) { "filed" } else { "other_year" })
+            } else if m.variant.is_none() && !edits.is_empty() && review.keep_edits != "all" {
+                // The original of edited versions always stays.
+                Some("original")
             } else if m.variant.as_deref() == Some("edited") {
-                Some("")
+                match review.keep_edits.as_str() {
+                    "all" => Some(""),
+                    "none" => {
+                        m.keep = false;
+                        None
+                    }
+                    _ => {
+                        m.keep = Some(m.file.id) == newest;
+                        None
+                    }
+                }
             } else {
                 None
             };
@@ -153,12 +197,17 @@ pub fn members(conn: &Connection, key: &str) -> Result<Vec<i64>> {
 
 /// How many groups of `kind` there are to review for `allowed` (the same ones `groups_in` gives).
 pub fn count_in(conn: &Connection, kind: &str, allowed: &HashSet<i64>, lib_vol: i64) -> Result<usize> {
+    count_in_with(conn, kind, allowed, &YearReview { lib_vol, ..Default::default() })
+}
+
+/// `count_in` the way `groups_in_with` shows them.
+pub fn count_in_with(conn: &Connection, kind: &str, allowed: &HashSet<i64>, review: &YearReview) -> Result<usize> {
     let ids = group_ids_in(conn, kind, allowed)?;
     let mut groups = match kind {
         "burst" => load_bursts(conn, ids)?,
         _ => load_dups(conn, kind, ids)?,
     };
-    lock_outside(&mut groups, allowed, lib_vol);
+    lock_outside(&mut groups, allowed, review);
     Ok(groups.len())
 }
 

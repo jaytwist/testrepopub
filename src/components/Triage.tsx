@@ -243,7 +243,7 @@ export default function Triage({ kind, variant, title, onClose, source, onFinish
             return (
               <div key={m.file.id} className={`tri-card ${kept ? "keep" : "drop"} ${m.locked ? "locked" : ""}`}
                 onClick={() => toggle(m)}
-                title={m.locked ? (m.role === "backup" ? "다른 드라이브의 백업: 지우지 않습니다" : m.role === "other_year" ? "다른 해의 사진: 그 해를 정리할 때 검토합니다" : m.role === "outside" ? "작업 범위 밖: 남는 쪽이며 여기서 지우지 않습니다" : "편집본: 항상 남깁니다") : "누르면 남기기/지우기"}>
+                title={m.locked ? (m.role === "backup" ? "다른 드라이브의 백업: 지우지 않습니다" : m.role === "other_year" ? "다른 해의 사진: 그 해를 정리할 때 검토합니다" : m.role === "outside" ? "작업 범위 밖: 남는 쪽이며 여기서 지우지 않습니다" : m.role === "filed" ? "이미 라이브러리에 정리된 사진: 남습니다" : m.role === "original" ? "편집본의 원본: 항상 남깁니다" : "편집본: 항상 남깁니다") : "누르면 남기기/지우기"}>
                 <div className="tri-img">
                   <img src={srcs[m.file.id] ?? thumbUrl(m.file.id)} alt="" draggable={false}
                     onError={(e) => ((e.target as HTMLImageElement).src = thumbUrl(m.file.id))} />
@@ -256,6 +256,8 @@ export default function Triage({ kind, variant, title, onClose, source, onFinish
                   {m.role === "backup" && <span className="role-tag backup">백업 · 지우지 않음</span>}
                   {m.role === "other_year" && <span className="role-tag backup">다른 해 · 그 해에서 검토</span>}
                   {m.role === "outside" && <span className="role-tag backup">범위 밖 · 남음</span>}
+                  {m.role === "filed" && <span className="role-tag backup">라이브러리에 있음 · 남음</span>}
+                  {m.role === "original" && <span className="role-tag original">원본 · 남음</span>}
                   {m.variant && <span className="role-tag variant">{VARIANT_NAMES[m.variant]}</span>}
                   {kind === "burst" && m.sharpness != null && maxSharp > 0 && (
                     <span className="muted small">선명도 {Math.round((100 * m.sharpness) / maxSharp)}%</span>

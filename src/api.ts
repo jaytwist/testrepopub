@@ -135,7 +135,7 @@ export type VariantKind = "smaller" | "recompressed" | "edited";
 
 /** Quick review: one group (burst, copies, versions) with the suggested keepers. */
 export interface TriageMember {
-  file: FileRow; keep: boolean; role: "backup" | "other_year" | "outside" | null; variant: VariantKind | null; sharpness: number | null; locked: boolean;
+  file: FileRow; keep: boolean; role: "backup" | "other_year" | "outside" | "filed" | "original" | null; variant: VariantKind | null; sharpness: number | null; locked: boolean;
 }
 export interface TriageGroup { key: string; members: TriageMember[] }
 export type TriageKind = "burst" | "exact" | "similar_image" | "similar_video";
@@ -202,7 +202,11 @@ export interface FileDetail {
 export interface DupMember { file: FileRow; keep: boolean; variant: VariantKind | null }
 export interface DupGroup { id: number; kind: string; members: DupMember[]; reclaimable_bytes: number }
 export interface DupSummary { kind: string; groups: number; files: number; drop_files: number; reclaimable_bytes: number }
-export interface LibraryOptions { big_video_bytes: number; event_span_days: number; remove_copies: boolean; remove_smaller_versions: boolean }
+export interface LibraryOptions {
+  big_video_bytes: number; event_span_days: number; remove_copies: boolean; remove_smaller_versions: boolean;
+  /** Edited versions: "latest" (original + newest edit stay), "all", "none" (original only). Offered in the review, never deleted without it. */
+  keep_edits: "latest" | "all" | "none";
+}
 export interface OrganizeOptions {
   target_dir: string; template: string; rename: "keep" | "date_prefix"; mode: "move" | "copy";
   filter: FileFilter; uncertain_folder: string | null; remove_empty_dirs: boolean;

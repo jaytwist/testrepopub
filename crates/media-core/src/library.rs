@@ -38,11 +38,15 @@ pub struct LibraryOptions {
     /// Resized / recompressed versions on other drives are not brought in when the original is
     /// kept (on the library drive they go beside their original, for review).
     pub remove_smaller_versions: bool,
+    /// Edited versions of one photo: "latest" (the original and the newest edit stay; the other
+    /// edits are offered for deletion in the year's review), "all" (all stay), "none" (only the
+    /// original; every edit is offered for deletion). Nothing is deleted without the review.
+    pub keep_edits: String,
 }
 
 impl Default for LibraryOptions {
     fn default() -> Self {
-        Self { big_video_bytes: 2 * 1024 * 1024 * 1024, event_span_days: 62, remove_copies: true, remove_smaller_versions: true }
+        Self { big_video_bytes: 2 * 1024 * 1024 * 1024, event_span_days: 62, remove_copies: true, remove_smaller_versions: true, keep_edits: "latest".into() }
     }
 }
 
@@ -373,6 +377,8 @@ pub fn layout(
 ) -> Result<HashMap<i64, Placement>> {
     let lib_root = lib_root.replace('\\', "/").trim_matches('/').to_string();
     let wanted: HashSet<i64> = ids.iter().copied().collect();
+    // id -> (content, folder) of filed library files outside the plan (see below).
+    let anchors: HashMap<i64, (Option<(String, i64)>, String)>;
     let files: Vec<F> = {
         let mut st = conn.prepare(
             "SELECT id, volume_id, rel_path, kind, size, taken_at, date_source, COALESCE(prehash, hash)
@@ -401,6 +407,14 @@ pub fn layout(
         for f in &rows {
             *sizes.entry(f.size).or_default() += 1;
         }
+        // Files already filed in the library that are not part of this plan (it covers only the
+        // work scope): they stay where they are, and a photo of the plan the same as one of them
+        // is a copy of it — not brought into the library a second time.
+        anchors = rows
+            .iter()
+            .filter(|f| !wanted.contains(&f.id) && f.vol == lib_vol && (lib_root.is_empty() || f.rel.starts_with(&format!("{lib_root}/"))))
+            .map(|f| (f.id, (f.content.clone(), f.dir().to_string())))
+            .collect();
         rows.into_iter()
             .filter(|f| wanted.contains(&f.id))
             .map(|mut f| {
@@ -472,6 +486,12 @@ pub fn layout(
             }
         }
     }
+    // Filed photos outside the plan join only the groups of photos in it.
+    for (id, (content, _)) in &anchors {
+        if let Some(g) = content.as_ref().and_then(|c| groups.get_mut(c)) {
+            g.push(*id);
+        }
+    }
     let dup_rules = DupRules::load(conn)?;
     for members in groups.values().filter(|m| m.len() > 1) {
         let mut rows: Vec<FileRow> = members.iter().filter_map(|id| all.get(id).cloned()).collect();
@@ -482,6 +502,9 @@ pub fn layout(
         keeper_first(&mut rows, lib_vol, &lib_root);
         let keep = rows[0].id;
         for (i, r) in rows.iter().enumerate() {
+            if anchors.contains_key(&r.id) {
+                continue; // not part of this plan: stays as it is
+            }
             let a = if i == 0 {
                 (if r.volume_id == lib_vol { Act::Move } else { Act::Copy }, None, "")
             } else if r.volume_id == lib_vol && opts.remove_copies {
@@ -514,7 +537,7 @@ pub fn layout(
         let mut by_group: HashMap<i64, Vec<(i64, Option<String>)>> = HashMap::new();
         for r in st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<String>>(2)?)))? {
             let (g, id, v) = r?;
-            if wanted.contains(&id) {
+            if wanted.contains(&id) || anchors.contains_key(&id) {
                 let id = stand_in.get(&id).copied().unwrap_or(id);
                 let members = by_group.entry(g).or_default();
                 if !members.iter().any(|(m, _)| *m == id) {
@@ -535,7 +558,7 @@ pub fn layout(
         };
         for members in by_group.values() {
             let Some(&(lead, _)) = members.iter().find(|(_, v)| v.is_none()) else { continue };
-            if !matches!(act.get(&lead).map(|a| a.0), Some(Act::Move | Act::Copy)) {
+            if !anchors.contains_key(&lead) && !matches!(act.get(&lead).map(|a| a.0), Some(Act::Move | Act::Copy)) {
                 continue;
             }
             for (id, v) in members {
@@ -779,7 +802,13 @@ pub fn layout(
         }
         let Some(&i) = by_id.get(id) else { continue };
         let (a, _, _) = act[id];
-        let lead_dir = out.get(lead).filter(|p| matches!(p.act, Act::Move | Act::Copy)).map(|p| (p.rel_dir.clone(), p.event.clone(), p.from_dir.clone()));
+        let lead_dir = out.get(lead).filter(|p| matches!(p.act, Act::Move | Act::Copy)).map(|p| (p.rel_dir.clone(), p.event.clone(), p.from_dir.clone())).or_else(|| {
+            // The original is already filed in the library: beside it.
+            anchors.get(lead).map(|(_, dir)| {
+                let in_lib = if lib_root.is_empty() { dir.as_str() } else { dir.strip_prefix(&format!("{lib_root}/")).unwrap_or(dir) };
+                (in_lib.to_string(), None, dir.clone())
+            })
+        });
         match lead_dir {
             Some((d, event, from)) => {
                 let rel_dir = if subdir.is_empty() { d } else { format!("{d}/{subdir}") };

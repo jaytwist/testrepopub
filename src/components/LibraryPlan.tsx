@@ -9,10 +9,11 @@ import Viewer from "./Viewer";
 import Compare from "./Compare";
 import Triage, { type ReviewResult } from "./Triage";
 import { PhotoTile, PickBar, usePick } from "./PhotoPick";
-import { useJob } from "../App";
+import { useJob, useScope } from "../App";
+import ScopePicker from "./ScopePicker";
 
 const GB = 1024 * 1024 * 1024;
-const DEFAULT_LIB: LibraryOptions = { big_video_bytes: 2 * GB, event_span_days: 62, remove_copies: true, remove_smaller_versions: true };
+const DEFAULT_LIB: LibraryOptions = { big_video_bytes: 2 * GB, event_span_days: 62, remove_copies: true, remove_smaller_versions: true, keep_edits: "latest" };
 const TAGS: Record<string, string> = {
   event: "이벤트", trip: "여행", loose: "낱장", received: "받은 사진", screenshot: "스크린샷", undated: "날짜 모름",
   raw: "RAW", live: "Live Photo", edited: "편집본",
@@ -63,6 +64,10 @@ export default function LibraryPlan() {
   const { running, setRunning, lastDone } = useJob();
   const [settings, setSettings] = useState<ImportSettings | null>(null);
   const [lib, setLib] = useState<LibraryOptions>(DEFAULT_LIB);
+  // The work scope: only its photos are planned (into the library). A new scope needs a new plan.
+  const { scope } = useScope();
+  const scopeKey = scope ? `${scope.volume_id}:${scope.dir}` : "all";
+  useEffect(() => { setPlan(null); }, [scopeKey]);
   const [plan, setPlan] = useState<PlanView | null>(null);
   const [tree, setTree] = useState<TreeNode[]>([]);
   const [years, setYears] = useState<YearBucket[]>([]);
@@ -332,6 +337,7 @@ export default function LibraryPlan() {
 
   return (
     <div className="library-plan">
+      <ScopePicker note="이 안의 사진만 라이브러리로 옮깁니다. 라이브러리에 이미 있는 같은 사진은 그대로 두고, 범위 안의 사본만 정리합니다" />
       <div className="form-grid">
         <label>라이브러리 위치</label>
         <div className="inline-form">
@@ -354,6 +360,15 @@ export default function LibraryPlan() {
             <input type="checkbox" checked={lib.remove_smaller_versions} onChange={(e) => { setLib({ ...lib, remove_smaller_versions: e.target.checked }); setPlan(null); }} />
             다른 드라이브의 축소본·재압축본은 가져오지 않음 ({drive}의 것은 원본 옆에 두고 「비슷한 사진 검토」로)
           </label>
+        </div>
+        <label>편집본</label>
+        <div className="col">
+          <select value={lib.keep_edits} onChange={(e) => { setLib({ ...lib, keep_edits: e.target.value as LibraryOptions["keep_edits"] }); setPlan(null); }}>
+            <option value="latest">원본 + 가장 최근 편집본만 남김 (권장)</option>
+            <option value="all">원본 + 편집본 모두 남김</option>
+            <option value="none">원본만 남김</option>
+          </select>
+          <span className="muted small">남기지 않을 편집본은 그 해의 「비슷한 사진 검토」에 '지울 것'으로 미리 골라 둡니다. 검토에서 바꿀 수 있고, 확인 전에는 지우지 않습니다. (가장 최근 = 파일 수정 시각 기준)</span>
         </div>
         <label>큰 동영상</label>
         <div className="inline-form">

@@ -1209,7 +1209,14 @@ struct PlanView {
 }
 
 #[tauri::command(async)]
-fn start_plan(app: AppHandle, state: State<AppState>, options: OrganizeOptions) -> CmdResult<()> {
+fn start_plan(app: AppHandle, state: State<AppState>, mut options: OrganizeOptions) -> CmdResult<()> {
+    // The work scope: only its photos are planned (into the library, wherever that is).
+    if options.layout == "library" && options.filter.volume_id.is_none() {
+        if let Some(sc) = media_core::db::Scope::load(&state.db.conn().map_err(err)?).map_err(err)? {
+            options.filter.volume_id = Some(sc.volume_id);
+            options.filter.under = (!sc.dir.is_empty()).then_some(sc.dir);
+        }
+    }
     spawn_job(&app, &state, "organize:plan", move |st, progress| {
         let plan = organizer::plan(&st.db, &options, &st.stop, progress)?;
         let view = PlanView { id: plan.id.clone(), summary: plan.summary.clone(), options: plan.options.clone() };
@@ -1314,9 +1321,15 @@ fn year_triage_groups(
     offset: usize,
     limit: usize,
 ) -> CmdResult<Vec<media_core::triage::TriageGroup>> {
-    let (files, lib) = with_plan(&state, &plan_id, |p| (organizer::year_files(p, &year), organizer::lib_vol(p)))?;
+    let (files, lib, keep_edits) =
+        with_plan(&state, &plan_id, |p| (organizer::year_files(p, &year), organizer::lib_vol(p), p.options.library.keep_edits.clone()))?;
     let conn = state.db.conn().map_err(err)?;
-    media_core::triage::groups_in(&conn, &kind, &files, lib.unwrap_or(-1), offset, limit).map_err(err)
+    let review = media_core::triage::YearReview {
+        lib_vol: lib.unwrap_or(-1),
+        lib_root: media_core::library::location(&conn).map(|l| l.1),
+        keep_edits,
+    };
+    media_core::triage::groups_in_with(&conn, &kind, &files, &review, offset, limit).map_err(err)
 }
 
 #[derive(Serialize)]
@@ -1329,8 +1342,10 @@ struct YearTriageCounts {
 
 #[tauri::command(async)]
 fn year_triage_counts(state: State<AppState>, plan_id: String, year: String) -> CmdResult<YearTriageCounts> {
-    let (files, lib) = with_plan(&state, &plan_id, |p| (organizer::year_files(p, &year), organizer::lib_vol(p).unwrap_or(-1)))?;
+    let (files, lib, keep_edits) =
+        with_plan(&state, &plan_id, |p| (organizer::year_files(p, &year), organizer::lib_vol(p).unwrap_or(-1), p.options.library.keep_edits.clone()))?;
     let conn = state.db.conn().map_err(err)?;
+    let review = media_core::triage::YearReview { lib_vol: lib, lib_root: media_core::library::location(&conn).map(|l| l.1), keep_edits };
     let unanalyzed: std::collections::HashSet<i64> = {
         let mut st = conn
             .prepare("SELECT f.id FROM files f WHERE f.kind = 'photo' AND NOT EXISTS (SELECT 1 FROM analysis a WHERE a.file_id = f.id)")
@@ -1339,8 +1354,8 @@ fn year_triage_counts(state: State<AppState>, plan_id: String, year: String) -> 
         rows
     };
     Ok(YearTriageCounts {
-        bursts: media_core::triage::count_in(&conn, "burst", &files, lib).map_err(err)?,
-        similar: media_core::triage::count_in(&conn, "similar_image", &files, lib).map_err(err)?,
+        bursts: media_core::triage::count_in_with(&conn, "burst", &files, &review).map_err(err)?,
+        similar: media_core::triage::count_in_with(&conn, "similar_image", &files, &review).map_err(err)?,
         unanalyzed: files.iter().filter(|id| unanalyzed.contains(id)).count(),
     })
 }
