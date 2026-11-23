@@ -762,3 +762,15 @@ figure.clickable { cursor: zoom-in; }
 .scope-twisty { width: 18px; border: 0; background: none; cursor: pointer; color: inherit; }
 .scope-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .scope-drives .chip { cursor: pointer; } .scope-drives .chip.on { background: var(--accent); color: #fff; }
+
+/* Library plan preview: what stays, its copies, look-alikes */
+.keep-summary { padding: 8px 10px; margin: 6px 0 10px; border-radius: 6px; background: var(--panel); border: 1px solid var(--line); line-height: 1.6; }
+.keep-badge.orig { background: #1f8f4e; color: #fff; cursor: pointer; }
+.keep-badge.alike-tag { top: 6px; bottom: auto; left: 6px; right: auto; background: #b7791f; color: #fff; }
+.keep-badge.bad { top: 6px; bottom: auto; right: 6px; left: auto; background: #c53030; color: #fff; }
+.keep-tile.alike { outline: 3px solid #d69e2e; outline-offset: -3px; }
+.keep-tile.alike-1 { outline-color: #3182ce; } .keep-tile.alike-2 { outline-color: #805ad5; } .keep-tile.alike-3 { outline-color: #dd6b20; }
+.keep-tile.alike-4 { outline-color: #38a169; } .keep-tile.alike-5 { outline-color: #d53f8c; }
+.copies-of { width: min(860px, 94vw); max-height: 80vh; overflow: auto; display: flex; flex-direction: column; gap: 6px; }
+.copies-of-row { display: flex; align-items: center; gap: 8px; }
+.copies-of-row .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }

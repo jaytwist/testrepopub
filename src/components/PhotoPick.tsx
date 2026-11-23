@@ -95,11 +95,11 @@ export function usePick(order: number[], open: (id: number) => void) {
   };
 }
 
-export function PhotoTile({ id, picked, marked, markLabel = "지움", children, ...rest }: {
-  id: number; picked: boolean; marked?: boolean; markLabel?: string; children?: ReactNode;
+export function PhotoTile({ id, picked, marked, markLabel = "지움", title, className = "", children, ...rest }: {
+  id: number; picked: boolean; marked?: boolean; markLabel?: string; title?: string; className?: string; children?: ReactNode;
 } & ReturnType<ReturnType<typeof usePick>["tileProps"]>) {
   return (
-    <button className={`keep-tile ${picked ? "picked" : ""} ${marked ? "marked" : ""}`} {...rest} draggable={false}>
+    <button className={`keep-tile ${picked ? "picked" : ""} ${marked ? "marked" : ""} ${className}`} title={title} {...rest} draggable={false}>
       <img src={thumbUrl(id)} loading="lazy" alt="" draggable={false} />
       {picked && <span className="pick-check">✓</span>}
       {marked && <span className="keep-badge drop">{markLabel}</span>}

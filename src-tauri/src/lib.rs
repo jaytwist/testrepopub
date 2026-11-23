@@ -1300,7 +1300,9 @@ fn year_copy_pairs(state: State<AppState>, plan_id: String, year: String, dir: S
 
 #[tauri::command(async)]
 fn year_keep(state: State<AppState>, plan_id: String, year: String, offset: usize, limit: usize) -> CmdResult<Vec<organizer::KeepItem>> {
-    with_plan(&state, &plan_id, |p| organizer::year_keep(p, &year, offset, limit))
+    let mut v = with_plan(&state, &plan_id, |p| organizer::year_keep(p, &year, offset, limit))?;
+    organizer::describe(&state.db.conn().map_err(err)?, &mut v).map_err(err)?;
+    Ok(v)
 }
 
 #[derive(Serialize)]
@@ -1363,7 +1365,9 @@ fn year_triage_counts(state: State<AppState>, plan_id: String, year: String) -> 
 /// Files planned into the chosen library folders (preview of a selection).
 #[tauri::command(async)]
 fn group_items(state: State<AppState>, plan_id: String, groups: Vec<String>, offset: usize, limit: usize) -> CmdResult<Vec<organizer::KeepItem>> {
-    with_plan(&state, &plan_id, |p| organizer::group_items(p, &groups, offset, limit))
+    let mut v = with_plan(&state, &plan_id, |p| organizer::group_items(p, &groups, offset, limit))?;
+    organizer::describe(&state.db.conn().map_err(err)?, &mut v).map_err(err)?;
+    Ok(v)
 }
 
 #[tauri::command(async)]

@@ -753,7 +753,7 @@ function KeepTab({ planId, year, total, list }: { planId: string; year: string; 
   return (
     <div className="keep-tab">
       <PhotoGrid
-        items={items.map((i) => ({ id: i.file_id, size: i.size, group: i.group, copies: i.copies, copyIn: i.action === "copy" }))}
+        items={items.map((i) => ({ id: i.file_id, size: i.size, group: i.group, copies: i.copies, copyIn: i.action === "copy", info: i }))}
         list={list}
         prefer="add"
         onAdd={(ids) => list.mark(ids.map((id) => { const it = items.find((i) => i.file_id === id); return { id, size: it?.size ?? 0, year, copyIn: it?.action === "copy" }; }))}
@@ -847,7 +847,7 @@ function SimilarTab({ planId, year, label, list }: { planId: string; year: strin
 
 /** Thumbnails with picking (Ctrl / Shift / drag), the viewer on a plain click, and compare. */
 function PhotoGrid({ items, list, prefer, onAdd, onRemove }: {
-  items: { id: number; size: number; group?: string; copies?: number; copyIn?: boolean }[];
+  items: { id: number; size: number; group?: string; copies?: number; copyIn?: boolean; info?: KeepItem }[];
   list: DeleteList;
   prefer: "add" | "remove";
   onAdd?: (ids: number[]) => void;
@@ -868,8 +868,33 @@ function PhotoGrid({ items, list, prefer, onAdd, onRemove }: {
   const groups = useMemo(() => {
     const m = new Map<string, typeof items>();
     for (const it of items) (m.get(it.group ?? "") ?? m.set(it.group ?? "", []).get(it.group ?? "")!).push(it);
+    // Look-alikes (same scene, other bytes) side by side, the biggest first.
+    for (const [, its] of m) {
+      const first = new Map<number, number>();
+      its.forEach((it, i) => { const a = it.info?.alike; if (a != null && !first.has(a)) first.set(a, i); });
+      its.sort((x, y) => {
+        const kx = x.info?.alike != null ? first.get(x.info.alike)! : its.indexOf(x);
+        const ky = y.info?.alike != null ? first.get(y.info.alike)! : its.indexOf(y);
+        return kx - ky || ((y.info?.width ?? 0) * (y.info?.height ?? 0)) - ((x.info?.width ?? 0) * (x.info?.height ?? 0));
+      });
+    }
     return [...m.entries()];
   }, [items]);
+  // How many of a look-alike group are in this preview (a group of one shows nothing).
+  const alikeCount = useMemo(() => {
+    const c = new Map<number, number>();
+    for (const it of items) if (it.info?.alike != null) c.set(it.info.alike, (c.get(it.info.alike) ?? 0) + 1);
+    return c;
+  }, [items]);
+  const [copiesOf, setCopiesOf] = useState<KeepItem | null>(null);
+  const summary = useMemo(() => {
+    const withCopies = items.filter((i) => (i.copies ?? 0) > 0);
+    const gone = withCopies.reduce((a, i) => a + (i.copies ?? 0), 0);
+    const alikeGroups = [...alikeCount.values()].filter((n) => n > 1).length;
+    const alikeFiles = [...alikeCount.values()].filter((n) => n > 1).reduce((a, n) => a + n, 0);
+    const damaged = items.filter((i) => i.info?.damaged).length;
+    return { gone, withCopies: withCopies.length, alikeGroups, alikeFiles, damaged };
+  }, [items, alikeCount]);
   const bytes = [...pick.picked].reduce((a, id) => a + (sizes.get(id) ?? 0), 0);
   const ids = () => [...pick.picked];
   return (
@@ -883,6 +908,15 @@ function PhotoGrid({ items, list, prefer, onAdd, onRemove }: {
         onCompare={() => setCmp(ids())}
         onClear={pick.clear}
       />
+      {items.length > 0 && items[0].info && (
+        <div className="small keep-summary">
+          여기 보이는 <b>{fmtCount(items.length)}장은 모두 남는 사진</b>입니다.
+          {summary.withCopies > 0 && <> 그중 {fmtCount(summary.withCopies)}장은 <b>원본</b>이고, 다른 폴더에 있는 똑같은 파일 {fmtCount(summary.gone)}개가 대신 지워집니다(「원본 −N」, 눌러서 위치 보기).</>}
+          {summary.alikeGroups > 0 && <> <span className="warn-text">겉보기만 같은 사진 {fmtCount(summary.alikeGroups)}묶음({fmtCount(summary.alikeFiles)}장)</span>은 파일이 서로 달라 지금은 모두 남습니다 — 「비슷한 사진 검토」에서 하나만 남기세요.</>}
+          {summary.damaged > 0 && <> <span className="bad-text">깨진 것 같은 파일 {fmtCount(summary.damaged)}장</span>(⚠).</>}
+          {" "}사진에 마우스를 올리면 원래 위치·크기·해상도가 보입니다.
+        </div>
+      )}
       {groups.map(([g, its]) => (
         <div key={g} className="keep-group">
           {g && (
@@ -893,8 +927,14 @@ function PhotoGrid({ items, list, prefer, onAdd, onRemove }: {
           )}
           <div className="keep-grid">
             {its.map((it) => (
-              <PhotoTile key={it.id} id={it.id} picked={pick.picked.has(it.id)} marked={list.listed.has(it.id)} markLabel={it.copyIn ? "안 가져옴" : "지움"} {...pick.tileProps(it.id)}>
-                {it.copies ? <span className="keep-badge">사본 {it.copies}</span> : null}
+              <PhotoTile key={it.id} id={it.id} picked={pick.picked.has(it.id)} marked={list.listed.has(it.id)} markLabel={it.copyIn ? "안 가져옴" : "지움"}
+                title={tileTitle(it)} className={it.info?.alike != null && (alikeCount.get(it.info.alike) ?? 0) > 1 ? `alike alike-${it.info.alike % 6}` : ""} {...pick.tileProps(it.id)}>
+                {it.copies ? (
+                  <span className="keep-badge orig" title={`이 사진이 원본으로 남고, 다른 폴더의 똑같은 파일 ${it.copies}개가 지워집니다 — 눌러서 위치 보기`}
+                    onClick={(e) => { e.stopPropagation(); if (it.info) setCopiesOf(it.info); }} onMouseDown={(e) => e.stopPropagation()}>원본 −{it.copies}</span>
+                ) : null}
+                {it.info?.alike != null && (alikeCount.get(it.info.alike) ?? 0) > 1 && <span className="keep-badge alike-tag">비슷함{it.info.variant === "smaller" ? " · 작음" : it.info.variant === "recompressed" ? " · 재압축" : it.info.variant === "edited" ? " · 편집" : ""}</span>}
+                {it.info?.damaged && <span className="keep-badge bad">⚠</span>}
                 {it.copyIn ? <span className="keep-badge copyin">가져옴</span> : null}
               </PhotoTile>
             ))}
@@ -903,8 +943,42 @@ function PhotoGrid({ items, list, prefer, onAdd, onRemove }: {
       ))}
       {view && <Viewer items={view.items} index={view.index} onIndex={(index) => setView((v) => (v ? { ...v, index } : v))} onClose={() => setView(null)} />}
       {cmp && <Compare ids={cmp} onClose={() => setCmp(null)} />}
+      {copiesOf && (
+        <div className="send-back" onClick={() => setCopiesOf(null)}>
+          <div className="card copies-of" onClick={(e) => e.stopPropagation()}>
+            <div className="row-between">
+              <h3>원본과 지워질 똑같은 파일</h3>
+              <button className="btn small ghost" onClick={() => setCopiesOf(null)}>닫기</button>
+            </div>
+            <div className="small"><span className="role-tag original">원본 · 남음</span> <span className="mono">{copiesOf.src}</span></div>
+            <div className="small muted">→ 라이브러리 폴더 <span className="mono">{copiesOf.group}</span>로 옮겨집니다.</div>
+            <div className="small" style={{ marginTop: 8 }}>바이트까지 똑같아서 지워지는 파일 {fmtCount(copiesOf.copies)}개{copiesOf.copies > (copiesOf.copies_at?.length ?? 0) ? ` (처음 ${copiesOf.copies_at?.length}개)` : ""}:</div>
+            {(copiesOf.copies_at ?? []).map((p) => (
+              <div key={p} className="small copies-of-row">
+                <span className="role-tag copy">사본 · 지움</span> <span className="mono grow" title={p}><bdi>{p}</bdi></span>
+                <button className="btn small ghost" onClick={() => api.openFolder(dirOf(p)).catch(() => {})}>폴더 열기</button>
+              </div>
+            ))}
+            <div className="small muted" style={{ marginTop: 8 }}>지우기 전에 원본과 끝까지 비교해, 다르면 지우지 않고 남겨 둡니다.</div>
+          </div>
+        </div>
+      )}
     </>
   );
+}
+
+const dirOf = (p: string) => p.slice(0, Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\"))) || p;
+
+/** What a preview photo is, on hover: where it is now, its size, and its copies. */
+function tileTitle(it: { size: number; copies?: number; info?: KeepItem }): string | undefined {
+  const k = it.info;
+  if (!k) return undefined;
+  const px = k.width && k.height ? ` · ${k.width}×${k.height}` : "";
+  const lines = [`지금 위치: ${k.src ?? ""}`, `${fmtBytes(k.size)}${px}`];
+  if (k.copies) lines.push(`원본으로 남음 — 똑같은 파일 ${k.copies}개가 지워짐:`, ...(k.copies_at ?? []).map((p) => `  ${p}`));
+  if (k.alike != null) lines.push("겉보기가 같은 다른 파일이 있음(바이트는 다름) — 둘 다 남음, 「비슷한 사진 검토」에서 고르기");
+  if (k.damaged) lines.push("깨진 것 같음");
+  return lines.join("\n");
 }
 
 function sameName(a: string, b: string): boolean {
@@ -947,7 +1021,7 @@ function SelectionPreview({ planId, groups, list, onClose }: { planId: string; g
         {!items && <div className="muted small">불러오는 중…</div>}
         {items && (
           <PhotoGrid
-            items={ordered.map((i) => ({ id: i.file_id, size: i.size, group: i.group, copies: i.copies, copyIn: i.action === "copy" }))}
+            items={ordered.map((i) => ({ id: i.file_id, size: i.size, group: i.group, copies: i.copies, copyIn: i.action === "copy", info: i }))}
             list={list}
             prefer="add"
             onAdd={(ids) => list.mark(ids.map((id) => { const it = ordered.find((i) => i.file_id === id); return { id, size: it?.size ?? 0, year: yearKey(it?.group ?? ""), copyIn: it?.action === "copy" }; }))}

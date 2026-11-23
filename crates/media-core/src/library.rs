@@ -175,6 +175,30 @@ const GENERIC: &[&str] = &[
     "사진 백업", "옛날사진", "옛날 사진", "old photos", "정리", "미정리", "정리 안 됨", "unsorted", "inbox", "import", "imports", "가져오기",
 ];
 
+/// Folders a recovery or repair program made (PhotoRec `recup_dir.12`, `run_20261110_021654`,
+/// `untrunc…`, `Raw2`): nothing below them was named by a person — their names are not events,
+/// and a file there is not the one to keep when a copy of it sits elsewhere.
+static RE_TOOL_DIR: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)^(recup_dir\.\d+|run_\d+.*|untrunc.*|raw\d+|found\.\d+|lost\+found|\$recycle\.bin)$").unwrap());
+/// File names a recovery program gives (`f1234567.jpg`, `file0012.jpg`, `recup_…`).
+static RE_TOOL_NAME: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)^(f\d{4,}|file\d{3,}|recup.*|recovered.*|_?\d{5,})(\.[a-z0-9]+)?$").unwrap());
+
+/// The folders of a path up to (not including) the first one a recovery program made.
+fn named_part(dir: &str) -> impl Iterator<Item = &str> {
+    dir.split('/').filter(|s| !s.is_empty()).take_while(|s| !RE_TOOL_DIR.is_match(s))
+}
+
+/// Whether a path lies below a folder a recovery program made.
+pub fn in_tool_dir(rel: &str) -> bool {
+    let rel = rel.replace('\\', "/");
+    let dir = rel.rfind('/').map(|i| &rel[..i]).unwrap_or("");
+    dir.split('/').any(|s| RE_TOOL_DIR.is_match(s))
+}
+
+/// Whether a file name was given by a recovery program, not a camera or a person.
+pub fn tool_named(name: &str) -> bool {
+    RE_TOOL_NAME.is_match(name)
+}
+
 /// Leading date (and an optional range) in a folder name: `2015-08-14 제주도`, `20150814_제주`,
 /// `2015.08 여행`, `2015-08-14~16 제주`, `2015`.
 static RE_LEAD_DATE: Lazy<Regex> = Lazy::new(|| {
@@ -224,7 +248,7 @@ pub fn event_name(folder: &str) -> Option<String> {
         return None;
     }
     // "옛날 백업", "Photos backup 2", "사진 복사본": a backup of something, not an event.
-    if ["백업", "backup", "사본", "복사본", "copy", "copies"].iter().any(|w| lower.contains(w)) {
+    if ["백업", "backup", "사본", "복사본", "copy", "copies", "recovery", "recovered", "복구"].iter().any(|w| lower.contains(w)) || RE_TOOL_DIR.is_match(rest) {
         return None;
     }
     Some(safe_name(rest))
@@ -243,7 +267,7 @@ pub fn folder_month(folder: &str) -> Option<(i32, u32)> {
 fn meaning(r: &FileRow) -> usize {
     let rel = r.rel_path.replace('\\', "/");
     let dir = rel.rfind('/').map(|i| &rel[..i]).unwrap_or("");
-    dir.split('/').filter(|s| event_name(s).is_some()).count()
+    named_part(dir).filter(|s| event_name(s).is_some()).count()
 }
 
 /// Whether a file is already inside the library folder.
@@ -255,7 +279,17 @@ pub fn is_filed(r: &FileRow, lib_vol: i64, lib_root: &str) -> bool {
 /// on the library drive, already filed in the library, in the most meaningful folders. One rule
 /// for the organizer and for the "original" shown everywhere.
 pub fn keeper_first(rows: &mut [FileRow], lib_vol: i64, lib_root: &str) {
-    rows.sort_by_key(|r| ((r.volume_id != lib_vol) as u8, !is_filed(r, lib_vol, lib_root) as u8, std::cmp::Reverse(meaning(r))));
+    // Then: not in a recovery program's output, a name a camera or a person gave, the most
+    // meaningful folders.
+    rows.sort_by_key(|r| {
+        (
+            (r.volume_id != lib_vol) as u8,
+            !is_filed(r, lib_vol, lib_root) as u8,
+            in_tool_dir(&r.rel_path) as u8,
+            tool_named(&r.name) as u8,
+            std::cmp::Reverse(meaning(r)),
+        )
+    });
 }
 
 /// The library drive and folder (relative to the drive) the user chose, if any.
@@ -623,7 +657,9 @@ pub fn layout(
     let segs_of = |f: &F, root: &str| -> Vec<String> {
         let dir = f.dir();
         let below = if root.is_empty() { dir } else { dir.strip_prefix(root).unwrap_or(dir).trim_start_matches('/') };
-        below.split('/').filter(|s| !s.is_empty()).map(String::from).collect()
+        // A recovery program's folders (and what is below them) name nothing: such files are
+        // filed by their date.
+        named_part(below).map(String::from).collect()
     };
     let path_at = |root: &str, segs: &[String], i: usize| -> String {
         let p = segs[..=i].join("/");

@@ -238,7 +238,14 @@ export interface CopyFolder { dir: string; count: number; bytes: number; version
 export interface FamilyMember { file: FileRow; abs_path: string; role: DupRole; relation: string; is_self: boolean; damaged: boolean }
 export interface Family { kind: "exact" | "similar"; why: string; members: FamilyMember[] }
 export interface CopyPair { file_id: number; src: string; size: number; tag: string; kept_id: number; kept_src: string; kept_dst: string }
-export interface KeepItem { file_id: number; group: string; action: PlanItem["action"]; copies: number; size: number }
+export interface KeepItem {
+  file_id: number; group: string; action: PlanItem["action"];
+  /** Byte-identical files elsewhere that are deleted because this one (the original) stays. */
+  copies: number; size: number;
+  src?: string; copies_at?: string[]; width?: number | null; height?: number | null;
+  /** Look-alike group (same scene, other bytes): those stay until the year's review decides. */
+  alike?: number | null; variant?: string | null; damaged?: boolean;
+}
 export interface DiskSpace { free: number; total: number; reserve: number }
 /** Library folder `from` merged into `into`. */
 export interface Merge { from: string; into: string }

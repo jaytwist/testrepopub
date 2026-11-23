@@ -1041,7 +1041,7 @@ pub fn year_copy_pairs(plan: &Plan, key: &str, dir: &str, offset: usize, limit: 
 pub fn group_items(plan: &Plan, groups: &[String], offset: usize, limit: usize) -> Vec<KeepItem> {
     let want: HashSet<&str> = groups.iter().map(String::as_str).collect();
     let ix = index_of(plan);
-    let copies = &ix.copies;
+    let removes = removes_by_kept(plan);
     let mut v: Vec<&PlanItem> = plan
         .items
         .iter()
@@ -1051,7 +1051,7 @@ pub fn group_items(plan: &Plan, groups: &[String], offset: usize, limit: usize) 
     v.into_iter()
         .skip(offset)
         .take(limit)
-        .map(|i| KeepItem { file_id: i.file_id, group: i.group.clone(), action: i.action, copies: copies.get(&i.file_id).copied().unwrap_or(0), size: i.size })
+        .map(|i| keep_item(i, &ix, &removes))
         .collect()
 }
 
@@ -1196,20 +1196,85 @@ pub struct KeepItem {
     pub file_id: i64,
     pub group: String,
     pub action: Action,
+    /// Byte-identical files elsewhere that are deleted because this one is kept: this file is
+    /// the original, those are the copies (they are not in the preview — they go).
     pub copies: u32,
     pub size: i64,
+    /// Where this file is now.
+    pub src: String,
+    /// Where those copies are (the first few).
+    pub copies_at: Vec<String>,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    /// The look-alike group (similar photos: same scene, other bytes) it is in, if any — such
+    /// files both stay until the year's 「비슷한 사진 검토」 decides.
+    pub alike: Option<i64>,
+    /// resized / recompressed / edited, within that group.
+    pub variant: Option<String>,
+    pub damaged: bool,
+}
+
+fn keep_item(i: &PlanItem, ix: &PlanIndex, removes: &HashMap<i64, Vec<&str>>) -> KeepItem {
+    KeepItem {
+        file_id: i.file_id,
+        group: i.group.clone(),
+        action: i.action,
+        copies: ix.copies.get(&i.file_id).copied().unwrap_or(0),
+        size: i.size,
+        src: i.src.clone(),
+        copies_at: removes.get(&i.file_id).map(|v| v.iter().take(5).map(|s| s.to_string()).collect()).unwrap_or_default(),
+        width: None,
+        height: None,
+        alike: None,
+        variant: None,
+        damaged: false,
+    }
+}
+
+/// Copies to remove, by the file kept instead.
+fn removes_by_kept(plan: &Plan) -> HashMap<i64, Vec<&str>> {
+    let mut m: HashMap<i64, Vec<&str>> = HashMap::new();
+    for i in plan.items.iter().filter(|i| i.action == Action::Remove) {
+        if let Some(k) = i.kept {
+            m.entry(k).or_default().push(i.src.as_str());
+        }
+    }
+    m
+}
+
+/// What the index knows of previewed files: size in pixels, the look-alike group, damage.
+pub fn describe(conn: &rusqlite::Connection, items: &mut [KeepItem]) -> Result<()> {
+    use rusqlite::OptionalExtension;
+    let mut px = conn.prepare_cached("SELECT width, height FROM files WHERE id = ?")?;
+    let mut alike = conn.prepare_cached(
+        "SELECT m.group_id, m.variant FROM dup_members m JOIN dup_groups g ON g.id = m.group_id
+         WHERE m.file_id = ? AND g.kind = 'similar_image' AND g.resolved = 0
+           AND (SELECT COUNT(*) FROM dup_members o JOIN files f ON f.id = o.file_id WHERE o.group_id = g.id AND f.missing = 0 AND f.quarantined = 0) > 1
+         LIMIT 1",
+    )?;
+    let mut bad = conn.prepare_cached("SELECT 1 FROM suggestions WHERE file_id = ? AND kind = 'damaged'")?;
+    for it in items.iter_mut() {
+        if let Some((w, h)) = px.query_row([it.file_id], |r| Ok((r.get(0)?, r.get(1)?))).optional()? {
+            (it.width, it.height) = (w, h);
+        }
+        if let Some((g, v)) = alike.query_row([it.file_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))).optional()? {
+            (it.alike, it.variant) = (Some(g), v);
+        }
+        it.damaged = bad.exists([it.file_id])?;
+    }
+    Ok(())
 }
 
 pub fn year_keep(plan: &Plan, key: &str, offset: usize, limit: usize) -> Vec<KeepItem> {
     let ix = index_of(plan);
-    let copies = &ix.copies;
+    let removes = removes_by_kept(plan);
     let mut v: Vec<&PlanItem> =
         year_items(plan, &ix, key).filter(|i| matches!(i.action, Action::Move | Action::Copy | Action::InPlace | Action::SkipDuplicate)).collect();
     v.sort_by(|a, b| a.group.cmp(&b.group).then(a.dst.cmp(&b.dst)));
     v.into_iter()
         .skip(offset)
         .take(limit)
-        .map(|i| KeepItem { file_id: i.file_id, group: i.group.clone(), action: i.action, copies: copies.get(&i.file_id).copied().unwrap_or(0), size: i.size })
+        .map(|i| keep_item(i, &ix, &removes))
         .collect()
 }
 
